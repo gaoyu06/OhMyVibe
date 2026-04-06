@@ -3,5 +3,7 @@ dist/
 .generated/
 *.log
 data/
+.env
+web/.env
 web/node_modules/
 web/dist/

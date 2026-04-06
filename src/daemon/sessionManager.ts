@@ -11,6 +11,7 @@ import {
   SessionStatus,
   SessionSummary,
   TranscriptEntry,
+  UpdateSessionConfigInput,
 } from "../shared/types.js";
 import { CodexAppServerClient } from "./codexAppServerClient.js";
 import { SessionStore } from "./sessionStore.js";
@@ -25,6 +26,8 @@ interface ManagedSession {
   origin: "created" | "restored";
   model?: string;
   reasoningEffort?: string;
+  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  approvalPolicy?: "untrusted" | "on-failure" | "on-request" | "never";
   codexThreadId?: string;
   codexPath?: string;
   codexSource?: string;
@@ -33,6 +36,8 @@ interface ManagedSession {
   codex?: CodexAppServerClient;
   liveMessages: Map<string, TranscriptEntry>;
   liveReasoning: Map<string, TranscriptEntry>;
+  configDirty?: boolean;
+  suppressNextExitFailure?: boolean;
 }
 
 export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
@@ -116,6 +121,8 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       origin: "created",
       model: input.model,
       reasoningEffort: input.reasoningEffort,
+      sandbox: input.sandbox ?? "workspace-write",
+      approvalPolicy: input.approvalPolicy ?? "never",
       transcript: [],
       liveMessages: new Map(),
       liveReasoning: new Map(),
@@ -124,22 +131,8 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     this.sessions.set(sessionId, session);
     this.persist();
     this.emitChange({ type: "session-created", session: this.toSummary(session) });
-
-    try {
-      await this.startFreshThread(session, input);
-      return this.getOrThrow(sessionId);
-    } catch (error) {
-      session.status = "failed";
-      session.lastError = this.errorMessage(error);
-      this.addEntry(session, {
-        kind: "system",
-        text: `Session startup failed: ${session.lastError}`,
-        status: "failed",
-      });
-      this.persist();
-      this.emitChange({ type: "session-updated", session: this.toSummary(session) });
-      return this.getOrThrow(sessionId);
-    }
+    void this.startSessionInBackground(session, input);
+    return this.getOrThrow(sessionId);
   }
 
   async restore(input: RestoreSessionInput): Promise<SessionDetails> {
@@ -163,6 +156,8 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       origin: "restored",
       model: input.model,
       reasoningEffort: input.reasoningEffort,
+      sandbox: input.sandbox ?? "workspace-write",
+      approvalPolicy: input.approvalPolicy ?? "never",
       codexThreadId: input.threadId,
       transcript: [],
       liveMessages: new Map(),
@@ -172,26 +167,42 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     this.sessions.set(session.id, session);
     this.persist();
     this.emitChange({ type: "session-created", session: this.toSummary(session) });
+    void this.restoreSessionInBackground(session, input);
+    return this.getOrThrow(session.id);
+  }
 
-    try {
-      await this.ensureCodexClient(session, input);
-      return this.getOrThrow(session.id);
-    } catch (error) {
-      session.status = "failed";
-      session.lastError = this.errorMessage(error);
-      this.addEntry(session, {
-        kind: "system",
-        text: `Session restore failed: ${session.lastError}`,
-        status: "failed",
-      });
-      this.persist();
-      this.emitChange({ type: "session-updated", session: this.toSummary(session) });
-      return this.getOrThrow(session.id);
+  async updateConfig(sessionId: string, input: UpdateSessionConfigInput): Promise<SessionDetails> {
+    const session = this.getSessionOrThrow(sessionId);
+    const model = typeof input.model === "string" && input.model.trim() ? input.model.trim() : session.model;
+    const reasoningEffort = this.normalizeReasoningEffort(
+      input.reasoningEffort ?? session.reasoningEffort,
+    );
+    const sandbox = input.sandbox ?? session.sandbox ?? "workspace-write";
+    const approvalPolicy = input.approvalPolicy ?? session.approvalPolicy ?? "never";
+    const runtimeChanged =
+      model !== session.model ||
+      sandbox !== session.sandbox ||
+      approvalPolicy !== session.approvalPolicy;
+
+    session.model = model;
+    session.reasoningEffort = reasoningEffort;
+    session.sandbox = sandbox;
+    session.approvalPolicy = approvalPolicy;
+    session.configDirty = session.configDirty || runtimeChanged;
+    this.touch(session);
+    this.persist();
+    this.emitChange({ type: "session-updated", session: this.toSummary(session) });
+
+    if (session.status !== "running" && session.status !== "starting") {
+      await this.applyPendingConfig(session);
     }
+
+    return this.getOrThrow(sessionId);
   }
 
   async sendMessage(sessionId: string, text: string): Promise<void> {
     const session = this.getSessionOrThrow(sessionId);
+    await this.applyPendingConfig(session);
     await this.ensureCodexClient(session);
     if (!session.codex || !session.codexThreadId) {
       throw new Error("Session is not ready");
@@ -243,6 +254,8 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
         origin: persisted.origin ?? "created",
         model: persisted.model,
         reasoningEffort: persisted.reasoningEffort,
+        sandbox: persisted.sandbox,
+        approvalPolicy: persisted.approvalPolicy,
         codexThreadId: persisted.codexThreadId,
         codexPath: persisted.codexPath,
         codexSource: persisted.codexSource,
@@ -262,6 +275,44 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     );
   }
 
+  private async startSessionInBackground(
+    session: ManagedSession,
+    input: CreateSessionInput,
+  ): Promise<void> {
+    try {
+      await this.startFreshThread(session, input);
+    } catch (error) {
+      session.status = "failed";
+      session.lastError = this.errorMessage(error);
+      this.addEntry(session, {
+        kind: "system",
+        text: `Session startup failed: ${session.lastError}`,
+        status: "failed",
+      });
+      this.persist();
+      this.emitChange({ type: "session-updated", session: this.toSummary(session) });
+    }
+  }
+
+  private async restoreSessionInBackground(
+    session: ManagedSession,
+    input: RestoreSessionInput,
+  ): Promise<void> {
+    try {
+      await this.ensureCodexClient(session, input);
+    } catch (error) {
+      session.status = "failed";
+      session.lastError = this.errorMessage(error);
+      this.addEntry(session, {
+        kind: "system",
+        text: `Session restore failed: ${session.lastError}`,
+        status: "failed",
+      });
+      this.persist();
+      this.emitChange({ type: "session-updated", session: this.toSummary(session) });
+    }
+  }
+
   private async startFreshThread(session: ManagedSession, input: CreateSessionInput): Promise<void> {
     const codex = new CodexAppServerClient({ cwd: session.cwd });
     session.codex = codex;
@@ -271,8 +322,8 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     const response = await codex.threadStart({
       cwd: session.cwd,
       model: input.model,
-      sandbox: input.sandbox,
-      approvalPolicy: input.approvalPolicy,
+      sandbox: input.sandbox ?? session.sandbox,
+      approvalPolicy: input.approvalPolicy ?? session.approvalPolicy,
     });
 
     session.codexThreadId = response.thread.id;
@@ -280,8 +331,11 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     session.codexSource = response.thread.source;
     session.model = response.model;
     session.reasoningEffort = input.reasoningEffort ?? response.reasoningEffort ?? "medium";
+    session.sandbox = input.sandbox ?? session.sandbox;
+    session.approvalPolicy = input.approvalPolicy ?? session.approvalPolicy;
     session.status = "idle";
     session.title = response.thread.preview || session.title;
+    session.configDirty = false;
     this.touch(session);
     this.persist();
     this.emitChange({ type: "session-updated", session: this.toSummary(session) });
@@ -302,8 +356,8 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
         reasoningEffort: this.normalizeReasoningEffort(
           overrides?.reasoningEffort ?? session.reasoningEffort,
         ),
-        sandbox: overrides?.sandbox,
-        approvalPolicy: overrides?.approvalPolicy,
+        sandbox: overrides?.sandbox ?? session.sandbox,
+        approvalPolicy: overrides?.approvalPolicy ?? session.approvalPolicy,
       });
       return;
     }
@@ -317,8 +371,8 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       threadId: session.codexThreadId,
       cwd: overrides?.cwd ?? session.cwd,
       model: overrides?.model ?? session.model,
-      sandbox: overrides?.sandbox,
-      approvalPolicy: overrides?.approvalPolicy,
+      sandbox: overrides?.sandbox ?? session.sandbox,
+      approvalPolicy: overrides?.approvalPolicy ?? session.approvalPolicy,
     });
 
     session.cwd = response.cwd || session.cwd;
@@ -326,6 +380,8 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     session.reasoningEffort = this.normalizeReasoningEffort(
       overrides?.reasoningEffort ?? response.reasoningEffort ?? session.reasoningEffort,
     );
+    session.sandbox = overrides?.sandbox ?? session.sandbox;
+    session.approvalPolicy = overrides?.approvalPolicy ?? session.approvalPolicy;
     session.codexPath = response.thread?.path || session.codexPath;
     session.codexSource = response.thread?.source || session.codexSource;
     session.title = response.thread?.name || response.thread?.preview || session.title;
@@ -333,6 +389,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     session.transcript = this.threadToTranscript(response.thread);
     session.liveMessages.clear();
     session.liveReasoning.clear();
+    session.configDirty = false;
     this.touch(session);
     this.persist();
     this.emitChange({
@@ -374,6 +431,10 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
 
     codex.onExit(({ code, signal }) => {
       session.codex = undefined;
+      if (session.suppressNextExitFailure) {
+        session.suppressNextExitFailure = false;
+        return;
+      }
       if (session.status === "closed") {
         return;
       }
@@ -614,6 +675,37 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
           status: item.status ?? "completed",
           createdAt,
         };
+      case "function_call": {
+        return {
+          id: item.call_id || item.id,
+          kind: "tool",
+          text: this.formatFunctionCall(item),
+          status: item.status ?? "completed",
+          createdAt,
+          meta: {
+            name: item.name,
+          },
+        };
+      }
+      case "function_call_output":
+        return {
+          id: item.call_id || item.id,
+          kind: "tool",
+          text: this.formatFunctionCallOutput(item),
+          status: item.status ?? "completed",
+          createdAt,
+        };
+      case "custom_tool_call":
+        return {
+          id: item.call_id || item.id,
+          kind: "tool",
+          text: this.formatCustomToolCall(item),
+          status: item.status ?? "completed",
+          createdAt,
+          meta: {
+            name: item.name,
+          },
+        };
       case "plan":
         return {
           id: item.id,
@@ -658,9 +750,15 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     if (existingIndex === -1) {
       session.transcript.push(entry);
     } else {
+      const existing = session.transcript[existingIndex];
+      const mergedText =
+        existing.kind === "tool" && entry.kind === "tool" && existing.text && entry.text && existing.text !== entry.text
+          ? `${existing.text}\n\n${entry.text}`.trim()
+          : entry.text || existing.text;
       session.transcript[existingIndex] = {
-        ...session.transcript[existingIndex],
+        ...existing,
         ...entry,
+        text: mergedText,
       };
     }
 
@@ -678,6 +776,26 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     session.updatedAt = new Date().toISOString();
   }
 
+  private async applyPendingConfig(session: ManagedSession): Promise<void> {
+    if (!session.configDirty || session.status === "running" || session.status === "starting") {
+      return;
+    }
+
+    if (session.codex) {
+      session.suppressNextExitFailure = true;
+      await session.codex.close();
+      session.codex = undefined;
+    }
+
+    await this.ensureCodexClient(session, {
+      cwd: session.cwd,
+      model: session.model,
+      reasoningEffort: this.normalizeReasoningEffort(session.reasoningEffort),
+      sandbox: session.sandbox,
+      approvalPolicy: session.approvalPolicy,
+    });
+  }
+
   private emitChange(event: DaemonEvent): void {
     this.emit("event", event);
   }
@@ -693,6 +811,8 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       origin: session.origin,
       model: session.model,
       reasoningEffort: session.reasoningEffort,
+      sandbox: session.sandbox,
+      approvalPolicy: session.approvalPolicy,
       codexThreadId: session.codexThreadId,
       codexPath: session.codexPath,
       codexSource: session.codexSource,
@@ -751,13 +871,15 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
   }
 
   private cleanStderr(text: string): string {
-    return text.replace(/\u001b\[[0-9;]*m/g, "").trim();
+    return text.replace(/\u001b\[[0-9;]*m/g, "").replace(/\r/g, "").trim();
   }
 
   private shouldIgnoreStderr(text: string): boolean {
     return (
-      text.includes("rmcp::transport::worker") &&
-      text.includes("data did not match any variant of untagged enum JsonRpcMessage")
+      (text.includes("rmcp::transport::worker") &&
+        text.includes("data did not match any variant of untagged enum JsonRpcMessage")) ||
+      (text.includes("failed to refresh available models") &&
+        text.includes("timeout waiting for child process to exit"))
     );
   }
 
@@ -844,6 +966,47 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     return typeof value === "number" && Number.isFinite(value)
       ? new Date(value * 1000).toISOString()
       : new Date().toISOString();
+  }
+
+  private formatFunctionCall(item: any): string {
+    const name = item?.name || "tool";
+    const args = this.prettyJsonString(item?.arguments);
+    return args ? `${name}\n\n${args}` : name;
+  }
+
+  private formatFunctionCallOutput(item: any): string {
+    return String(item?.output ?? "").trim();
+  }
+
+  private formatCustomToolCall(item: any): string {
+    const name = item?.name || "custom_tool";
+    const input = typeof item?.input === "string" ? item.input : this.prettyJson(item?.input);
+    return input ? `${name}\n\n${input}` : name;
+  }
+
+  private prettyJsonString(value: unknown): string {
+    if (typeof value !== "string" || !value.trim()) {
+      return "";
+    }
+    try {
+      return JSON.stringify(JSON.parse(value), null, 2);
+    } catch {
+      return value;
+    }
+  }
+
+  private prettyJson(value: unknown): string {
+    if (value === undefined || value === null) {
+      return "";
+    }
+    if (typeof value === "string") {
+      return value;
+    }
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
   }
 
   private normalizeReasoningEffort(value: unknown):

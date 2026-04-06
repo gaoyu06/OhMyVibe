@@ -149,6 +149,15 @@ export class ManagementBridge {
       case "sendMessage":
         await this.sessionManager.sendMessage(String(params.sessionId), String(params.text ?? ""));
         return { ok: true };
+      case "updateSessionConfig":
+        return this.sessionManager.updateConfig(String(params.sessionId), {
+          model: typeof params.model === "string" ? params.model : undefined,
+          reasoningEffort:
+            typeof params.reasoningEffort === "string" ? (params.reasoningEffort as any) : undefined,
+          sandbox: typeof params.sandbox === "string" ? (params.sandbox as any) : undefined,
+          approvalPolicy:
+            typeof params.approvalPolicy === "string" ? (params.approvalPolicy as any) : undefined,
+        });
       case "interruptSession":
         await this.sessionManager.interrupt(String(params.sessionId));
         return { ok: true };

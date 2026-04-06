@@ -58,6 +58,8 @@ export interface SessionSummary {
   origin: SessionOrigin;
   model?: string;
   reasoningEffort?: string;
+  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  approvalPolicy?: "untrusted" | "on-failure" | "on-request" | "never";
   codexThreadId?: string;
   codexPath?: string;
   codexSource?: string;
@@ -88,6 +90,13 @@ export interface RestoreSessionInput {
 
 export interface SendMessageInput {
   text: string;
+}
+
+export interface UpdateSessionConfigInput {
+  model?: string;
+  reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  approvalPolicy?: "untrusted" | "on-failure" | "on-request" | "never";
 }
 
 export interface CodexHistoryEntry {

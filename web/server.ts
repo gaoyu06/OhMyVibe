@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import http from "node:http";
 import path from "node:path";
@@ -26,8 +27,8 @@ const port = Number(process.env.PORT ?? "3310");
 const rootDir = path.resolve(process.cwd());
 const clientDistDir = path.join(rootDir, "dist");
 const server = http.createServer(app);
-const daemonWss = new WebSocketServer({ server, path: "/daemon" });
-const clientWss = new WebSocketServer({ server, path: "/ws" });
+const daemonWss = new WebSocketServer({ noServer: true });
+const clientWss = new WebSocketServer({ noServer: true });
 const daemons = new Map<string, ConnectedDaemon>();
 const pending = new Map<
   string,
@@ -117,6 +118,19 @@ app.post("/api/daemons/:daemonId/sessions/:sessionId/messages", async (req, res)
   }
 });
 
+app.patch("/api/daemons/:daemonId/sessions/:sessionId/config", async (req, res) => {
+  try {
+    res.json(
+      await requestDaemon(req.params.daemonId, "updateSessionConfig", {
+        sessionId: req.params.sessionId,
+        ...(req.body ?? {}),
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 app.post("/api/daemons/:daemonId/sessions/:sessionId/interrupt", async (req, res) => {
   try {
     res.status(202).json(
@@ -142,6 +156,26 @@ app.delete("/api/daemons/:daemonId/sessions/:sessionId", async (req, res) => {
 
 app.get("/{*any}", (_req, res) => {
   res.sendFile(path.join(clientDistDir, "index.html"));
+});
+
+server.on("upgrade", (request, socket, head) => {
+  const pathname = new URL(request.url ?? "/", `http://${request.headers.host}`).pathname;
+
+  if (pathname === "/daemon") {
+    daemonWss.handleUpgrade(request, socket, head, (ws) => {
+      daemonWss.emit("connection", ws, request);
+    });
+    return;
+  }
+
+  if (pathname === "/ws") {
+    clientWss.handleUpgrade(request, socket, head, (ws) => {
+      clientWss.emit("connection", ws, request);
+    });
+    return;
+  }
+
+  socket.destroy();
 });
 
 daemonWss.on("connection", (socket) => {

@@ -37,18 +37,21 @@ npm run web:server
 ```
 
 默认监听 `http://localhost:3310`
+默认读取 `web/.env`
 
 2. 在被控机器启动 daemon，并主动连接管理端：
 
 ```bash
-MANAGEMENT_SERVER_URL=http://your-control-host:3310 npm run daemon
+npm run daemon
 ```
+
+daemon 不再暴露本地 HTTP API，浏览器也不应直接连接 daemon。
+默认读取根目录 `.env`
 
 可选环境变量：
 
 - `DAEMON_ID`：固定 daemon 标识
 - `DAEMON_NAME`：展示名称
-- `PORT`：daemon 本地 API 端口（默认 `3210`）
 
 3. 浏览器访问管理端页面：
 

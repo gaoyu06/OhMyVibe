@@ -56,6 +56,8 @@ export interface SessionSummary {
   origin: "created" | "restored";
   model?: string;
   reasoningEffort?: string;
+  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  approvalPolicy?: "untrusted" | "on-failure" | "on-request" | "never";
   codexThreadId?: string;
   codexPath?: string;
   codexSource?: string;

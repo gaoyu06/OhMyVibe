@@ -1,13 +1,15 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type UIEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   AlertCircle,
   Circle,
+  GitCommitHorizontal,
   LoaderCircle,
   Moon,
   PanelLeftOpen,
   Play,
-  RefreshCcw,
   Send,
   Square,
   Sun,
@@ -40,6 +42,8 @@ import { formatDateTime, formatTime, lastLines } from "@/lib/utils";
 
 const DEFAULT_CONTROL_URL = import.meta.env.VITE_CONTROL_SERVER_URL || window.location.origin;
 const TOOL_LINE_LIMIT = 30;
+const TRANSCRIPT_INITIAL_COUNT = 80;
+const TRANSCRIPT_CHUNK_SIZE = 60;
 
 type ThemeMode = "light" | "dark";
 
@@ -48,16 +52,17 @@ interface ActivityState {
   variant: "default" | "warning" | "destructive" | "success";
 }
 
+const SANDBOX_OPTIONS = [
+  { value: "danger-full-access", label: "Full Access" },
+  { value: "workspace-write", label: "Workspace" },
+  { value: "read-only", label: "Read Only" },
+] as const;
+
 function App() {
   const [theme, setTheme] = useState<ThemeMode>(
     () => (localStorage.getItem("ohmyvibe-theme") as ThemeMode) || "dark",
   );
-  const [controlUrlInput, setControlUrlInput] = useState(
-    () => localStorage.getItem("ohmyvibe-control-url") || DEFAULT_CONTROL_URL,
-  );
-  const [controlUrl, setControlUrl] = useState(
-    () => localStorage.getItem("ohmyvibe-control-url") || DEFAULT_CONTROL_URL,
-  );
+  const controlUrl = DEFAULT_CONTROL_URL;
   const [connectionState, setConnectionState] = useState<"connecting" | "open" | "closed" | "error">(
     "connecting",
   );
@@ -67,24 +72,29 @@ function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [history, setHistory] = useState<CodexHistoryEntry[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [newSessionOpen, setNewSessionOpen] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [activeSession, setActiveSession] = useState<SessionDetails | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [sessionLoading, setSessionLoading] = useState(false);
+  const [creatingSession, setCreatingSession] = useState(false);
+  const [restoringHistoryId, setRestoringHistoryId] = useState<string | null>(null);
+  const [loadedTranscriptCount, setLoadedTranscriptCount] = useState(TRANSCRIPT_INITIAL_COUNT);
   const [composer, setComposer] = useState("");
   const [cwd, setCwd] = useState("C:\\Code\\Projects\\OhMyVibe");
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState("medium");
+  const [sandbox, setSandbox] = useState<"read-only" | "workspace-write" | "danger-full-access">(
+    "danger-full-access",
+  );
   const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const prependPendingRef = useRef<{ previousHeight: number; previousTop: number } | null>(null);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
     localStorage.setItem("ohmyvibe-theme", theme);
   }, [theme]);
-
-  useEffect(() => {
-    setControlUrlInput(controlUrl);
-    localStorage.setItem("ohmyvibe-control-url", controlUrl);
-  }, [controlUrl]);
 
   useEffect(() => {
     let disposed = false;
@@ -109,13 +119,17 @@ function App() {
     ws.onmessage = (event) => {
       const payload = JSON.parse(event.data) as
         | { type: "hello"; daemons: DaemonDescriptor[] }
+        | { type: "hello"; sessions: SessionSummary[] }
         | { type: "daemon-connected"; daemon: DaemonDescriptor }
         | { type: "daemon-disconnected"; daemonId: string }
         | { type: "daemon-event"; daemonId: string; event: DaemonEvent };
 
       if (payload.type === "hello") {
-        setDaemons(payload.daemons);
-        setActiveDaemonId((current) => current ?? payload.daemons[0]?.id ?? null);
+        const nextDaemons = Array.isArray((payload as { daemons?: DaemonDescriptor[] }).daemons)
+          ? (payload as { daemons: DaemonDescriptor[] }).daemons
+          : [];
+        setDaemons(nextDaemons);
+        setActiveDaemonId((current) => current ?? nextDaemons[0]?.id ?? null);
         return;
       }
 
@@ -199,6 +213,11 @@ function App() {
     void loadSession(activeDaemonId, activeSessionId);
   }, [activeDaemonId, activeSessionId]);
 
+  useEffect(() => {
+    setLoadedTranscriptCount(TRANSCRIPT_INITIAL_COUNT);
+    prependPendingRef.current = null;
+  }, [activeSessionId]);
+
   const currentModel = useMemo(
     () => config.models.find((item) => item.model === model) ?? config.models[0],
     [config.models, model],
@@ -217,15 +236,52 @@ function App() {
     setEffort(nextEffort);
   }, [config, currentModel, effort, model]);
 
+  useEffect(() => {
+    if (!activeSession) {
+      return;
+    }
+    if (activeSession.model) {
+      setModel(activeSession.model);
+    }
+    if (activeSession.reasoningEffort) {
+      setEffort(activeSession.reasoningEffort);
+    }
+    if (activeSession.sandbox) {
+      setSandbox(activeSession.sandbox);
+    }
+  }, [activeSession?.id, activeSession?.model, activeSession?.reasoningEffort, activeSession?.sandbox]);
+
   const transcript = activeSession?.transcript ?? [];
+  const transcriptStart = Math.max(0, transcript.length - loadedTranscriptCount);
+  const visibleTranscript = useMemo(
+    () => transcript.slice(transcriptStart),
+    [transcript, transcriptStart],
+  );
+  const hasOlderTranscript = transcriptStart > 0;
   const rowVirtualizer = useVirtualizer({
-    count: transcript.length,
+    count: visibleTranscript.length,
     getScrollElement: () => transcriptRef.current,
-    estimateSize: (index) => estimateEntryHeight(transcript[index]),
+    estimateSize: (index) => estimateEntryHeight(visibleTranscript[index]),
     overscan: 8,
+    measureElement: (element) => element.getBoundingClientRect().height,
   });
-  const activity = getActivity(activeSession);
+  const activity = getActivity(activeSession, {
+    creatingSession,
+    restoringHistory: Boolean(restoringHistoryId),
+    sessionLoading,
+  });
   const activeDaemon = daemons.find((item) => item.id === activeDaemonId) ?? null;
+
+  useLayoutEffect(() => {
+    const scrollElement = transcriptRef.current;
+    const pending = prependPendingRef.current;
+    if (!scrollElement || !pending) {
+      return;
+    }
+    const delta = scrollElement.scrollHeight - pending.previousHeight;
+    scrollElement.scrollTop = pending.previousTop + delta;
+    prependPendingRef.current = null;
+  }, [visibleTranscript.length]);
 
   async function api<T>(path: string, options?: RequestInit) {
     const response = await fetch(new URL(path, normalizeBaseUrl(controlUrl)).toString(), {
@@ -262,61 +318,82 @@ function App() {
   }
 
   async function loadSession(daemonId: string, sessionId: string) {
-    const session = await api<SessionDetails>(`/api/daemons/${daemonId}/sessions/${sessionId}`);
-    setActiveSession(session);
-    setExpanded((current) => {
-      const next = new Set(current);
-      for (const entry of session.transcript) {
-        if (entry.kind === "reasoning" && entry.status === "streaming") {
-          next.add(entry.id);
+    setSessionLoading(true);
+    try {
+      const session = await api<SessionDetails>(`/api/daemons/${daemonId}/sessions/${sessionId}`);
+      setActiveSession(session);
+      setExpanded((current) => {
+        const next = new Set(current);
+        for (const entry of session.transcript) {
+          if (entry.kind === "reasoning" && entry.status === "streaming") {
+            next.add(entry.id);
+          }
         }
-      }
-      return next;
-    });
+        return next;
+      });
+    } finally {
+      setSessionLoading(false);
+    }
   }
 
   async function loadHistory(daemonId: string) {
-    const items = await api<CodexHistoryEntry[]>(`/api/daemons/${daemonId}/history`);
-    setHistory(items);
+    setHistoryLoading(true);
+    try {
+      const items = await api<CodexHistoryEntry[]>(`/api/daemons/${daemonId}/history`);
+      setHistory(items);
+    } finally {
+      setHistoryLoading(false);
+    }
   }
 
   async function handleCreateSession() {
     if (!activeDaemonId) {
       return;
     }
-    const session = await api<SessionDetails>(`/api/daemons/${activeDaemonId}/sessions`, {
-      method: "POST",
-      body: JSON.stringify({
-        cwd,
-        model,
-        reasoningEffort: effort,
-        sandbox: "workspace-write",
-      }),
-    });
-    setActiveSessionId(session.id);
-    setActiveSession(session);
-    setComposer("");
+    setCreatingSession(true);
+    try {
+      const session = await api<SessionDetails>(`/api/daemons/${activeDaemonId}/sessions`, {
+        method: "POST",
+        body: JSON.stringify({
+          cwd,
+          model,
+          reasoningEffort: effort,
+          sandbox,
+        }),
+      });
+      setActiveSessionId(session.id);
+      setActiveSession(session);
+      setComposer("");
+      setNewSessionOpen(false);
+    } finally {
+      setCreatingSession(false);
+    }
   }
 
   async function handleRestoreSession(item: CodexHistoryEntry) {
     if (!activeDaemonId) {
       return;
     }
-    const session = await api<SessionDetails>(
-      `/api/daemons/${activeDaemonId}/history/${item.id}/restore`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          cwd: item.cwd || cwd,
-          model,
-          reasoningEffort: effort,
-          sandbox: "workspace-write",
-        }),
-      },
-    );
-    setHistoryOpen(false);
-    setActiveSessionId(session.id);
-    setActiveSession(session);
+    setRestoringHistoryId(item.id);
+    try {
+      const session = await api<SessionDetails>(
+        `/api/daemons/${activeDaemonId}/history/${item.id}/restore`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            cwd: item.cwd || cwd,
+            model,
+            reasoningEffort: effort,
+            sandbox,
+          }),
+        },
+      );
+      setHistoryOpen(false);
+      setActiveSessionId(session.id);
+      setActiveSession(session);
+    } finally {
+      setRestoringHistoryId(null);
+    }
   }
 
   async function handleSendMessage() {
@@ -328,6 +405,25 @@ function App() {
       body: JSON.stringify({ text: composer.trim() }),
     });
     setComposer("");
+  }
+
+  async function handleSessionConfigChange(next: {
+    model?: string;
+    reasoningEffort?: string;
+    sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  }) {
+    if (!activeDaemonId || !activeSessionId) {
+      return;
+    }
+    const session = await api<SessionDetails>(
+      `/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/config`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(next),
+      },
+    );
+    setActiveSession(session);
+    setSessions((current) => upsertSessionSummary(current, session));
   }
 
   async function handleInterrupt() {
@@ -348,8 +444,18 @@ function App() {
     });
   }
 
-  async function reconnect() {
-    setControlUrl(normalizeBaseUrl(controlUrlInput));
+  function handleTranscriptScroll(event: UIEvent<HTMLDivElement>) {
+    const element = event.currentTarget;
+    if (!hasOlderTranscript || prependPendingRef.current || element.scrollTop > 120) {
+      return;
+    }
+    prependPendingRef.current = {
+      previousHeight: element.scrollHeight,
+      previousTop: element.scrollTop,
+    };
+    setLoadedTranscriptCount((current) =>
+      Math.min(transcript.length, current + TRANSCRIPT_CHUNK_SIZE),
+    );
   }
 
   return (
@@ -358,8 +464,7 @@ function App() {
         <header className="grid grid-cols-[220px_1fr_auto] items-center gap-3 border-b border-border px-3">
           <div className="text-sm font-semibold tracking-tight">OhMyVibe</div>
 
-          <div className="grid grid-cols-[minmax(180px,280px)_220px_120px_120px_minmax(220px,1fr)] items-center gap-2">
-            <Input value={controlUrlInput} onChange={(event) => setControlUrlInput(event.target.value)} />
+          <div className="grid grid-cols-[280px] items-center gap-2">
             <Select value={activeDaemonId ?? ""} onValueChange={setActiveDaemonId}>
               <SelectTrigger>
                 <SelectValue placeholder="Daemon" />
@@ -372,39 +477,10 @@ function App() {
                 ))}
               </SelectContent>
             </Select>
-            <Select value={model} onValueChange={setModel}>
-              <SelectTrigger>
-                <SelectValue placeholder="Model" />
-              </SelectTrigger>
-              <SelectContent>
-                {config.models.map((item) => (
-                  <SelectItem key={item.model} value={item.model}>
-                    {item.model}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Select value={effort} onValueChange={setEffort}>
-              <SelectTrigger>
-                <SelectValue placeholder="Effort" />
-              </SelectTrigger>
-              <SelectContent>
-                {(currentModel?.supportedReasoningEfforts || []).map((item) => (
-                  <SelectItem key={item.reasoningEffort} value={item.reasoningEffort}>
-                    {item.reasoningEffort}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Input value={cwd} onChange={(event) => setCwd(event.target.value)} />
           </div>
 
           <div className="flex items-center gap-2">
             <StatusBadge connectionState={connectionState} />
-            <Button variant="outline" size="sm" onClick={() => void reconnect()}>
-              <RefreshCcw className="h-3.5 w-3.5" />
-              Connect
-            </Button>
             <Dialog
               open={historyOpen}
               onOpenChange={(open) => {
@@ -427,17 +503,29 @@ function App() {
                 </DialogHeader>
                 <ScrollArea className="h-[calc(100vh-64px)]">
                   <div className="space-y-2 p-4">
+                    {historyLoading ? (
+                      <div className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-xs text-muted-foreground">
+                        <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                        Loading history
+                      </div>
+                    ) : null}
                     {history.map((item) => (
                       <button
                         key={item.id}
                         type="button"
-                        className="grid w-full gap-1 rounded-md border border-border px-3 py-2 text-left text-xs hover:bg-accent/50"
+                        className="grid w-full gap-1 rounded-md border border-border px-3 py-2 text-left text-xs hover:bg-accent/50 disabled:cursor-wait disabled:opacity-70"
                         onClick={() => void handleRestoreSession(item)}
+                        disabled={Boolean(restoringHistoryId)}
                       >
-                        <div className="line-clamp-2 text-sm font-medium">{item.title || item.id}</div>
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="line-clamp-2 text-sm font-medium">{item.title || item.id}</div>
+                          {restoringHistoryId === item.id ? (
+                            <LoaderCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin" />
+                          ) : null}
+                        </div>
                         <div className="text-muted-foreground">{item.cwd}</div>
                         <div className="text-muted-foreground">
-                          {formatDateTime(item.updatedAt)} · {item.source || "unknown"} · {item.status}
+                          {formatDateTime(item.updatedAt)} · {item.source || "unknown"} · {restoringHistoryId === item.id ? "restoring" : item.status}
                         </div>
                       </button>
                     ))}
@@ -445,10 +533,37 @@ function App() {
                 </ScrollArea>
               </DialogContent>
             </Dialog>
-            <Button size="sm" disabled={!activeDaemonId} onClick={() => void handleCreateSession()}>
-              <Play className="h-3.5 w-3.5" />
-              New
-            </Button>
+            <Dialog open={newSessionOpen} onOpenChange={setNewSessionOpen}>
+              <DialogTrigger asChild>
+                <Button size="sm" disabled={!activeDaemonId}>
+                  <Play className="h-3.5 w-3.5" />
+                  New
+                </Button>
+              </DialogTrigger>
+              <DialogContent className="top-1/2 right-1/2 h-auto max-w-[560px] translate-x-1/2 -translate-y-1/2 rounded-lg border">
+                <DialogHeader>
+                  <DialogTitle>New Session</DialogTitle>
+                  <DialogDescription>cwd</DialogDescription>
+                </DialogHeader>
+                <div className="grid gap-3 p-4">
+                  <Input
+                    value={cwd}
+                    onChange={(event) => setCwd(event.target.value)}
+                    placeholder="Working directory"
+                  />
+                  <div className="flex justify-end">
+                    <Button
+                      size="sm"
+                      disabled={!activeDaemonId || !cwd.trim() || creatingSession}
+                      onClick={() => void handleCreateSession()}
+                    >
+                      {creatingSession ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : null}
+                      Create
+                    </Button>
+                  </div>
+                </div>
+              </DialogContent>
+            </Dialog>
             <Button
               variant="ghost"
               size="icon"
@@ -498,7 +613,7 @@ function App() {
             </ScrollArea>
           </aside>
 
-          <main className="grid min-h-0 grid-rows-[64px_minmax(0,1fr)_152px]">
+          <main className="grid min-h-0 grid-rows-[64px_minmax(0,1fr)_auto]">
             <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-b border-border px-3">
               <div className="min-w-0">
                 <div className="truncate text-sm font-medium">{activeSession?.title || activeDaemon?.name || "No Session"}</div>
@@ -537,44 +652,70 @@ function App() {
               </div>
             </div>
 
-            <div ref={transcriptRef} className="min-h-0 overflow-auto bg-muted/10">
-              <div
-                className="relative mx-auto w-full max-w-[1200px] px-3 py-3"
-                style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
-              >
-                {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-                  const entry = transcript[virtualRow.index];
-                  if (!entry) {
-                    return null;
-                  }
-                  return (
-                    <div
-                      key={entry.id}
-                      className="absolute left-0 top-0 w-full px-3"
-                      style={{ transform: `translateY(${virtualRow.start}px)` }}
-                    >
-                      <TranscriptCard
-                        entry={entry}
-                        expanded={expanded.has(entry.id)}
-                        onToggle={() =>
-                          setExpanded((current) => {
-                            const next = new Set(current);
-                            if (next.has(entry.id)) {
-                              next.delete(entry.id);
-                            } else {
-                              next.add(entry.id);
-                            }
-                            return next;
-                          })
-                        }
-                      />
+            <div
+              ref={transcriptRef}
+              className="min-h-0 overflow-auto bg-muted/10"
+              onScroll={handleTranscriptScroll}
+            >
+              {sessionLoading ? (
+                <div className="flex h-full items-center justify-center px-3 py-3">
+                  <div className="flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-sm text-muted-foreground shadow-sm">
+                    <LoaderCircle className="h-4 w-4 animate-spin" />
+                    Loading session
+                  </div>
+                </div>
+              ) : (
+                <div
+                  className="relative mx-auto w-full max-w-[1200px] px-3 py-3"
+                  style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
+                >
+                  {hasOlderTranscript ? (
+                    <div className="sticky top-0 z-10 mb-2 flex justify-center">
+                      <div className="rounded-full border border-border bg-background/90 px-3 py-1 text-[11px] text-muted-foreground backdrop-blur">
+                        Scroll top to load older messages
+                      </div>
                     </div>
-                  );
-                })}
-              </div>
+                  ) : null}
+                  {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                    const entry = visibleTranscript[virtualRow.index];
+                    if (!entry) {
+                      return null;
+                    }
+                    return (
+                      <div
+                        key={entry.id}
+                        data-index={virtualRow.index}
+                        ref={(node) => {
+                          if (node) {
+                            rowVirtualizer.measureElement(node);
+                          }
+                        }}
+                        className="absolute left-0 top-0 w-full px-3"
+                        style={{ transform: `translateY(${virtualRow.start}px)` }}
+                      >
+                        <TranscriptCard
+                          entry={entry}
+                          expanded={expanded.has(entry.id)}
+                          onToggle={() =>
+                            setExpanded((current) => {
+                              const next = new Set(current);
+                              if (next.has(entry.id)) {
+                                next.delete(entry.id);
+                              } else {
+                                next.add(entry.id);
+                              }
+                              return next;
+                            })
+                          }
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
 
-            <div className="grid gap-2 border-t border-border p-3">
+            <div className="grid gap-1.5 border-t border-border p-3">
               <Textarea
                 value={composer}
                 onChange={(event) => setComposer(event.target.value)}
@@ -585,14 +726,45 @@ function App() {
                   }
                 }}
                 placeholder="Enter send · Ctrl+Enter newline"
-                className="min-h-[108px] max-h-[108px]"
+                className="min-h-[96px] max-h-[96px]"
               />
-              <div className="flex items-center justify-between gap-2">
-                <div className="truncate text-xs text-muted-foreground">
-                  {activeDaemon
-                    ? `${activeDaemon.name} · ${activeDaemon.platform} · ${formatDateTime(activeDaemon.lastSeenAt)}`
-                    : "no daemon"}
+              <div className="flex items-center gap-1 overflow-x-auto">
+                <InlineSelect
+                  value={sandbox}
+                  onValueChange={(value) => {
+                    const nextValue = value as "read-only" | "workspace-write" | "danger-full-access";
+                    setSandbox(nextValue);
+                    void handleSessionConfigChange({ sandbox: nextValue });
+                  }}
+                  options={SANDBOX_OPTIONS}
+                />
+                <InlineSelect
+                  value={model}
+                  onValueChange={(value) => {
+                    setModel(value);
+                    void handleSessionConfigChange({ model: value });
+                  }}
+                  options={config.models.map((item) => ({
+                    value: item.model,
+                    label: item.model,
+                  }))}
+                />
+                <InlineSelect
+                  value={effort}
+                  onValueChange={(value) => {
+                    setEffort(value);
+                    void handleSessionConfigChange({ reasoningEffort: value });
+                  }}
+                  options={(currentModel?.supportedReasoningEfforts || []).map((item) => ({
+                    value: item.reasoningEffort,
+                    label: formatEffortLabel(item.reasoningEffort),
+                  }))}
+                />
+                <div className="truncate pl-2 text-xs text-muted-foreground">
+                  {activeSession ? activeSession.cwd : cwd}
                 </div>
+              </div>
+              <div className="flex items-center justify-end gap-2">
                 <div className="flex items-center gap-2">
                   {activity ? (
                     <div className="flex items-center gap-1 text-xs text-muted-foreground">
@@ -630,34 +802,164 @@ function TranscriptCard({
   const expandable = ["tool", "command", "file_change", "reasoning"].includes(entry.kind);
   const preview = entry.kind === "reasoning" ? entry.text || "thinking" : lastLines(entry.text, TOOL_LINE_LIMIT);
   const body = expandable && !expanded ? preview : entry.text;
+  const rowClassName = getBubbleRowClassName(entry);
+  const bubbleClassName = getBubbleClassName(entry);
+  const metaBadges = getEntryMetaBadges(entry);
+  const showMetaHeader = metaBadges.length > 0 || !isChatBubble(entry);
 
   return (
-    <article className="mb-2 rounded-md border border-border bg-card px-3 py-2 shadow-sm">
-      <div className="mb-1.5 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
-        <div className="flex items-center gap-1.5">
-          <Badge variant={variantForEntry(entry)}>{entry.kind}</Badge>
-          {entry.status ? <Badge variant="outline">{entry.status}</Badge> : null}
-          {entry.phase ? <Badge variant="outline">{entry.phase}</Badge> : null}
-        </div>
-        <div>{formatTime(entry.createdAt)}</div>
+    <article className={`mb-4 flex w-full ${rowClassName}`}>
+      <div className={bubbleClassName}>
+        {showMetaHeader ? (
+          <div className="mb-2 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+            <div className="flex items-center gap-1.5">
+              {!isChatBubble(entry) ? <Badge variant={variantForEntry(entry)}>{entry.kind}</Badge> : null}
+              {metaBadges.map((badge) => (
+                <Badge key={badge.label} variant={badge.variant}>
+                  {badge.label}
+                </Badge>
+              ))}
+            </div>
+            <div>{formatTime(entry.createdAt)}</div>
+          </div>
+        ) : null}
+
+        {renderEntryBody(entry, body, expanded)}
+
+        {expandable && entry.text ? (
+          <div className="mt-2 flex justify-end">
+            <Button variant="ghost" size="sm" onClick={onToggle}>
+              {expanded ? "Collapse" : "Expand"}
+            </Button>
+          </div>
+        ) : null}
       </div>
+    </article>
+  );
+}
+
+function renderEntryBody(entry: TranscriptEntry, body: string, expanded: boolean) {
+  if (entry.kind === "assistant" || entry.kind === "user") {
+    return <MarkdownBody text={body} />;
+  }
+
+  if (entry.kind === "file_change") {
+    return expanded ? (
+      <div className="max-h-80 overflow-auto rounded-md border border-border bg-background/70">
+        <DiffViewer text={body} />
+      </div>
+    ) : (
+      <pre className="overflow-hidden whitespace-pre-wrap break-words font-mono text-xs leading-5 text-foreground/90">
+        {body}
+      </pre>
+    );
+  }
+
+  if (entry.kind === "command" || entry.kind === "tool") {
+    return (
       <div
         className={
-          expandable && expanded
-            ? "max-h-72 overflow-auto rounded border border-border bg-muted/30 p-2 font-mono text-xs leading-5 whitespace-pre-wrap"
-            : "whitespace-pre-wrap text-sm leading-6"
+          expanded
+            ? "max-h-80 overflow-auto rounded-md border border-border bg-background/70 p-2 font-mono text-xs leading-5 whitespace-pre-wrap"
+            : "overflow-hidden whitespace-pre-wrap break-words font-mono text-xs leading-5 text-foreground/90"
         }
       >
-        {body || (entry.kind === "reasoning" ? "thinking" : "")}
+        {body}
       </div>
-      {expandable && entry.text ? (
-        <div className="mt-2 flex justify-end">
-          <Button variant="ghost" size="sm" onClick={onToggle}>
-            {expanded ? "Collapse" : "Expand"}
-          </Button>
+    );
+  }
+
+  if (entry.kind === "reasoning") {
+    return expanded ? (
+      <div className="max-h-72 overflow-auto rounded-md border border-border bg-background/60 p-2">
+        <MarkdownBody text={body || "thinking"} muted />
+      </div>
+    ) : (
+      <div className="text-sm leading-6 text-muted-foreground">{body || "thinking"}</div>
+    );
+  }
+
+  return <MarkdownBody text={body || ""} muted={entry.kind === "system"} />;
+}
+
+function MarkdownBody({ text, muted = false }: { text: string; muted?: boolean }) {
+  return (
+    <div className={muted ? "markdown-body text-sm leading-6 text-muted-foreground" : "markdown-body text-sm leading-6"}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          code(props) {
+            const { children, className } = props;
+            const inline = !className;
+            if (inline) {
+              return <code className="rounded bg-muted px-1 py-0.5 font-mono text-[0.92em]">{children}</code>;
+            }
+            return (
+              <pre className="overflow-auto rounded-md border border-border bg-background/70 p-3">
+                <code className={className}>{children}</code>
+              </pre>
+            );
+          },
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+function DiffViewer({ text }: { text: string }) {
+  const sections = parseDiffSections(text);
+
+  return (
+    <div className="divide-y divide-border">
+      {sections.map((section, index) => (
+        <div key={`${section.path}-${index}`} className="overflow-hidden">
+          <div className="flex items-center gap-2 border-b border-border bg-muted/40 px-3 py-2 text-xs font-medium">
+            <GitCommitHorizontal className="h-3.5 w-3.5" />
+            <span className="truncate">{section.path || `Change ${index + 1}`}</span>
+          </div>
+          <div className="font-mono text-xs leading-5">
+            {section.lines.map((line, lineIndex) => (
+              <div
+                key={`${section.path}-${lineIndex}`}
+                className={getDiffLineClassName(line)}
+              >
+                <span className="select-none pr-3 text-[10px] text-muted-foreground/70">
+                  {lineIndex + 1}
+                </span>
+                <span className="whitespace-pre-wrap break-words">{line || " "}</span>
+              </div>
+            ))}
+          </div>
         </div>
-      ) : null}
-    </article>
+      ))}
+    </div>
+  );
+}
+
+function InlineSelect({
+  value,
+  onValueChange,
+  options,
+}: {
+  value: string;
+  onValueChange: (value: string) => void;
+  options: ReadonlyArray<{ value: string; label: string }>;
+}) {
+  return (
+    <Select value={value} onValueChange={onValueChange}>
+      <SelectTrigger className="h-7 w-auto shrink-0 gap-1 border-transparent bg-transparent px-2 text-[14px] font-medium text-foreground shadow-none hover:bg-accent/50 focus:ring-0">
+        <SelectValue placeholder="Select" />
+      </SelectTrigger>
+      <SelectContent>
+        {options.map((option) => (
+          <SelectItem key={option.value} value={option.value}>
+            {option.label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
   );
 }
 
@@ -694,7 +996,23 @@ function StatusBadge({ connectionState }: { connectionState: "connecting" | "ope
   );
 }
 
-function getActivity(session: SessionDetails | null): ActivityState | null {
+function getActivity(
+  session: SessionDetails | null,
+  pending?: {
+    creatingSession?: boolean;
+    restoringHistory?: boolean;
+    sessionLoading?: boolean;
+  },
+): ActivityState | null {
+  if (pending?.restoringHistory) {
+    return { label: "restoring", variant: "warning" };
+  }
+  if (pending?.creatingSession) {
+    return { label: "starting", variant: "default" };
+  }
+  if (pending?.sessionLoading) {
+    return { label: "loading", variant: "default" };
+  }
   if (!session) {
     return null;
   }
@@ -735,6 +1053,153 @@ function variantForEntry(entry: TranscriptEntry): "default" | "outline" | "warni
       return "success";
     default:
       return "outline";
+  }
+}
+
+function isChatBubble(entry: TranscriptEntry) {
+  return entry.kind === "user" || entry.kind === "assistant";
+}
+
+function getEntryMetaBadges(entry: TranscriptEntry): Array<{
+  label: string;
+  variant: "default" | "outline" | "warning" | "destructive" | "success";
+}> {
+  const badges: Array<{
+    label: string;
+    variant: "default" | "outline" | "warning" | "destructive" | "success";
+  }> = [];
+
+  if (entry.kind === "reasoning") {
+    if (entry.status && entry.status !== "completed") {
+      badges.push({ label: entry.status, variant: "outline" });
+    }
+    return badges;
+  }
+
+  if (!isChatBubble(entry) && entry.status) {
+    badges.push({
+      label: entry.status,
+      variant: entry.status === "failed" ? "destructive" : "outline",
+    });
+  }
+
+  if (!isChatBubble(entry) && entry.phase && entry.phase !== "final_answer") {
+    badges.push({ label: entry.phase, variant: "outline" });
+  }
+
+  return badges;
+}
+
+function getBubbleClassName(entry: TranscriptEntry) {
+  if (entry.kind === "user") {
+    return "inline-block w-fit max-w-[min(82%,880px)] rounded-2xl rounded-br-md border border-primary/20 bg-primary text-primary-foreground px-4 py-3 shadow-sm";
+  }
+  if (entry.kind === "assistant") {
+    return "inline-block w-fit max-w-[min(82%,880px)] rounded-2xl rounded-bl-md border border-border bg-card px-4 py-3 shadow-sm";
+  }
+  if (entry.kind === "reasoning") {
+    return "inline-block w-fit max-w-[min(82%,880px)] rounded-2xl rounded-bl-md border border-amber-500/20 bg-amber-500/6 px-4 py-3 shadow-sm";
+  }
+  if (entry.kind === "system") {
+    return "w-full max-w-full rounded-xl border border-border bg-muted/40 px-3 py-2 shadow-sm";
+  }
+  return "w-full max-w-full rounded-xl border border-border bg-card px-3 py-3 shadow-sm";
+}
+
+function getBubbleRowClassName(entry: TranscriptEntry) {
+  if (entry.kind === "user") {
+    return "justify-end";
+  }
+  if (entry.kind === "assistant" || entry.kind === "reasoning") {
+    return "justify-start";
+  }
+  return "justify-start";
+}
+
+function parseDiffSections(text: string) {
+  const lines = String(text || "").split(/\r?\n/);
+  const sections: Array<{ path: string; lines: string[] }> = [];
+  let current: { path: string; lines: string[] } | null = null;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+
+    if (line.startsWith("diff --git ")) {
+      const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+      current = {
+        path: match?.[2] || match?.[1] || line,
+        lines: [line],
+      };
+      sections.push(current);
+      continue;
+    }
+
+    if (!current) {
+      const nextLine = lines[index + 1] ?? "";
+      if (line && !isDiffLine(line) && (isDiffLine(nextLine) || nextLine.startsWith("diff --git "))) {
+        current = { path: line, lines: [] };
+        sections.push(current);
+        continue;
+      }
+      current = { path: "output", lines: [] };
+      sections.push(current);
+    }
+
+    current.lines.push(line);
+  }
+
+  return sections.filter((section) => section.lines.length || section.path);
+}
+
+function isDiffLine(line: string) {
+  return (
+    line.startsWith("@@") ||
+    line.startsWith("+") ||
+    line.startsWith("-") ||
+    line.startsWith(" ") ||
+    line.startsWith("---") ||
+    line.startsWith("+++") ||
+    line.startsWith("index ") ||
+    line.startsWith("new file mode") ||
+    line.startsWith("deleted file mode")
+  );
+}
+
+function getDiffLineClassName(line: string) {
+  if (line.startsWith("@@")) {
+    return "grid grid-cols-[auto_1fr] gap-0 border-b border-border/60 bg-blue-500/8 px-3 py-1 text-blue-700 dark:text-blue-300";
+  }
+  if (line.startsWith("+++")) {
+    return "grid grid-cols-[auto_1fr] gap-0 bg-emerald-500/10 px-3 py-1 text-emerald-800 dark:text-emerald-300";
+  }
+  if (line.startsWith("---")) {
+    return "grid grid-cols-[auto_1fr] gap-0 bg-rose-500/10 px-3 py-1 text-rose-800 dark:text-rose-300";
+  }
+  if (line.startsWith("+")) {
+    return "grid grid-cols-[auto_1fr] gap-0 bg-emerald-500/8 px-3 py-1 text-emerald-800 dark:text-emerald-200";
+  }
+  if (line.startsWith("-")) {
+    return "grid grid-cols-[auto_1fr] gap-0 bg-rose-500/8 px-3 py-1 text-rose-800 dark:text-rose-200";
+  }
+  return "grid grid-cols-[auto_1fr] gap-0 px-3 py-1 text-foreground/90";
+}
+
+function formatEffortLabel(value: string) {
+  switch (value) {
+    case "none":
+      return "None";
+    case "minimal":
+      return "Minimal";
+    case "low":
+      return "Low";
+    case "medium":
+      return "Medium";
+    case "high":
+      return "High";
+    case "xhigh":
+      return "XHigh";
+    default:
+      return value;
   }
 }
 
@@ -779,8 +1244,10 @@ function estimateEntryHeight(entry: TranscriptEntry | undefined) {
   const previewLines =
     entry.kind === "tool" || entry.kind === "command" || entry.kind === "file_change"
       ? Math.min(lines, TOOL_LINE_LIMIT)
+      : entry.kind === "assistant" || entry.kind === "user"
+        ? Math.min(lines + 1, 24)
       : Math.min(lines, 16);
-  return Math.max(84, 52 + previewLines * 18);
+  return Math.max(88, 56 + previewLines * 20);
 }
 
 export default App;

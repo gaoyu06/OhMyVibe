@@ -21,6 +21,7 @@ export class JsonRpcProcess extends EventEmitter<{
   >();
   private nextId = 1;
   private stdoutBuffer = "";
+  private stderrBuffer = "";
 
   constructor(command: string, args: string[], cwd: string) {
     super();
@@ -33,7 +34,7 @@ export class JsonRpcProcess extends EventEmitter<{
     this.child.stdout.setEncoding("utf8");
     this.child.stderr.setEncoding("utf8");
     this.child.stdout.on("data", (chunk: string) => this.onStdout(chunk));
-    this.child.stderr.on("data", (chunk: string) => this.emit("stderr", chunk));
+    this.child.stderr.on("data", (chunk: string) => this.onStderr(chunk));
     this.child.on("error", (error) => {
       for (const pending of this.pending.values()) {
         pending.reject(error);
@@ -43,6 +44,7 @@ export class JsonRpcProcess extends EventEmitter<{
       this.emit("exit", { code: null, signal: null });
     });
     this.child.on("exit", (code, signal) => {
+      this.flushStderr();
       const error = new Error(`JSON-RPC process exited (code=${code}, signal=${signal})`);
       for (const pending of this.pending.values()) {
         pending.reject(error);
@@ -116,6 +118,31 @@ export class JsonRpcProcess extends EventEmitter<{
       if (message.method) {
         this.emit("notification", { method: message.method, params: message.params });
       }
+    }
+  }
+
+  private onStderr(chunk: string): void {
+    this.stderrBuffer += chunk;
+
+    while (true) {
+      const newlineIndex = this.stderrBuffer.indexOf("\n");
+      if (newlineIndex === -1) {
+        break;
+      }
+
+      const line = this.stderrBuffer.slice(0, newlineIndex);
+      this.stderrBuffer = this.stderrBuffer.slice(newlineIndex + 1);
+      if (line.trim()) {
+        this.emit("stderr", line);
+      }
+    }
+  }
+
+  private flushStderr(): void {
+    const remaining = this.stderrBuffer.trim();
+    this.stderrBuffer = "";
+    if (remaining) {
+      this.emit("stderr", remaining);
     }
   }
 }
