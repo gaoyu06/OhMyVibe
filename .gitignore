@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.generated/
+*.log
+data/
+web/node_modules/
+web/dist/

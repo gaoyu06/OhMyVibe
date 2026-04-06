@@ -1,0 +1,34 @@
+{
+  "name": "ohmyvibe",
+  "version": "0.1.0",
+  "description": "VibeCoding daemon + web console MVP for orchestrating Codex sessions",
+  "main": "dist/daemon/index.js",
+  "scripts": {
+    "build": "npm run build:daemon && npm run build:web",
+    "build:daemon": "tsc -p tsconfig.json",
+    "build:web": "npm --prefix web run build",
+    "daemon": "tsx src/daemon/index.ts",
+    "acp": "tsx src/acp/index.ts",
+    "dev": "tsx watch src/daemon/index.ts",
+    "web:dev": "npm --prefix web run dev",
+    "web:preview": "npm --prefix web run preview"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^0.18.0",
+    "express": "^5.2.1",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}

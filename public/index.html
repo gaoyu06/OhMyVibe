@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OhMyVibe Console</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="navbar">
+        <div class="navbar-brand">
+          <div class="brand-mark">OV</div>
+          <div>
+            <strong>OhMyVibe</strong>
+            <div class="navbar-subtitle">Codex orchestration console</div>
+          </div>
+        </div>
+        <form id="create-session-form" class="navbar-controls">
+          <input id="cwd-input" name="cwd" value="C:\Code\Projects\OhMyVibe" required />
+          <select id="model-select" name="model"></select>
+          <select id="effort-select" name="reasoningEffort"></select>
+          <button type="submit">新建会话</button>
+          <button type="button" id="history-toggle" class="ghost-button">恢复历史</button>
+          <button type="button" id="theme-toggle" class="ghost-button">切换主题</button>
+        </form>
+      </header>
+
+      <div class="workspace">
+        <aside class="sidebar">
+          <div class="sidebar-header">
+            <strong>Sessions</strong>
+            <span id="session-count" class="muted">0</span>
+          </div>
+          <div id="session-list" class="session-list"></div>
+        </aside>
+
+        <main class="chat-panel">
+          <section id="session-meta" class="meta-bar empty">选择左侧会话开始交互</section>
+
+          <section id="transcript" class="transcript-shell">
+            <div id="transcript-top-spacer"></div>
+            <div id="transcript-list"></div>
+            <div id="transcript-bottom-spacer"></div>
+          </section>
+
+          <form id="message-form" class="composer">
+            <textarea
+              id="message-input"
+              name="text"
+              placeholder="Enter 发送，Ctrl+Enter 换行"
+              required
+            ></textarea>
+            <div class="composer-actions">
+              <div id="activity-indicator" class="activity-indicator hidden"></div>
+              <div class="composer-buttons">
+                <button type="submit">发送</button>
+                <button type="button" id="interrupt-button" class="ghost-button">中断</button>
+                <button type="button" id="delete-button" class="danger">关闭会话</button>
+              </div>
+            </div>
+          </form>
+        </main>
+      </div>
+    </div>
+
+    <div id="history-modal" class="history-modal hidden">
+      <div id="history-backdrop" class="history-backdrop"></div>
+      <section class="history-panel">
+        <div class="history-header">
+          <div>
+            <strong>Codex History</strong>
+            <div class="navbar-subtitle">从 `~/.codex/sessions` 恢复到当前应用</div>
+          </div>
+          <button type="button" id="history-close" class="ghost-button">关闭</button>
+        </div>
+        <div id="history-list" class="history-list"></div>
+      </section>
+    </div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
