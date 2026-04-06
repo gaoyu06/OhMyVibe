@@ -79,6 +79,17 @@ export interface CodexHistoryEntry {
   modelProvider?: string;
 }
 
+export interface DaemonDescriptor {
+  id: string;
+  name: string;
+  platform: string;
+  cwd: string;
+  connectedAt: string;
+  lastSeenAt: string;
+  online: boolean;
+  sessionCount: number;
+}
+
 export type DaemonEvent =
   | {
       type: "session-created";

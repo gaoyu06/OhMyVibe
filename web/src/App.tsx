@@ -27,17 +27,18 @@ import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { formatDateTime, formatTime, lastLines } from "@/lib/utils";
 import type {
   CodexHistoryEntry,
   DaemonConfig,
+  DaemonDescriptor,
   DaemonEvent,
   SessionDetails,
   SessionSummary,
   TranscriptEntry,
 } from "@/lib/types";
+import { formatDateTime, formatTime, lastLines } from "@/lib/utils";
 
-const DEFAULT_SERVER_URL = import.meta.env.VITE_DAEMON_URL || window.location.origin;
+const DEFAULT_CONTROL_URL = import.meta.env.VITE_CONTROL_SERVER_URL || window.location.origin;
 const TOOL_LINE_LIMIT = 30;
 
 type ThemeMode = "light" | "dark";
@@ -51,15 +52,17 @@ function App() {
   const [theme, setTheme] = useState<ThemeMode>(
     () => (localStorage.getItem("ohmyvibe-theme") as ThemeMode) || "dark",
   );
-  const [serverUrlInput, setServerUrlInput] = useState(
-    () => localStorage.getItem("ohmyvibe-server-url") || DEFAULT_SERVER_URL,
+  const [controlUrlInput, setControlUrlInput] = useState(
+    () => localStorage.getItem("ohmyvibe-control-url") || DEFAULT_CONTROL_URL,
   );
-  const [serverUrl, setServerUrl] = useState(
-    () => localStorage.getItem("ohmyvibe-server-url") || DEFAULT_SERVER_URL,
+  const [controlUrl, setControlUrl] = useState(
+    () => localStorage.getItem("ohmyvibe-control-url") || DEFAULT_CONTROL_URL,
   );
   const [connectionState, setConnectionState] = useState<"connecting" | "open" | "closed" | "error">(
     "connecting",
   );
+  const [daemons, setDaemons] = useState<DaemonDescriptor[]>([]);
+  const [activeDaemonId, setActiveDaemonId] = useState<string | null>(null);
   const [config, setConfig] = useState<DaemonConfig>({ models: [] });
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [history, setHistory] = useState<CodexHistoryEntry[]>([]);
@@ -79,77 +82,122 @@ function App() {
   }, [theme]);
 
   useEffect(() => {
-    setServerUrlInput(serverUrl);
-    localStorage.setItem("ohmyvibe-server-url", serverUrl);
-  }, [serverUrl]);
+    setControlUrlInput(controlUrl);
+    localStorage.setItem("ohmyvibe-control-url", controlUrl);
+  }, [controlUrl]);
 
   useEffect(() => {
-    void loadConfig();
-    void loadSessions();
-
-    const ws = new WebSocket(toWsUrl(serverUrl));
+    let disposed = false;
+    const ws = new WebSocket(toWsUrl(controlUrl));
     setConnectionState("connecting");
 
-    ws.onopen = () => setConnectionState("open");
-    ws.onerror = () => setConnectionState("error");
-    ws.onclose = () => setConnectionState("closed");
+    ws.onopen = () => {
+      if (!disposed) {
+        setConnectionState("open");
+      }
+    };
+    ws.onerror = () => {
+      if (!disposed) {
+        setConnectionState("error");
+      }
+    };
+    ws.onclose = () => {
+      if (!disposed) {
+        setConnectionState("closed");
+      }
+    };
     ws.onmessage = (event) => {
-      const payload = JSON.parse(event.data) as DaemonEvent | { type: "hello"; sessions: SessionSummary[] };
+      const payload = JSON.parse(event.data) as
+        | { type: "hello"; daemons: DaemonDescriptor[] }
+        | { type: "daemon-connected"; daemon: DaemonDescriptor }
+        | { type: "daemon-disconnected"; daemonId: string }
+        | { type: "daemon-event"; daemonId: string; event: DaemonEvent };
+
       if (payload.type === "hello") {
-        setSessions(payload.sessions);
-        setActiveSessionId((current) => current ?? payload.sessions[0]?.id ?? null);
+        setDaemons(payload.daemons);
+        setActiveDaemonId((current) => current ?? payload.daemons[0]?.id ?? null);
         return;
       }
 
-      if (payload.type === "session-created" || payload.type === "session-updated") {
-        setSessions((current) => upsertSessionSummary(current, payload.session));
-        setActiveSession((current) =>
-          current && current.id === payload.session.id ? { ...current, ...payload.session } : current,
+      if (payload.type === "daemon-connected") {
+        setDaemons((current) => upsertDaemon(current, payload.daemon));
+        setActiveDaemonId((current) => current ?? payload.daemon.id);
+        return;
+      }
+
+      if (payload.type === "daemon-disconnected") {
+        setDaemons((current) =>
+          current.map((daemon) =>
+            daemon.id === payload.daemonId
+              ? { ...daemon, online: false, lastSeenAt: new Date().toISOString() }
+              : daemon,
+          ),
         );
         return;
       }
 
-      if (payload.type === "session-deleted") {
-        setSessions((current) => current.filter((session) => session.id !== payload.sessionId));
-        setActiveSession((current) => (current?.id === payload.sessionId ? null : current));
-        setActiveSessionId((current) => (current === payload.sessionId ? null : current));
-        return;
-      }
-
-      if (payload.type === "session-entry") {
-        setActiveSession((current) => {
-          if (!current || current.id !== payload.sessionId) {
-            return current;
-          }
-          const nextTranscript = [...current.transcript, payload.entry];
-          return { ...current, transcript: nextTranscript, transcriptCount: nextTranscript.length };
-        });
-        if (payload.entry.kind === "reasoning" && payload.entry.status === "streaming") {
-          setExpanded((current) => new Set(current).add(payload.entry.id));
+      if (payload.type === "daemon-event" && payload.daemonId === activeDaemonId) {
+        const event = payload.event;
+        if (event.type === "session-created" || event.type === "session-updated") {
+          setSessions((current) => upsertSessionSummary(current, event.session));
+          setActiveSession((current) =>
+            current && current.id === event.session.id ? { ...current, ...event.session } : current,
+          );
+          return;
         }
-        return;
-      }
-
-      if (payload.type === "session-reset") {
-        setActiveSession((current) =>
-          current && current.id === payload.sessionId
-            ? { ...current, transcript: payload.transcript, transcriptCount: payload.transcript.length }
-            : current,
-        );
+        if (event.type === "session-deleted") {
+          setSessions((current) => current.filter((session) => session.id !== event.sessionId));
+          setActiveSession((current) => (current?.id === event.sessionId ? null : current));
+          setActiveSessionId((current) => (current === event.sessionId ? null : current));
+          return;
+        }
+        if (event.type === "session-entry") {
+          setActiveSession((current) => {
+            if (!current || current.id !== event.sessionId) {
+              return current;
+            }
+            const nextTranscript = [...current.transcript, event.entry];
+            return { ...current, transcript: nextTranscript, transcriptCount: nextTranscript.length };
+          });
+          if (event.entry.kind === "reasoning" && event.entry.status === "streaming") {
+            setExpanded((current) => new Set(current).add(event.entry.id));
+          }
+          return;
+        }
+        if (event.type === "session-reset") {
+          setActiveSession((current) =>
+            current && current.id === event.sessionId
+              ? { ...current, transcript: event.transcript, transcriptCount: event.transcript.length }
+              : current,
+          );
+        }
       }
     };
 
     return () => {
+      disposed = true;
       ws.close();
     };
-  }, [serverUrl]);
+  }, [activeDaemonId, controlUrl]);
 
   useEffect(() => {
-    if (!activeSessionId) {
+    if (!activeDaemonId) {
+      setConfig({ models: [] });
+      setSessions([]);
+      setActiveSession(null);
+      setActiveSessionId(null);
       return;
     }
-    void loadSession(activeSessionId);
-  }, [activeSessionId]);
+    void loadConfig(activeDaemonId);
+    void loadSessions(activeDaemonId);
+  }, [activeDaemonId]);
+
+  useEffect(() => {
+    if (!activeDaemonId || !activeSessionId) {
+      return;
+    }
+    void loadSession(activeDaemonId, activeSessionId);
+  }, [activeDaemonId, activeSessionId]);
 
   const currentModel = useMemo(
     () => config.models.find((item) => item.model === model) ?? config.models[0],
@@ -170,21 +218,18 @@ function App() {
   }, [config, currentModel, effort, model]);
 
   const transcript = activeSession?.transcript ?? [];
-  const parentRef = transcriptRef;
   const rowVirtualizer = useVirtualizer({
     count: transcript.length,
-    getScrollElement: () => parentRef.current,
+    getScrollElement: () => transcriptRef.current,
     estimateSize: (index) => estimateEntryHeight(transcript[index]),
     overscan: 8,
   });
-
   const activity = getActivity(activeSession);
+  const activeDaemon = daemons.find((item) => item.id === activeDaemonId) ?? null;
 
   async function api<T>(path: string, options?: RequestInit) {
-    const response = await fetch(new URL(path, normalizeBaseUrl(serverUrl)).toString(), {
-      headers: {
-        "Content-Type": "application/json",
-      },
+    const response = await fetch(new URL(path, normalizeBaseUrl(controlUrl)).toString(), {
+      headers: { "Content-Type": "application/json" },
       ...options,
     });
 
@@ -199,8 +244,8 @@ function App() {
     return payload;
   }
 
-  async function loadConfig() {
-    const nextConfig = await api<DaemonConfig>("/api/config");
+  async function loadConfig(daemonId: string) {
+    const nextConfig = await api<DaemonConfig>(`/api/daemons/${daemonId}/config`);
     setConfig(nextConfig);
     const nextModel = nextConfig.defaultModel || nextConfig.models[0]?.model || "";
     if (nextModel) {
@@ -210,14 +255,14 @@ function App() {
     }
   }
 
-  async function loadSessions() {
-    const nextSessions = await api<SessionSummary[]>("/api/sessions");
+  async function loadSessions(daemonId: string) {
+    const nextSessions = await api<SessionSummary[]>(`/api/daemons/${daemonId}/sessions`);
     setSessions(nextSessions);
     setActiveSessionId((current) => current ?? nextSessions[0]?.id ?? null);
   }
 
-  async function loadSession(sessionId: string) {
-    const session = await api<SessionDetails>(`/api/sessions/${sessionId}`);
+  async function loadSession(daemonId: string, sessionId: string) {
+    const session = await api<SessionDetails>(`/api/daemons/${daemonId}/sessions/${sessionId}`);
     setActiveSession(session);
     setExpanded((current) => {
       const next = new Set(current);
@@ -230,13 +275,16 @@ function App() {
     });
   }
 
-  async function loadHistory() {
-    const items = await api<CodexHistoryEntry[]>("/api/history");
+  async function loadHistory(daemonId: string) {
+    const items = await api<CodexHistoryEntry[]>(`/api/daemons/${daemonId}/history`);
     setHistory(items);
   }
 
   async function handleCreateSession() {
-    const session = await api<SessionDetails>("/api/sessions", {
+    if (!activeDaemonId) {
+      return;
+    }
+    const session = await api<SessionDetails>(`/api/daemons/${activeDaemonId}/sessions`, {
       method: "POST",
       body: JSON.stringify({
         cwd,
@@ -251,25 +299,31 @@ function App() {
   }
 
   async function handleRestoreSession(item: CodexHistoryEntry) {
-    const session = await api<SessionDetails>(`/api/history/${item.id}/restore`, {
-      method: "POST",
-      body: JSON.stringify({
-        cwd: item.cwd || cwd,
-        model,
-        reasoningEffort: effort,
-        sandbox: "workspace-write",
-      }),
-    });
+    if (!activeDaemonId) {
+      return;
+    }
+    const session = await api<SessionDetails>(
+      `/api/daemons/${activeDaemonId}/history/${item.id}/restore`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          cwd: item.cwd || cwd,
+          model,
+          reasoningEffort: effort,
+          sandbox: "workspace-write",
+        }),
+      },
+    );
     setHistoryOpen(false);
     setActiveSessionId(session.id);
     setActiveSession(session);
   }
 
   async function handleSendMessage() {
-    if (!activeSessionId || !composer.trim()) {
+    if (!activeDaemonId || !activeSessionId || !composer.trim()) {
       return;
     }
-    await api(`/api/sessions/${activeSessionId}/messages`, {
+    await api(`/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/messages`, {
       method: "POST",
       body: JSON.stringify({ text: composer.trim() }),
     });
@@ -277,21 +331,25 @@ function App() {
   }
 
   async function handleInterrupt() {
-    if (!activeSessionId) {
+    if (!activeDaemonId || !activeSessionId) {
       return;
     }
-    await api(`/api/sessions/${activeSessionId}/interrupt`, { method: "POST" });
+    await api(`/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/interrupt`, {
+      method: "POST",
+    });
   }
 
   async function handleDelete() {
-    if (!activeSessionId) {
+    if (!activeDaemonId || !activeSessionId) {
       return;
     }
-    await api(`/api/sessions/${activeSessionId}`, { method: "DELETE" });
+    await api(`/api/daemons/${activeDaemonId}/sessions/${activeSessionId}`, {
+      method: "DELETE",
+    });
   }
 
   async function reconnect() {
-    setServerUrl(normalizeBaseUrl(serverUrlInput));
+    setControlUrl(normalizeBaseUrl(controlUrlInput));
   }
 
   return (
@@ -300,8 +358,20 @@ function App() {
         <header className="grid grid-cols-[220px_1fr_auto] items-center gap-3 border-b border-border px-3">
           <div className="text-sm font-semibold tracking-tight">OhMyVibe</div>
 
-          <div className="grid grid-cols-[minmax(180px,280px)_120px_120px_minmax(220px,1fr)] items-center gap-2">
-            <Input value={serverUrlInput} onChange={(event) => setServerUrlInput(event.target.value)} />
+          <div className="grid grid-cols-[minmax(180px,280px)_220px_120px_120px_minmax(220px,1fr)] items-center gap-2">
+            <Input value={controlUrlInput} onChange={(event) => setControlUrlInput(event.target.value)} />
+            <Select value={activeDaemonId ?? ""} onValueChange={setActiveDaemonId}>
+              <SelectTrigger>
+                <SelectValue placeholder="Daemon" />
+              </SelectTrigger>
+              <SelectContent>
+                {daemons.map((item) => (
+                  <SelectItem key={item.id} value={item.id}>
+                    {item.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <Select value={model} onValueChange={setModel}>
               <SelectTrigger>
                 <SelectValue placeholder="Model" />
@@ -339,13 +409,13 @@ function App() {
               open={historyOpen}
               onOpenChange={(open) => {
                 setHistoryOpen(open);
-                if (open) {
-                  void loadHistory();
+                if (open && activeDaemonId) {
+                  void loadHistory(activeDaemonId);
                 }
               }}
             >
               <DialogTrigger asChild>
-                <Button variant="outline" size="sm">
+                <Button variant="outline" size="sm" disabled={!activeDaemonId}>
                   <PanelLeftOpen className="h-3.5 w-3.5" />
                   History
                 </Button>
@@ -353,7 +423,7 @@ function App() {
               <DialogContent>
                 <DialogHeader>
                   <DialogTitle>History</DialogTitle>
-                  <DialogDescription>restore from Codex sessions</DialogDescription>
+                  <DialogDescription>restore from daemon-bound Codex sessions</DialogDescription>
                 </DialogHeader>
                 <ScrollArea className="h-[calc(100vh-64px)]">
                   <div className="space-y-2 p-4">
@@ -375,7 +445,7 @@ function App() {
                 </ScrollArea>
               </DialogContent>
             </Dialog>
-            <Button size="sm" onClick={() => void handleCreateSession()}>
+            <Button size="sm" disabled={!activeDaemonId} onClick={() => void handleCreateSession()}>
               <Play className="h-3.5 w-3.5" />
               New
             </Button>
@@ -431,20 +501,37 @@ function App() {
           <main className="grid min-h-0 grid-rows-[64px_minmax(0,1fr)_152px]">
             <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-b border-border px-3">
               <div className="min-w-0">
-                <div className="truncate text-sm font-medium">{activeSession?.title || "No Session"}</div>
+                <div className="truncate text-sm font-medium">{activeSession?.title || activeDaemon?.name || "No Session"}</div>
                 <div className="truncate text-xs text-muted-foreground">
                   {activeSession
                     ? `${activeSession.cwd} · ${activeSession.model || "default"} · ${activeSession.reasoningEffort || "medium"} · ${activeSession.codexThreadId || "pending"}`
-                    : "select or create"}
+                    : activeDaemon
+                      ? `${activeDaemon.cwd} · ${activeDaemon.platform} · ${activeDaemon.id}`
+                      : "select daemon"}
                 </div>
               </div>
               <div className="flex items-center gap-2">
+                {activeDaemon ? (
+                  <Badge variant={activeDaemon.online ? "success" : "destructive"}>
+                    {activeDaemon.online ? "online" : "offline"}
+                  </Badge>
+                ) : null}
                 {activity ? <Badge variant={activity.variant}>{activity.label}</Badge> : null}
-                <Button variant="outline" size="sm" disabled={!activeSessionId} onClick={() => void handleInterrupt()}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!activeDaemonId || !activeSessionId}
+                  onClick={() => void handleInterrupt()}
+                >
                   <Square className="h-3.5 w-3.5" />
                   Stop
                 </Button>
-                <Button variant="destructive" size="sm" disabled={!activeSessionId} onClick={() => void handleDelete()}>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  disabled={!activeDaemonId || !activeSessionId}
+                  onClick={() => void handleDelete()}
+                >
                   Close
                 </Button>
               </div>
@@ -502,7 +589,9 @@ function App() {
               />
               <div className="flex items-center justify-between gap-2">
                 <div className="truncate text-xs text-muted-foreground">
-                  {activeSession?.codexSource || "daemon"} · {activeSession?.origin || "local"}
+                  {activeDaemon
+                    ? `${activeDaemon.name} · ${activeDaemon.platform} · ${formatDateTime(activeDaemon.lastSeenAt)}`
+                    : "no daemon"}
                 </div>
                 <div className="flex items-center gap-2">
                   {activity ? (
@@ -511,7 +600,11 @@ function App() {
                       {activity.label}
                     </div>
                   ) : null}
-                  <Button size="sm" disabled={!activeSessionId || !composer.trim()} onClick={() => void handleSendMessage()}>
+                  <Button
+                    size="sm"
+                    disabled={!activeDaemonId || !activeSessionId || !composer.trim()}
+                    onClick={() => void handleSendMessage()}
+                  >
                     <Send className="h-3.5 w-3.5" />
                     Send
                   </Button>
@@ -548,7 +641,13 @@ function TranscriptCard({
         </div>
         <div>{formatTime(entry.createdAt)}</div>
       </div>
-      <div className={expandable && expanded ? "max-h-72 overflow-auto rounded border border-border bg-muted/30 p-2 font-mono text-xs leading-5 whitespace-pre-wrap" : "whitespace-pre-wrap text-sm leading-6"}>
+      <div
+        className={
+          expandable && expanded
+            ? "max-h-72 overflow-auto rounded border border-border bg-muted/30 p-2 font-mono text-xs leading-5 whitespace-pre-wrap"
+            : "whitespace-pre-wrap text-sm leading-6"
+        }
+      >
         {body || (entry.kind === "reasoning" ? "thinking" : "")}
       </div>
       {expandable && entry.text ? (
@@ -567,7 +666,7 @@ function StatusBadge({ connectionState }: { connectionState: "connecting" | "ope
     return (
       <div className="flex items-center gap-1 text-xs text-muted-foreground">
         <Circle className="h-3.5 w-3.5 fill-emerald-500 text-emerald-500" />
-        connected
+        control
       </div>
     );
   }
@@ -600,11 +699,15 @@ function getActivity(session: SessionDetails | null): ActivityState | null {
     return null;
   }
   const transcript = session.transcript || [];
-  const reasoning = [...transcript].reverse().find((entry) => entry.kind === "reasoning" && entry.status === "streaming");
+  const reasoning = [...transcript]
+    .reverse()
+    .find((entry) => entry.kind === "reasoning" && entry.status === "streaming");
   if (reasoning) {
     return { label: "thinking", variant: "warning" };
   }
-  const assistant = [...transcript].reverse().find((entry) => entry.kind === "assistant" && entry.status === "streaming");
+  const assistant = [...transcript]
+    .reverse()
+    .find((entry) => entry.kind === "assistant" && entry.status === "streaming");
   if (assistant) {
     return { label: "replying", variant: "default" };
   }
@@ -645,8 +748,18 @@ function upsertSessionSummary(current: SessionSummary[], session: SessionSummary
   return next.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
+function upsertDaemon(current: DaemonDescriptor[], daemon: DaemonDescriptor) {
+  const index = current.findIndex((item) => item.id === daemon.id);
+  if (index === -1) {
+    return [daemon, ...current];
+  }
+  const next = [...current];
+  next[index] = daemon;
+  return next;
+}
+
 function normalizeBaseUrl(value: string) {
-  const normalized = value.trim() || DEFAULT_SERVER_URL;
+  const normalized = value.trim() || DEFAULT_CONTROL_URL;
   return normalized.endsWith("/") ? normalized.slice(0, -1) : normalized;
 }
 

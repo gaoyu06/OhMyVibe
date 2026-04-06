@@ -1,0 +1,265 @@
+import express from "express";
+import http from "node:http";
+import path from "node:path";
+import { WebSocket, WebSocketServer } from "ws";
+
+interface DaemonDescriptor {
+  id: string;
+  name: string;
+  platform: string;
+  cwd: string;
+  connectedAt: string;
+  lastSeenAt: string;
+  online: boolean;
+  sessionCount: number;
+}
+
+interface ConnectedDaemon {
+  descriptor: DaemonDescriptor;
+  socket: WebSocket;
+}
+
+const app = express();
+app.use(express.json());
+
+const port = Number(process.env.PORT ?? "3310");
+const rootDir = path.resolve(process.cwd());
+const clientDistDir = path.join(rootDir, "dist");
+const server = http.createServer(app);
+const daemonWss = new WebSocketServer({ server, path: "/daemon" });
+const clientWss = new WebSocketServer({ server, path: "/ws" });
+const daemons = new Map<string, ConnectedDaemon>();
+const pending = new Map<
+  string,
+  {
+    resolve: (value: unknown) => void;
+    reject: (error: Error) => void;
+    timeout: NodeJS.Timeout;
+  }
+>();
+
+app.use(express.static(clientDistDir));
+
+app.get("/api/daemons", (_req, res) => {
+  res.json(Array.from(daemons.values()).map((item) => item.descriptor));
+});
+
+app.get("/api/daemons/:daemonId/config", async (req, res) => {
+  try {
+    res.json(await requestDaemon(req.params.daemonId, "getConfig"));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get("/api/daemons/:daemonId/sessions", async (req, res) => {
+  try {
+    res.json(await requestDaemon(req.params.daemonId, "listSessions"));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get("/api/daemons/:daemonId/history", async (req, res) => {
+  try {
+    res.json(await requestDaemon(req.params.daemonId, "listHistory"));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get("/api/daemons/:daemonId/sessions/:sessionId", async (req, res) => {
+  try {
+    const session = await requestDaemon(req.params.daemonId, "getSession", {
+      sessionId: req.params.sessionId,
+    });
+    if (!session) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    res.json(session);
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post("/api/daemons/:daemonId/sessions", async (req, res) => {
+  try {
+    res.status(201).json(await requestDaemon(req.params.daemonId, "createSession", req.body ?? {}));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post("/api/daemons/:daemonId/history/:threadId/restore", async (req, res) => {
+  try {
+    res.status(201).json(
+      await requestDaemon(req.params.daemonId, "restoreSession", {
+        ...(req.body ?? {}),
+        threadId: req.params.threadId,
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post("/api/daemons/:daemonId/sessions/:sessionId/messages", async (req, res) => {
+  try {
+    res.status(202).json(
+      await requestDaemon(req.params.daemonId, "sendMessage", {
+        sessionId: req.params.sessionId,
+        text: req.body?.text ?? "",
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post("/api/daemons/:daemonId/sessions/:sessionId/interrupt", async (req, res) => {
+  try {
+    res.status(202).json(
+      await requestDaemon(req.params.daemonId, "interruptSession", {
+        sessionId: req.params.sessionId,
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.delete("/api/daemons/:daemonId/sessions/:sessionId", async (req, res) => {
+  try {
+    await requestDaemon(req.params.daemonId, "closeSession", {
+      sessionId: req.params.sessionId,
+    });
+    res.status(204).end();
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get("/{*any}", (_req, res) => {
+  res.sendFile(path.join(clientDistDir, "index.html"));
+});
+
+daemonWss.on("connection", (socket) => {
+  let daemonId: string | undefined;
+
+  socket.on("message", (raw) => {
+    const payload = JSON.parse(String(raw));
+
+    if (payload.type === "daemon-hello") {
+      const helloId = typeof payload?.daemon?.id === "string" ? payload.daemon.id : "";
+      if (!helloId) {
+        return;
+      }
+      daemonId = helloId;
+      const descriptor = {
+        ...payload.daemon,
+        lastSeenAt: new Date().toISOString(),
+        online: true,
+        sessionCount: Array.isArray(payload.sessions) ? payload.sessions.length : 0,
+      };
+      daemons.set(helloId, {
+        descriptor,
+        socket,
+      });
+      broadcast({
+        type: "daemon-connected",
+        daemon: descriptor,
+      });
+      return;
+    }
+
+    if (payload.type === "daemon-response") {
+      const requestId = String(payload.requestId || "");
+      const record = pending.get(requestId);
+      if (!record) {
+        return;
+      }
+      clearTimeout(record.timeout);
+      pending.delete(requestId);
+      if (payload.ok) {
+        record.resolve(payload.data);
+      } else {
+        record.reject(new Error(payload.error || "daemon_request_failed"));
+      }
+      return;
+    }
+
+    if (payload.type === "daemon-event" && daemonId) {
+      const current = daemons.get(daemonId);
+      if (current) {
+        current.descriptor.lastSeenAt = new Date().toISOString();
+      }
+      broadcast({
+        type: "daemon-event",
+        daemonId,
+        event: payload.event,
+      });
+    }
+  });
+
+  socket.on("close", () => {
+    if (!daemonId) {
+      return;
+    }
+    const current = daemons.get(daemonId);
+    if (!current) {
+      return;
+    }
+    current.descriptor.online = false;
+    current.descriptor.lastSeenAt = new Date().toISOString();
+    daemons.delete(daemonId);
+    broadcast({ type: "daemon-disconnected", daemonId });
+  });
+});
+
+clientWss.on("connection", (socket) => {
+  socket.send(
+    JSON.stringify({
+      type: "hello",
+      daemons: Array.from(daemons.values()).map((item) => item.descriptor),
+    }),
+  );
+});
+
+server.listen(port, () => {
+  console.log(`OhMyVibe control server listening on http://localhost:${port}`);
+});
+
+function broadcast(payload: unknown) {
+  const serialized = JSON.stringify(payload);
+  for (const client of clientWss.clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(serialized);
+    }
+  }
+}
+
+function requestDaemon(daemonId: string, method: string, params: Record<string, unknown> = {}) {
+  const daemon = daemons.get(daemonId);
+  if (!daemon) {
+    throw new Error(`Daemon not connected: ${daemonId}`);
+  }
+
+  const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  daemon.socket.send(
+    JSON.stringify({
+      type: "daemon-request",
+      requestId,
+      method,
+      params,
+    }),
+  );
+
+  return new Promise<unknown>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      pending.delete(requestId);
+      reject(new Error(`Daemon request timeout: ${method}`));
+    }, 30000);
+    pending.set(requestId, { resolve, reject, timeout });
+  });
+}

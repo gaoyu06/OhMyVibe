@@ -2,13 +2,13 @@
 
 这是一个 `VibeCoding` 控制台：
 
-- `daemon + standalone web` 架构
+- `daemon -> control server <- browser` 架构（daemon 主动连接管理端）
 - 每个会话独立启动一个 `codex app-server` 子进程
 - daemon 统一管理多会话、消息发送、中断、状态同步
 - 额外提供一个标准 `ACP` bridge 入口，方便后续给编辑器或其他 ACP client 接入
 - 应用侧 session 本地持久化到 `data/sessions.json`
 - 支持从 Codex 历史 `~/.codex/sessions` 恢复会话，并绑定到原始 Codex thread
-- Web 控制台为独立 React + shadcn 风格项目，可连接远程 daemon
+- Web 控制台为独立 React + shadcn 风格项目，浏览器只连接管理端
 
 ## 为什么这样做
 
@@ -27,31 +27,39 @@
 - 本机已安装并可运行 `codex`
 - `codex` 已完成登录
 
-启动 daemon：
+1. 启动 Web 管理端（API + 页面）：
 
 ```bash
 npm install
-npm run daemon
+npm --prefix web install
+npm --prefix web run build
+npm run web:server
 ```
 
-启动独立 Web 控制台：
+默认监听 `http://localhost:3310`
+
+2. 在被控机器启动 daemon，并主动连接管理端：
 
 ```bash
-cd web
-npm install
-npm run dev
+MANAGEMENT_SERVER_URL=http://your-control-host:3310 npm run daemon
 ```
 
-默认前端会连接 `window.location.origin`，也可以在 Web 顶栏直接输入远程 daemon 地址，或通过环境变量指定：
+可选环境变量：
+
+- `DAEMON_ID`：固定 daemon 标识
+- `DAEMON_NAME`：展示名称
+- `PORT`：daemon 本地 API 端口（默认 `3210`）
+
+3. 浏览器访问管理端页面：
 
 ```bash
-VITE_DAEMON_URL=http://your-daemon-host:3210 npm run dev
+http://your-control-host:3310
 ```
 
-daemon 默认已允许跨域访问；如需限制来源，可设置：
+开发模式（前端热更新）：
 
 ```bash
-ALLOW_ORIGIN=http://your-web-host:5173 npm run daemon
+npm run web:dev
 ```
 
 启动 ACP bridge：
@@ -71,6 +79,7 @@ npm run acp
 - 关闭会话
 - 从 Codex 历史会话列表恢复，并继续在同一 `threadId` 上对话
 - 使用独立前端从其他设备远程管理 daemon
+- daemon 主动连接管理端，浏览器不需要直连 daemon
 
 ## 后续建议
 

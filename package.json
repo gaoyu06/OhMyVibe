@@ -11,7 +11,8 @@
     "acp": "tsx src/acp/index.ts",
     "dev": "tsx watch src/daemon/index.ts",
     "web:dev": "npm --prefix web run dev",
-    "web:preview": "npm --prefix web run preview"
+    "web:preview": "npm --prefix web run preview",
+    "web:server": "npm --prefix web run server"
   },
   "keywords": [],
   "author": "",
