@@ -71,6 +71,115 @@ npm run web:dev
 npm run acp
 ```
 
+## 使用示例
+
+### 示例 1：本机快速跑通
+
+先启动控制端：
+
+```bash
+git clone https://github.com/gaoyu06/OhMyVibe.git
+cd OhMyVibe
+npm install
+npm --prefix web install
+npm --prefix web run build
+npm run web:server
+```
+
+再在另一台机器或另一个终端启动 daemon：
+
+```bash
+cp .env.example .env
+```
+
+`.env`:
+
+```env
+MANAGEMENT_SERVER_URL=http://localhost:3310
+DAEMON_NAME=ohmyvibe-local
+```
+
+启动：
+
+```bash
+npm run daemon
+```
+
+浏览器访问：
+
+```text
+http://localhost:3310
+```
+
+### 示例 2：通过 npm 全局安装 daemon
+
+如果你只想安装被控端 daemon，可以直接安装 npm 包：
+
+```bash
+npm install -g ohmyvibe
+```
+
+然后直接连接到你的控制端：
+
+```bash
+ohmyvibe --management-server-url http://your-control-host:3310
+```
+
+也可以显式指定 daemon 名称或 id：
+
+```bash
+ohmyvibe daemon ^
+  --management-server-url http://your-control-host:3310 ^
+  --daemon-name office-win ^
+  --daemon-id office-win-01
+```
+
+说明：
+
+- 当前 npm 包主要提供 `daemon` / `acp` CLI
+- Web 控制服务端目前仍建议直接从仓库部署
+
+## 服务端部署示例
+
+### 示例 1：在 Linux 服务器部署控制端
+
+```bash
+git clone https://github.com/gaoyu06/OhMyVibe.git
+cd OhMyVibe
+npm install
+npm --prefix web install
+cp web/.env.example web/.env
+npm --prefix web run build
+npm run web:server
+```
+
+`web/.env`:
+
+```env
+PORT=3310
+VITE_CONTROL_SERVER_URL=https://your-domain.example.com
+```
+
+反向代理到 `3310` 端口后，浏览器即可访问控制台，远端 daemon 使用：
+
+```env
+MANAGEMENT_SERVER_URL=https://your-domain.example.com
+```
+
+### 示例 2：用 PM2 托管控制端
+
+```bash
+pm2 start "npm run web:server" --name ohmyvibe-control
+pm2 save
+```
+
+### 示例 3：发布前验证 npm 包
+
+```bash
+npm run build:daemon
+npm run pack:dry-run
+```
+
 ## 全局安装 daemon
 
 如果你要把 daemon 作为全局命令安装，当前包已经支持：
