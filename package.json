@@ -1,6 +1,6 @@
 {
   "name": "ohmyvibe",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "VibeCoding daemon + web console MVP for orchestrating Codex sessions",
   "bin": {
     "ohmyvibe": "./dist/cli.js"

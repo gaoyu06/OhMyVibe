@@ -39,7 +39,7 @@ export class CodexAppServerClient {
       clientInfo: {
         name: "ohmyvibe-daemon",
         title: "OhMyVibe Daemon",
-        version: "0.1.0",
+        version: "0.1.1",
       },
       capabilities: {
         experimentalApi: true,

@@ -37,7 +37,7 @@ Examples:
 }
 
 function printVersion(): void {
-  console.log("0.1.0");
+  console.log("0.1.1");
 }
 
 function readOptionValue(args: string[], index: number, flag: string): string {
