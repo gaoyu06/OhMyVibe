@@ -125,6 +125,23 @@ export class ManagementBridge {
         return this.sessionManager.get(String(params.sessionId));
       case "listHistory":
         return this.sessionManager.listHistory();
+      case "browseDirectories":
+        return this.sessionManager.browseDirectories(
+          typeof params.path === "string" ? params.path : undefined,
+        );
+      case "browseSessionFiles":
+        return this.sessionManager.browseSessionFiles(
+          String(params.sessionId),
+          typeof params.path === "string" ? params.path : undefined,
+        );
+      case "readSessionFile":
+        return this.sessionManager.readSessionFile(String(params.sessionId), String(params.path));
+      case "writeSessionFile":
+        return this.sessionManager.writeSessionFile(
+          String(params.sessionId),
+          String(params.path),
+          String(params.content ?? ""),
+        );
       case "createSession":
         return this.sessionManager.create({
           cwd: String(params.cwd ?? process.cwd()),

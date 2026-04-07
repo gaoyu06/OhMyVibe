@@ -69,6 +69,19 @@ app.get("/api/daemons/:daemonId/history", async (req, res) => {
   }
 });
 
+app.get("/api/daemons/:daemonId/directories", async (req, res) => {
+  try {
+    const pathParam = typeof req.query.path === "string" ? req.query.path : undefined;
+    res.json(
+      await requestDaemon(req.params.daemonId, "browseDirectories", {
+        path: pathParam,
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 app.get("/api/daemons/:daemonId/sessions/:sessionId", async (req, res) => {
   try {
     const session = await requestDaemon(req.params.daemonId, "getSession", {
@@ -79,6 +92,48 @@ app.get("/api/daemons/:daemonId/sessions/:sessionId", async (req, res) => {
       return;
     }
     res.json(session);
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get("/api/daemons/:daemonId/sessions/:sessionId/files", async (req, res) => {
+  try {
+    const pathParam = typeof req.query.path === "string" ? req.query.path : undefined;
+    res.json(
+      await requestDaemon(req.params.daemonId, "browseSessionFiles", {
+        sessionId: req.params.sessionId,
+        path: pathParam,
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get("/api/daemons/:daemonId/sessions/:sessionId/file", async (req, res) => {
+  try {
+    const pathParam = typeof req.query.path === "string" ? req.query.path : "";
+    res.json(
+      await requestDaemon(req.params.daemonId, "readSessionFile", {
+        sessionId: req.params.sessionId,
+        path: pathParam,
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.put("/api/daemons/:daemonId/sessions/:sessionId/file", async (req, res) => {
+  try {
+    res.json(
+      await requestDaemon(req.params.daemonId, "writeSessionFile", {
+        sessionId: req.params.sessionId,
+        path: req.body?.path ?? "",
+        content: req.body?.content ?? "",
+      }),
+    );
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
   }

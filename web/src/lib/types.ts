@@ -93,6 +93,38 @@ export interface DaemonDescriptor {
   sessionCount: number;
 }
 
+export interface DirectoryEntry {
+  name: string;
+  path: string;
+}
+
+export interface DirectoryBrowseResult {
+  currentPath: string;
+  parentPath?: string;
+  entries: DirectoryEntry[];
+}
+
+export interface ProjectFileEntry {
+  name: string;
+  path: string;
+  kind: "directory" | "file";
+  size?: number;
+}
+
+export interface ProjectFileBrowseResult {
+  currentPath: string;
+  parentPath?: string;
+  entries: ProjectFileEntry[];
+}
+
+export interface ProjectFileReadResult {
+  path: string;
+  kind: "text" | "image" | "binary";
+  mimeType?: string;
+  content: string;
+  size: number;
+}
+
 export type DaemonEvent =
   | {
       type: "session-created";

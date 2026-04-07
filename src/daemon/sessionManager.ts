@@ -1,11 +1,17 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import { Buffer } from "node:buffer";
 import path from "node:path";
 import {
   CodexHistoryEntry,
   CreateSessionInput,
   DaemonConfig,
   DaemonEvent,
+  DirectoryBrowseResult,
+  ProjectFileBrowseResult,
+  ProjectFileReadResult,
   RenameSessionInput,
   RestoreSessionInput,
   SessionDetails,
@@ -121,6 +127,129 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     } finally {
       await client.close();
     }
+  }
+
+  async browseDirectories(inputPath?: string): Promise<DirectoryBrowseResult> {
+    if (process.platform === "win32" && (!inputPath || !inputPath.trim())) {
+      return this.listWindowsRoots();
+    }
+
+    const requestedPath = inputPath && inputPath.trim() ? inputPath.trim() : process.cwd();
+    const currentPath = path.resolve(requestedPath);
+    const stat = await fs.stat(currentPath);
+    if (!stat.isDirectory()) {
+      throw new Error(`Not a directory: ${currentPath}`);
+    }
+
+    const entries = (await fs.readdir(currentPath, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => ({
+        name: entry.name,
+        path: path.join(currentPath, entry.name),
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    return {
+      currentPath,
+      parentPath: this.resolveParentPath(currentPath),
+      entries,
+    };
+  }
+
+  async browseSessionFiles(sessionId: string, inputPath?: string): Promise<ProjectFileBrowseResult> {
+    const session = this.getSessionOrThrow(sessionId);
+    const currentPath = this.resolveSessionPath(session, inputPath ?? session.cwd);
+    const stat = await fs.stat(currentPath);
+    if (!stat.isDirectory()) {
+      throw new Error(`Not a directory: ${currentPath}`);
+    }
+
+    const entries = (await fs.readdir(currentPath, { withFileTypes: true }))
+      .filter((entry) => !entry.name.startsWith(".git"))
+      .map((entry) => {
+        const entryPath = path.join(currentPath, entry.name);
+        return {
+          name: entry.name,
+          path: entryPath,
+          kind: entry.isDirectory() ? "directory" : "file",
+        } as const;
+      })
+      .sort((a, b) => {
+        if (a.kind !== b.kind) {
+          return a.kind === "directory" ? -1 : 1;
+        }
+        return a.name.localeCompare(b.name);
+      });
+
+    const enrichedEntries = await Promise.all(
+      entries.map(async (entry) => {
+        if (entry.kind === "directory") {
+          return entry;
+        }
+        try {
+          const fileStat = await fs.stat(entry.path);
+          return { ...entry, size: fileStat.size };
+        } catch {
+          return entry;
+        }
+      }),
+    );
+
+    return {
+      currentPath,
+      parentPath:
+        currentPath === session.cwd ? undefined : this.resolveParentPath(currentPath),
+      entries: enrichedEntries,
+    };
+  }
+
+  async readSessionFile(sessionId: string, filePath: string): Promise<ProjectFileReadResult> {
+    const session = this.getSessionOrThrow(sessionId);
+    const resolvedPath = this.resolveSessionPath(session, filePath);
+    const stat = await fs.stat(resolvedPath);
+    if (!stat.isFile()) {
+      throw new Error(`Not a file: ${resolvedPath}`);
+    }
+
+    const size = stat.size;
+    const extension = path.extname(resolvedPath).toLowerCase();
+    const mimeType = this.getMimeType(extension);
+    const buffer = await fs.readFile(resolvedPath);
+
+    if (mimeType?.startsWith("image/")) {
+      return {
+        path: resolvedPath,
+        kind: "image",
+        mimeType,
+        content: `data:${mimeType};base64,${buffer.toString("base64")}`,
+        size,
+      };
+    }
+
+    if (this.isTextFile(extension, buffer)) {
+      return {
+        path: resolvedPath,
+        kind: "text",
+        mimeType: mimeType ?? "text/plain",
+        content: buffer.toString("utf8"),
+        size,
+      };
+    }
+
+    return {
+      path: resolvedPath,
+      kind: "binary",
+      mimeType,
+      content: "",
+      size,
+    };
+  }
+
+  async writeSessionFile(sessionId: string, filePath: string, content: string): Promise<ProjectFileReadResult> {
+    const session = this.getSessionOrThrow(sessionId);
+    const resolvedPath = this.resolveSessionPath(session, filePath);
+    await fs.writeFile(resolvedPath, content, "utf8");
+    return this.readSessionFile(sessionId, resolvedPath);
   }
 
   async create(input: CreateSessionInput): Promise<SessionDetails> {
@@ -1392,5 +1521,118 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       default:
         return "medium";
     }
+  }
+
+  private async listWindowsRoots(): Promise<DirectoryBrowseResult> {
+    const entries: DirectoryBrowseResult["entries"] = [];
+    for (let code = 67; code <= 90; code += 1) {
+      const drive = `${String.fromCharCode(code)}:\\`;
+      try {
+        const stat = await fs.stat(drive);
+        if (stat.isDirectory()) {
+          entries.push({ name: drive, path: drive });
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    return {
+      currentPath: path.parse(process.cwd()).root || `${os.homedir().slice(0, 2)}\\`,
+      entries,
+    };
+  }
+
+  private resolveParentPath(currentPath: string): string | undefined {
+    const root = path.parse(currentPath).root;
+    if (currentPath === root) {
+      return undefined;
+    }
+    const parentPath = path.dirname(currentPath);
+    return parentPath && parentPath !== currentPath ? parentPath : undefined;
+  }
+
+  private resolveSessionPath(session: ManagedSession, targetPath: string): string {
+    const basePath = path.resolve(session.cwd);
+    const resolvedPath = path.resolve(targetPath);
+    const relative = path.relative(basePath, resolvedPath);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new Error(`Path is outside session workspace: ${targetPath}`);
+    }
+    return resolvedPath;
+  }
+
+  private getMimeType(extension: string): string | undefined {
+    switch (extension) {
+      case ".png":
+        return "image/png";
+      case ".jpg":
+      case ".jpeg":
+        return "image/jpeg";
+      case ".gif":
+        return "image/gif";
+      case ".webp":
+        return "image/webp";
+      case ".svg":
+        return "image/svg+xml";
+      case ".json":
+        return "application/json";
+      case ".md":
+        return "text/markdown";
+      case ".ts":
+      case ".tsx":
+      case ".js":
+      case ".jsx":
+      case ".css":
+      case ".html":
+      case ".py":
+      case ".rs":
+      case ".go":
+      case ".java":
+      case ".c":
+      case ".cpp":
+      case ".h":
+      case ".yml":
+      case ".yaml":
+      case ".toml":
+      case ".txt":
+        return "text/plain";
+      default:
+        return undefined;
+    }
+  }
+
+  private isTextFile(extension: string, buffer: Buffer): boolean {
+    const knownTextExtensions = new Set([
+      ".ts",
+      ".tsx",
+      ".js",
+      ".jsx",
+      ".json",
+      ".css",
+      ".scss",
+      ".html",
+      ".md",
+      ".txt",
+      ".py",
+      ".rs",
+      ".go",
+      ".java",
+      ".c",
+      ".cpp",
+      ".h",
+      ".yml",
+      ".yaml",
+      ".toml",
+      ".env",
+      ".gitignore",
+    ]);
+
+    if (knownTextExtensions.has(extension)) {
+      return true;
+    }
+
+    const sample = buffer.subarray(0, Math.min(buffer.length, 1024));
+    return !sample.includes(0);
   }
 }

@@ -5,10 +5,16 @@ import remarkGfm from "remark-gfm";
 import {
   AlertCircle,
   ArrowDown,
+  ArrowUp,
   ChevronDown,
   ChevronUp,
   Circle,
   Edit3,
+  FileCode2,
+  FileImage,
+  FileText,
+  Folder,
+  FolderOpen,
   GitCommitHorizontal,
   History,
   LayoutGrid,
@@ -18,6 +24,7 @@ import {
   PanelLeftOpen,
   Play,
   Plus,
+  Save,
   Send,
   Server,
   Square,
@@ -44,6 +51,9 @@ import type {
   DaemonConfig,
   DaemonDescriptor,
   DaemonEvent,
+  DirectoryBrowseResult,
+  ProjectFileBrowseResult,
+  ProjectFileReadResult,
   SessionDetails,
   SessionSummary,
   TranscriptEntry,
@@ -88,6 +98,8 @@ interface WorkspaceStore {
   workspaces: WorkspaceDefinition[];
 }
 
+type SessionPane = "chat" | "files";
+
 const SANDBOX_OPTIONS = [
   { value: "danger-full-access", label: "Full Access" },
   { value: "workspace-write", label: "Workspace" },
@@ -111,6 +123,8 @@ function App() {
   const [historySearch, setHistorySearch] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
   const [newSessionOpen, setNewSessionOpen] = useState(false);
+  const [directoryPickerOpen, setDirectoryPickerOpen] = useState(false);
+  const [sessionPane, setSessionPane] = useState<SessionPane>("chat");
   const [sessionsCollapsed, setSessionsCollapsed] = useState(false);
   const [workspaceState, setWorkspaceState] = useState<WorkspaceStore>(() => loadWorkspaceState());
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -130,6 +144,15 @@ function App() {
   const [loadedTranscriptCount, setLoadedTranscriptCount] = useState(TRANSCRIPT_INITIAL_COUNT);
   const [composer, setComposer] = useState("");
   const [cwd, setCwd] = useState("C:\\Code\\Projects\\OhMyVibe");
+  const [directoryBrowser, setDirectoryBrowser] = useState<DirectoryBrowseResult | null>(null);
+  const [directoryBrowserLoading, setDirectoryBrowserLoading] = useState(false);
+  const [directoryBrowserPath, setDirectoryBrowserPath] = useState("");
+  const [projectFiles, setProjectFiles] = useState<ProjectFileBrowseResult | null>(null);
+  const [projectFilesLoading, setProjectFilesLoading] = useState(false);
+  const [selectedFile, setSelectedFile] = useState<ProjectFileReadResult | null>(null);
+  const [selectedFileLoading, setSelectedFileLoading] = useState(false);
+  const [fileEditorValue, setFileEditorValue] = useState("");
+  const [savingFile, setSavingFile] = useState(false);
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState("medium");
   const [sandbox, setSandbox] = useState<"read-only" | "workspace-write" | "danger-full-access">(
@@ -318,6 +341,13 @@ function App() {
     setSendingMessage(false);
     stickToBottomRef.current = true;
     setShowScrollToBottom(false);
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    setProjectFiles(null);
+    setSelectedFile(null);
+    setFileEditorValue("");
+    setSessionPane("chat");
   }, [activeSessionId]);
 
   useEffect(() => {
@@ -617,6 +647,47 @@ function App() {
     }
   }
 
+  async function loadDirectories(daemonId: string, nextPath?: string) {
+    setDirectoryBrowserLoading(true);
+    try {
+      const query = nextPath ? `?path=${encodeURIComponent(nextPath)}` : "";
+      const result = await api<DirectoryBrowseResult>(`/api/daemons/${daemonId}/directories${query}`);
+      setDirectoryBrowser(result);
+      setDirectoryBrowserPath(result.currentPath);
+      return result;
+    } finally {
+      setDirectoryBrowserLoading(false);
+    }
+  }
+
+  async function loadProjectFiles(daemonId: string, sessionId: string, nextPath?: string) {
+    setProjectFilesLoading(true);
+    try {
+      const query = nextPath ? `?path=${encodeURIComponent(nextPath)}` : "";
+      const result = await api<ProjectFileBrowseResult>(
+        `/api/daemons/${daemonId}/sessions/${sessionId}/files${query}`,
+      );
+      setProjectFiles(result);
+      return result;
+    } finally {
+      setProjectFilesLoading(false);
+    }
+  }
+
+  async function loadProjectFile(daemonId: string, sessionId: string, filePath: string) {
+    setSelectedFileLoading(true);
+    try {
+      const result = await api<ProjectFileReadResult>(
+        `/api/daemons/${daemonId}/sessions/${sessionId}/file?path=${encodeURIComponent(filePath)}`,
+      );
+      setSelectedFile(result);
+      setFileEditorValue(result.kind === "text" ? result.content : "");
+      return result;
+    } finally {
+      setSelectedFileLoading(false);
+    }
+  }
+
   async function handleCreateSession() {
     if (!activeDaemonId) {
       return;
@@ -695,6 +766,81 @@ function App() {
 
   function handleDeleteWorkspace() {
     setWorkspaceState((current) => deleteActiveWorkspace(current));
+  }
+
+  async function handleOpenDirectoryPicker() {
+    if (!activeDaemonId) {
+      return;
+    }
+    setDirectoryPickerOpen(true);
+    await loadDirectories(activeDaemonId, cwd);
+  }
+
+  async function handleBrowseDirectory(pathValue?: string) {
+    if (!activeDaemonId) {
+      return;
+    }
+    await loadDirectories(activeDaemonId, pathValue ?? directoryBrowserPath);
+  }
+
+  async function handleOpenFilesPane() {
+    if (!activeDaemonId || !activeSessionId || !activeSession) {
+      return;
+    }
+    setSessionPane("files");
+    await loadProjectFiles(activeDaemonId, activeSessionId, activeSession.cwd);
+  }
+
+  async function handleBrowseProjectPath(pathValue?: string) {
+    if (!activeDaemonId || !activeSessionId) {
+      return;
+    }
+    await loadProjectFiles(activeDaemonId, activeSessionId, pathValue);
+  }
+
+  async function handleOpenProjectFile(filePath: string) {
+    if (!activeDaemonId || !activeSessionId) {
+      return;
+    }
+    await loadProjectFile(activeDaemonId, activeSessionId, filePath);
+  }
+
+  async function handleSaveProjectFile() {
+    if (!activeDaemonId || !activeSessionId || !selectedFile || selectedFile.kind !== "text") {
+      return;
+    }
+    setSavingFile(true);
+    try {
+      const result = await api<ProjectFileReadResult>(
+        `/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/file`,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            path: selectedFile.path,
+            content: fileEditorValue,
+          }),
+        },
+      );
+      setSelectedFile(result);
+      setFileEditorValue(result.content);
+    } finally {
+      setSavingFile(false);
+    }
+  }
+
+  function handleQuoteFileSelection() {
+    if (!selectedFile || selectedFile.kind !== "text") {
+      return;
+    }
+    const textarea = document.getElementById("project-file-editor") as HTMLTextAreaElement | null;
+    const start = textarea?.selectionStart ?? 0;
+    const end = textarea?.selectionEnd ?? 0;
+    const selectedText =
+      start !== end ? fileEditorValue.slice(start, end) : fileEditorValue;
+    const extension = pathLikeExtension(selectedFile.path);
+    const quoted = `\n\n[${selectedFile.path}]\n\`\`\`${extension}\n${selectedText.trim()}\n\`\`\`\n`;
+    setComposer((current) => `${current}${quoted}`.trimStart());
+    setSessionPane("chat");
   }
 
   async function handleSendMessage() {
@@ -1012,11 +1158,23 @@ function App() {
                     <DialogDescription>cwd</DialogDescription>
                   </DialogHeader>
                   <div className="grid gap-3 p-4">
-                    <Input
-                      value={cwd}
-                      onChange={(event) => setCwd(event.target.value)}
-                      placeholder="Working directory"
-                    />
+                    <div className="flex items-center gap-2">
+                      <Input
+                        value={cwd}
+                        onChange={(event) => setCwd(event.target.value)}
+                        placeholder="Working directory"
+                      />
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                        className="shrink-0"
+                        onClick={() => void handleOpenDirectoryPicker()}
+                        disabled={!activeDaemonId}
+                      >
+                        <FolderOpen className="h-4 w-4" />
+                      </Button>
+                    </div>
                     <div className="flex justify-end">
                       <Button
                         size="sm"
@@ -1025,6 +1183,100 @@ function App() {
                       >
                         {creatingSession ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : null}
                         Create
+                      </Button>
+                    </div>
+                  </div>
+                </DialogContent>
+              </Dialog>
+              <Dialog
+                open={directoryPickerOpen}
+                onOpenChange={(open) => {
+                  setDirectoryPickerOpen(open);
+                  if (!open) {
+                    setDirectoryBrowserPath("");
+                  }
+                }}
+              >
+                <DialogContent className="max-w-[720px] md:w-full">
+                  <DialogHeader>
+                    <DialogTitle>Select Directory</DialogTitle>
+                    <DialogDescription>remote daemon filesystem</DialogDescription>
+                  </DialogHeader>
+                  <div className="grid gap-3 p-4">
+                    <div className="flex items-center gap-2">
+                      <Input
+                        value={directoryBrowserPath}
+                        onChange={(event) => setDirectoryBrowserPath(event.target.value)}
+                        placeholder="Directory path"
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            void handleBrowseDirectory(directoryBrowserPath);
+                          }
+                        }}
+                      />
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                        disabled={!directoryBrowser?.parentPath || directoryBrowserLoading}
+                        onClick={() => void handleBrowseDirectory(directoryBrowser?.parentPath)}
+                      >
+                        <ArrowUp className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={!directoryBrowserPath.trim() || directoryBrowserLoading}
+                        onClick={() => void handleBrowseDirectory(directoryBrowserPath)}
+                      >
+                        Open
+                      </Button>
+                    </div>
+                    <div className="rounded-md border border-border">
+                      <ScrollArea className="h-[360px]">
+                        <div className="grid gap-1 p-2">
+                          {directoryBrowserLoading ? (
+                            <div className="flex items-center gap-2 px-2 py-2 text-sm text-muted-foreground">
+                              <LoaderCircle className="h-4 w-4 animate-spin" />
+                              Loading directories
+                            </div>
+                          ) : null}
+                          {!directoryBrowserLoading && !directoryBrowser?.entries.length ? (
+                            <div className="px-2 py-2 text-sm text-muted-foreground">No subdirectories</div>
+                          ) : null}
+                          {directoryBrowser?.entries.map((entry) => (
+                            <button
+                              key={entry.path}
+                              type="button"
+                              className="flex items-center justify-between gap-3 rounded-md px-2 py-2 text-left text-sm hover:bg-accent/60"
+                              onClick={() => void handleBrowseDirectory(entry.path)}
+                            >
+                              <div className="flex min-w-0 items-center gap-2">
+                                <Folder className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                <span className="truncate">{entry.name}</span>
+                              </div>
+                              <ChevronDown className="-rotate-90 h-4 w-4 shrink-0 text-muted-foreground" />
+                            </button>
+                          ))}
+                        </div>
+                      </ScrollArea>
+                    </div>
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="truncate text-xs text-muted-foreground">
+                        {directoryBrowser?.currentPath || directoryBrowserPath || cwd}
+                      </div>
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={!directoryBrowser?.currentPath && !directoryBrowserPath.trim()}
+                        onClick={() => {
+                          setCwd(directoryBrowser?.currentPath || directoryBrowserPath.trim());
+                          setDirectoryPickerOpen(false);
+                        }}
+                      >
+                        Select
                       </Button>
                     </div>
                   </div>
@@ -1180,6 +1432,28 @@ function App() {
                       <PanelLeftOpen className="h-4 w-4" />
                     </Button>
                   ) : null}
+                  <div className="flex items-center gap-1 rounded-md border border-border bg-muted/30 p-1">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className={sessionPane === "chat" ? "h-7 bg-card px-2 text-xs shadow-sm" : "h-7 px-2 text-xs"}
+                      onClick={() => setSessionPane("chat")}
+                      disabled={!activeSessionId}
+                    >
+                      <MessageSquareText className="h-3.5 w-3.5" />
+                      Chat
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className={sessionPane === "files" ? "h-7 bg-card px-2 text-xs shadow-sm" : "h-7 px-2 text-xs"}
+                      onClick={() => void handleOpenFilesPane()}
+                      disabled={!activeSessionId}
+                    >
+                      <FolderOpen className="h-3.5 w-3.5" />
+                      Files
+                    </Button>
+                  </div>
                   <div className="truncate text-sm font-medium">
                     {activeSession?.title || activeDaemon?.name || "No Session"}
                   </div>
@@ -1230,175 +1504,319 @@ function App() {
                 </div>
               </div>
 
-              <div
-                ref={transcriptRef}
-                className="relative min-h-0 overflow-auto bg-muted/10"
-                onScroll={handleTranscriptScroll}
-              >
-                {sessionLoading ? (
-                  <div className="flex h-full items-center justify-center px-3 py-3">
-                    <div className="flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-sm text-muted-foreground shadow-sm">
-                      <LoaderCircle className="h-4 w-4 animate-spin" />
-                      Loading session
+              {sessionPane === "files" ? (
+                <>
+                  <div className="grid min-h-0 grid-cols-1 bg-muted/10 md:grid-cols-[280px_minmax(0,1fr)]">
+                    <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] border-b border-border md:border-r md:border-b-0">
+                      <div className="grid gap-2 border-b border-border px-3 py-3">
+                        <div className="truncate text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+                          Project Files
+                        </div>
+                        <div className="truncate text-xs text-muted-foreground">
+                          {projectFiles?.currentPath || activeSession?.cwd || ""}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="h-7 px-2"
+                            disabled={!projectFiles?.parentPath || projectFilesLoading}
+                            onClick={() => void handleBrowseProjectPath(projectFiles?.parentPath)}
+                          >
+                            <ArrowUp className="h-3.5 w-3.5" />
+                            Up
+                          </Button>
+                          {projectFilesLoading ? (
+                            <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
+                              <LoaderCircle className="h-3 w-3 animate-spin" />
+                              Loading
+                            </div>
+                          ) : null}
+                        </div>
+                      </div>
+                      <ScrollArea>
+                        <div className="grid gap-1 p-2">
+                          {!projectFilesLoading && !projectFiles?.entries.length ? (
+                            <div className="px-2 py-2 text-sm text-muted-foreground">No files</div>
+                          ) : null}
+                          {projectFiles?.entries.map((entry) => (
+                            <button
+                              key={entry.path}
+                              type="button"
+                              className={[
+                                "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-accent/50",
+                                selectedFile?.path === entry.path ? "bg-accent/60" : "",
+                              ].join(" ")}
+                              onClick={() =>
+                                entry.kind === "directory"
+                                  ? void handleBrowseProjectPath(entry.path)
+                                  : void handleOpenProjectFile(entry.path)
+                              }
+                            >
+                              {entry.kind === "directory" ? (
+                                <Folder className="h-4 w-4 shrink-0 text-muted-foreground" />
+                              ) : getProjectFileIcon(entry.path)}
+                              <div className="min-w-0 flex-1 truncate">{entry.name}</div>
+                              {entry.kind === "file" && typeof entry.size === "number" ? (
+                                <div className="shrink-0 text-[10px] text-muted-foreground">
+                                  {formatFileSize(entry.size)}
+                                </div>
+                              ) : null}
+                            </button>
+                          ))}
+                        </div>
+                      </ScrollArea>
+                    </div>
+
+                    <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)]">
+                      <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                        <div className="min-w-0 truncate text-xs text-muted-foreground">
+                          {selectedFile?.path || "Select a file"}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {selectedFile?.kind === "text" ? (
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="h-7 px-2"
+                              onClick={handleQuoteFileSelection}
+                            >
+                              <FileCode2 className="h-3.5 w-3.5" />
+                              Quote
+                            </Button>
+                          ) : null}
+                          {selectedFile?.kind === "text" ? (
+                            <Button
+                              type="button"
+                              size="sm"
+                              className="h-7 px-2"
+                              onClick={() => void handleSaveProjectFile()}
+                              disabled={savingFile}
+                            >
+                              {savingFile ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                              Save
+                            </Button>
+                          ) : null}
+                        </div>
+                      </div>
+                      <div className="min-h-0 overflow-auto">
+                        {selectedFileLoading ? (
+                          <div className="flex h-full items-center justify-center px-4 py-4 text-sm text-muted-foreground">
+                            <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+                            Loading file
+                          </div>
+                        ) : selectedFile?.kind === "image" ? (
+                          <div className="flex h-full items-start justify-center p-4">
+                            <img
+                              src={selectedFile.content}
+                              alt={selectedFile.path}
+                              className="max-h-full max-w-full rounded-md border border-border bg-background object-contain"
+                            />
+                          </div>
+                        ) : selectedFile?.kind === "binary" ? (
+                          <div className="flex h-full items-center justify-center p-4 text-sm text-muted-foreground">
+                            Binary preview is not supported
+                          </div>
+                        ) : selectedFile?.kind === "text" ? (
+                          <Textarea
+                            id="project-file-editor"
+                            value={fileEditorValue}
+                            onChange={(event) => setFileEditorValue(event.target.value)}
+                            className="h-full min-h-full w-full resize-none border-0 rounded-none bg-transparent px-4 py-3 font-mono text-[12px] leading-6 shadow-none focus-visible:ring-0"
+                          />
+                        ) : (
+                          <div className="flex h-full items-center justify-center p-4 text-sm text-muted-foreground">
+                            Select a file to preview
+                          </div>
+                        )}
+                      </div>
                     </div>
                   </div>
-                ) : (
-                  <div
-                    className="relative mx-auto w-full max-w-[1200px] px-3 py-3"
-                    style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
-                  >
-                    {hasOlderTranscript ? (
-                      <div className="sticky top-0 z-10 mb-2 flex justify-center">
-                        <div className="rounded-full border border-border bg-background/90 px-3 py-1 text-[11px] text-muted-foreground backdrop-blur">
-                          Scroll top to load older messages
-                        </div>
-                      </div>
-                    ) : null}
-                    {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-                      const row = visibleTranscript[virtualRow.index];
-                      if (!row) {
-                        return null;
-                      }
-                      return (
-                        <div
-                          key={row.id}
-                          data-index={virtualRow.index}
-                          ref={(node) => {
-                            if (node) {
-                              rowVirtualizer.measureElement(node);
-                            }
-                          }}
-                          className="absolute left-0 top-0 w-full px-3 ui-entry-reveal"
-                          style={{ transform: `translateY(${virtualRow.start}px)` }}
-                        >
-                          <TranscriptCard
-                            entry={row.entry}
-                            reasoning={row.reasoning}
-                            busy={approvalActionId === row.entry.id}
-                            expanded={expanded.has(row.entry.id)}
-                            onApprovalAction={(decision) => void handleApprovalAction(row.entry, decision)}
-                            onToggle={() =>
-                              setExpanded((current) => {
-                                const next = new Set(current);
-                                if (next.has(row.entry.id)) {
-                                  next.delete(row.entry.id);
-                                } else {
-                                  next.add(row.entry.id);
-                                }
-                                return next;
-                              })
-                            }
-                          />
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-                {showScrollToBottom && chatTranscript.length ? (
-                  <div className="ui-fab-reveal pointer-events-none sticky bottom-3 z-20 flex justify-end px-3">
-                    <Button
-                      type="button"
-                      size="icon"
-                      variant="outline"
-                      className="pointer-events-auto h-8 w-8 rounded-full shadow-sm"
-                      onClick={scrollTranscriptToBottom}
-                    >
-                      <ArrowDown className="h-4 w-4" />
+                  <div className="flex items-center justify-between gap-2 border-t border-border px-3 py-2">
+                    <div className="truncate text-[11px] text-muted-foreground">
+                      {activeSession ? activeSession.cwd : cwd}
+                    </div>
+                    <Button variant="outline" size="sm" className="h-7 px-2" onClick={() => setSessionPane("chat")}>
+                      <MessageSquareText className="h-3.5 w-3.5" />
+                      Back to Chat
                     </Button>
                   </div>
-                ) : null}
-              </div>
+                </>
+              ) : (
+                <>
+                  <div
+                    ref={transcriptRef}
+                    className="relative min-h-0 overflow-auto bg-muted/10"
+                    onScroll={handleTranscriptScroll}
+                  >
+                    {sessionLoading ? (
+                      <div className="flex h-full items-center justify-center px-3 py-3">
+                        <div className="flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-sm text-muted-foreground shadow-sm">
+                          <LoaderCircle className="h-4 w-4 animate-spin" />
+                          Loading session
+                        </div>
+                      </div>
+                    ) : (
+                      <div
+                        className="relative mx-auto w-full max-w-[1200px] px-3 py-3"
+                        style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
+                      >
+                        {hasOlderTranscript ? (
+                          <div className="sticky top-0 z-10 mb-2 flex justify-center">
+                            <div className="rounded-full border border-border bg-background/90 px-3 py-1 text-[11px] text-muted-foreground backdrop-blur">
+                              Scroll top to load older messages
+                            </div>
+                          </div>
+                        ) : null}
+                        {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                          const row = visibleTranscript[virtualRow.index];
+                          if (!row) {
+                            return null;
+                          }
+                          return (
+                            <div
+                              key={row.id}
+                              data-index={virtualRow.index}
+                              ref={(node) => {
+                                if (node) {
+                                  rowVirtualizer.measureElement(node);
+                                }
+                              }}
+                              className="absolute left-0 top-0 w-full px-3 ui-entry-reveal"
+                              style={{ transform: `translateY(${virtualRow.start}px)` }}
+                            >
+                              <TranscriptCard
+                                entry={row.entry}
+                                reasoning={row.reasoning}
+                                busy={approvalActionId === row.entry.id}
+                                expanded={expanded.has(row.entry.id)}
+                                onApprovalAction={(decision) => void handleApprovalAction(row.entry, decision)}
+                                onToggle={() =>
+                                  setExpanded((current) => {
+                                    const next = new Set(current);
+                                    if (next.has(row.entry.id)) {
+                                      next.delete(row.entry.id);
+                                    } else {
+                                      next.add(row.entry.id);
+                                    }
+                                    return next;
+                                  })
+                                }
+                              />
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                    {showScrollToBottom && chatTranscript.length ? (
+                      <div className="ui-fab-reveal pointer-events-none sticky bottom-3 z-20 flex justify-end px-3">
+                        <Button
+                          type="button"
+                          size="icon"
+                          variant="outline"
+                          className="pointer-events-auto h-8 w-8 rounded-full shadow-sm"
+                          onClick={scrollTranscriptToBottom}
+                        >
+                          <ArrowDown className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    ) : null}
+                  </div>
 
-              <div className="grid gap-2 border-t border-border p-3">
-                <Textarea
-                  value={composer}
-                  onChange={(event) => setComposer(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && !event.ctrlKey) {
-                      event.preventDefault();
-                      void handleSendMessage();
-                    }
-                  }}
-                  placeholder="Enter send · Ctrl+Enter newline"
-                  className="min-h-[96px] max-h-[128px] md:max-h-[96px]"
-                />
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                  <div className="flex min-w-0 items-center gap-2">
-                    {activity ? (
-                      <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
-                        {isBusyActivity(activity) ? (
-                          <LoaderCircle className="h-3 w-3 animate-spin" />
+                  <div className="grid gap-2 border-t border-border p-3">
+                    <Textarea
+                      value={composer}
+                      onChange={(event) => setComposer(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" && !event.ctrlKey) {
+                          event.preventDefault();
+                          void handleSendMessage();
+                        }
+                      }}
+                      placeholder="Enter send · Ctrl+Enter newline"
+                      className="min-h-[96px] max-h-[128px] md:max-h-[96px]"
+                    />
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex min-w-0 items-center gap-2">
+                        {activity ? (
+                          <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
+                            {isBusyActivity(activity) ? (
+                              <LoaderCircle className="h-3 w-3 animate-spin" />
+                            ) : (
+                              <Circle className="h-3 w-3 fill-current" />
+                            )}
+                            {activity.label}
+                          </div>
                         ) : (
-                          <Circle className="h-3 w-3 fill-current" />
+                          <div className="truncate text-[11px] text-muted-foreground">
+                            {activeSession ? activeSession.cwd : cwd}
+                          </div>
                         )}
-                        {activity.label}
                       </div>
-                    ) : (
-                      <div className="truncate text-[11px] text-muted-foreground">
-                        {activeSession ? activeSession.cwd : cwd}
+                      <div className="flex flex-wrap items-center gap-1 sm:justify-end">
+                        <InlineSelect
+                          value={sandbox}
+                          onValueChange={(value) => {
+                            const nextValue = value as "read-only" | "workspace-write" | "danger-full-access";
+                            const nextApprovalPolicy = defaultApprovalPolicyForSandbox(nextValue);
+                            setSandbox(nextValue);
+                            setApprovalPolicy(nextApprovalPolicy);
+                            void handleSessionConfigChange({
+                              sandbox: nextValue,
+                              approvalPolicy: nextApprovalPolicy,
+                            });
+                          }}
+                          options={SANDBOX_OPTIONS}
+                        />
+                        <InlineSelect
+                          value={model}
+                          onValueChange={(value) => {
+                            setModel(value);
+                            void handleSessionConfigChange({ model: value });
+                          }}
+                          options={config.models.map((item) => ({
+                            value: item.model,
+                            label: item.model,
+                          }))}
+                        />
+                        <InlineSelect
+                          value={effort}
+                          onValueChange={(value) => {
+                            setEffort(value);
+                            void handleSessionConfigChange({ reasoningEffort: value });
+                          }}
+                          options={(currentModel?.supportedReasoningEfforts || []).map((item) => ({
+                            value: item.reasoningEffort,
+                            label: formatEffortLabel(item.reasoningEffort),
+                          }))}
+                        />
+                        {isTurnBusy(activeSession, sendingMessage) ? (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={!activeDaemonId || !activeSessionId}
+                            onClick={() => void handleInterrupt()}
+                          >
+                            <Square className="h-3.5 w-3.5" />
+                            Stop
+                          </Button>
+                        ) : (
+                          <Button
+                            size="sm"
+                            disabled={!activeDaemonId || !activeSessionId || !composer.trim()}
+                            onClick={() => void handleSendMessage()}
+                          >
+                            <Send className="h-3.5 w-3.5" />
+                            Send
+                          </Button>
+                        )}
                       </div>
-                    )}
+                    </div>
                   </div>
-                  <div className="flex flex-wrap items-center gap-1 sm:justify-end">
-                    <InlineSelect
-                      value={sandbox}
-                      onValueChange={(value) => {
-                        const nextValue = value as "read-only" | "workspace-write" | "danger-full-access";
-                        const nextApprovalPolicy = defaultApprovalPolicyForSandbox(nextValue);
-                        setSandbox(nextValue);
-                        setApprovalPolicy(nextApprovalPolicy);
-                        void handleSessionConfigChange({
-                          sandbox: nextValue,
-                          approvalPolicy: nextApprovalPolicy,
-                        });
-                      }}
-                      options={SANDBOX_OPTIONS}
-                    />
-                    <InlineSelect
-                      value={model}
-                      onValueChange={(value) => {
-                        setModel(value);
-                        void handleSessionConfigChange({ model: value });
-                      }}
-                      options={config.models.map((item) => ({
-                        value: item.model,
-                        label: item.model,
-                      }))}
-                    />
-                    <InlineSelect
-                      value={effort}
-                      onValueChange={(value) => {
-                        setEffort(value);
-                        void handleSessionConfigChange({ reasoningEffort: value });
-                      }}
-                      options={(currentModel?.supportedReasoningEfforts || []).map((item) => ({
-                        value: item.reasoningEffort,
-                        label: formatEffortLabel(item.reasoningEffort),
-                      }))}
-                    />
-                    {isTurnBusy(activeSession, sendingMessage) ? (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={!activeDaemonId || !activeSessionId}
-                        onClick={() => void handleInterrupt()}
-                      >
-                        <Square className="h-3.5 w-3.5" />
-                        Stop
-                      </Button>
-                    ) : (
-                      <Button
-                        size="sm"
-                        disabled={!activeDaemonId || !activeSessionId || !composer.trim()}
-                        onClick={() => void handleSendMessage()}
-                      >
-                        <Send className="h-3.5 w-3.5" />
-                        Send
-                      </Button>
-                    )}
-                  </div>
-                </div>
-              </div>
+                </>
+              )}
             </main>
           </div>
         )}
@@ -2185,6 +2603,58 @@ function getOverviewEntryPreviewText(entry: TranscriptEntry) {
     .replace(/\s+/g, " ")
     .trim();
   return collapsed || getOverviewEntryLabel(entry);
+}
+
+function getProjectFileIcon(filePath: string) {
+  const extension = pathLikeExtension(filePath);
+  if (["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico"].includes(extension)) {
+    return <FileImage className="h-4 w-4 shrink-0 text-muted-foreground" />;
+  }
+  if (
+    [
+      "ts",
+      "tsx",
+      "js",
+      "jsx",
+      "json",
+      "css",
+      "html",
+      "md",
+      "py",
+      "rs",
+      "go",
+      "java",
+      "c",
+      "cpp",
+      "h",
+      "hpp",
+      "yml",
+      "yaml",
+      "toml",
+      "sh",
+      "ps1",
+    ].includes(extension)
+  ) {
+    return <FileCode2 className="h-4 w-4 shrink-0 text-muted-foreground" />;
+  }
+  return <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />;
+}
+
+function pathLikeExtension(filePath: string) {
+  const normalized = String(filePath || "").replace(/\\/g, "/");
+  const lastSegment = normalized.split("/").pop() || "";
+  const parts = lastSegment.split(".");
+  return parts.length > 1 ? parts.pop()!.toLowerCase() : "";
+}
+
+function formatFileSize(size: number) {
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  if (size < 1024 * 1024) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function parseDiffSections(text: string) {
