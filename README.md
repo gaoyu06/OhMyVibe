@@ -71,6 +71,48 @@ npm run web:dev
 npm run acp
 ```
 
+## 全局安装 daemon
+
+如果你要把 daemon 作为全局命令安装，当前包已经支持：
+
+```bash
+npm install -g ohmyvibe
+```
+
+然后直接启动：
+
+```bash
+ohmyvibe --management-server-url http://localhost:3310
+```
+
+也可以显式指定 daemon 名称或 id：
+
+```bash
+ohmyvibe daemon \
+  --management-server-url http://localhost:3310 \
+  --daemon-name ohmyvibe-local \
+  --daemon-id local-1
+```
+
+如果仍然想走环境变量，也支持：
+
+- `MANAGEMENT_SERVER_URL`
+- `DAEMON_ID`
+- `DAEMON_NAME`
+
+发布前可先验证打包内容：
+
+```bash
+npm run build:daemon
+npm run pack:dry-run
+```
+
+正式发布：
+
+```bash
+npm publish --access public
+```
+
 ## 现在支持的能力
 
 - 创建多个独立 Codex 会话
