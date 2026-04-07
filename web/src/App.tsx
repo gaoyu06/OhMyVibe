@@ -4,15 +4,22 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   AlertCircle,
+  ArrowDown,
+  ChevronDown,
+  ChevronUp,
   Circle,
   GitCommitHorizontal,
+  LayoutGrid,
   LoaderCircle,
+  MessageSquareText,
   Moon,
   PanelLeftOpen,
   Play,
+  Plus,
   Send,
   Square,
   Sun,
+  Trash2,
   Unplug,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -38,9 +45,10 @@ import type {
   SessionSummary,
   TranscriptEntry,
 } from "@/lib/types";
-import { formatDateTime, formatTime, lastLines } from "@/lib/utils";
+import { formatDateTime, formatDurationMs, formatTime, lastLines } from "@/lib/utils";
 
 const DEFAULT_CONTROL_URL = import.meta.env.VITE_CONTROL_SERVER_URL || window.location.origin;
+const WORKSPACE_STORAGE_KEY = "ohmyvibe-workspaces";
 const TOOL_LINE_LIMIT = 30;
 const TRANSCRIPT_INITIAL_COUNT = 80;
 const TRANSCRIPT_CHUNK_SIZE = 60;
@@ -49,7 +57,32 @@ type ThemeMode = "light" | "dark";
 
 interface ActivityState {
   label: string;
-  variant: "default" | "warning" | "destructive" | "success";
+  variant: "default" | "outline" | "warning" | "destructive" | "success";
+}
+
+interface PendingAssistantState {
+  sessionId: string;
+  since: number;
+  baseTranscriptCount: number;
+  userEntry: TranscriptEntry;
+  entry: TranscriptEntry;
+}
+
+interface ChatTranscriptRow {
+  id: string;
+  entry: TranscriptEntry;
+  reasoning?: TranscriptEntry;
+}
+
+interface WorkspaceDefinition {
+  id: string;
+  sessionKeys: string[];
+  activeSessionKey: string | null;
+}
+
+interface WorkspaceStore {
+  activeWorkspaceId: string;
+  workspaces: WorkspaceDefinition[];
 }
 
 const SANDBOX_OPTIONS = [
@@ -59,6 +92,7 @@ const SANDBOX_OPTIONS = [
 ] as const;
 
 function App() {
+  const [viewMode, setViewMode] = useState<"chat" | "overview">("chat");
   const [theme, setTheme] = useState<ThemeMode>(
     () => (localStorage.getItem("ohmyvibe-theme") as ThemeMode) || "dark",
   );
@@ -71,15 +105,22 @@ function App() {
   const [config, setConfig] = useState<DaemonConfig>({ models: [] });
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [history, setHistory] = useState<CodexHistoryEntry[]>([]);
+  const [historySearch, setHistorySearch] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
   const [newSessionOpen, setNewSessionOpen] = useState(false);
+  const [sessionsCollapsed, setSessionsCollapsed] = useState(false);
+  const [workspaceState, setWorkspaceState] = useState<WorkspaceStore>(() => loadWorkspaceState());
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [activeSession, setActiveSession] = useState<SessionDetails | null>(null);
+  const [sessionDetailsById, setSessionDetailsById] = useState<Record<string, SessionDetails>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [historyLoading, setHistoryLoading] = useState(false);
   const [sessionLoading, setSessionLoading] = useState(false);
   const [creatingSession, setCreatingSession] = useState(false);
   const [restoringHistoryId, setRestoringHistoryId] = useState<string | null>(null);
+  const [approvalActionId, setApprovalActionId] = useState<string | null>(null);
+  const [sendingMessage, setSendingMessage] = useState(false);
+  const [pendingAssistant, setPendingAssistant] = useState<PendingAssistantState | null>(null);
   const [loadedTranscriptCount, setLoadedTranscriptCount] = useState(TRANSCRIPT_INITIAL_COUNT);
   const [composer, setComposer] = useState("");
   const [cwd, setCwd] = useState("C:\\Code\\Projects\\OhMyVibe");
@@ -88,13 +129,22 @@ function App() {
   const [sandbox, setSandbox] = useState<"read-only" | "workspace-write" | "danger-full-access">(
     "danger-full-access",
   );
+  const [approvalPolicy, setApprovalPolicy] = useState<
+    "untrusted" | "on-failure" | "on-request" | "never"
+  >("never");
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const prependPendingRef = useRef<{ previousHeight: number; previousTop: number } | null>(null);
+  const stickToBottomRef = useRef(true);
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
     localStorage.setItem("ohmyvibe-theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    localStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(workspaceState));
+  }, [workspaceState]);
 
   useEffect(() => {
     let disposed = false;
@@ -154,6 +204,16 @@ function App() {
         const event = payload.event;
         if (event.type === "session-created" || event.type === "session-updated") {
           setSessions((current) => upsertSessionSummary(current, event.session));
+          setSessionDetailsById((current) => {
+            const existing = current[event.session.id];
+            if (!existing) {
+              return current;
+            }
+            return {
+              ...current,
+              [event.session.id]: { ...existing, ...event.session },
+            };
+          });
           setActiveSession((current) =>
             current && current.id === event.session.id ? { ...current, ...event.session } : current,
           );
@@ -161,11 +221,31 @@ function App() {
         }
         if (event.type === "session-deleted") {
           setSessions((current) => current.filter((session) => session.id !== event.sessionId));
+          setSessionDetailsById((current) => {
+            const next = { ...current };
+            delete next[event.sessionId];
+            return next;
+          });
           setActiveSession((current) => (current?.id === event.sessionId ? null : current));
           setActiveSessionId((current) => (current === event.sessionId ? null : current));
           return;
         }
         if (event.type === "session-entry") {
+          setSessionDetailsById((current) => {
+            const existing = current[event.sessionId];
+            if (!existing) {
+              return current;
+            }
+            const nextTranscript = [...existing.transcript, event.entry];
+            return {
+              ...current,
+              [event.sessionId]: {
+                ...existing,
+                transcript: nextTranscript,
+                transcriptCount: nextTranscript.length,
+              },
+            };
+          });
           setActiveSession((current) => {
             if (!current || current.id !== event.sessionId) {
               return current;
@@ -173,12 +253,23 @@ function App() {
             const nextTranscript = [...current.transcript, event.entry];
             return { ...current, transcript: nextTranscript, transcriptCount: nextTranscript.length };
           });
-          if (event.entry.kind === "reasoning" && event.entry.status === "streaming") {
-            setExpanded((current) => new Set(current).add(event.entry.id));
-          }
           return;
         }
         if (event.type === "session-reset") {
+          setSessionDetailsById((current) => {
+            const existing = current[event.sessionId];
+            if (!existing) {
+              return current;
+            }
+            return {
+              ...current,
+              [event.sessionId]: {
+                ...existing,
+                transcript: event.transcript,
+                transcriptCount: event.transcript.length,
+              },
+            };
+          });
           setActiveSession((current) =>
             current && current.id === event.sessionId
               ? { ...current, transcript: event.transcript, transcriptCount: event.transcript.length }
@@ -200,6 +291,7 @@ function App() {
       setSessions([]);
       setActiveSession(null);
       setActiveSessionId(null);
+      setSessionDetailsById({});
       return;
     }
     void loadConfig(activeDaemonId);
@@ -216,6 +308,10 @@ function App() {
   useEffect(() => {
     setLoadedTranscriptCount(TRANSCRIPT_INITIAL_COUNT);
     prependPendingRef.current = null;
+    setPendingAssistant(null);
+    setSendingMessage(false);
+    stickToBottomRef.current = true;
+    setShowScrollToBottom(false);
   }, [activeSessionId]);
 
   const currentModel = useMemo(
@@ -249,13 +345,42 @@ function App() {
     if (activeSession.sandbox) {
       setSandbox(activeSession.sandbox);
     }
-  }, [activeSession?.id, activeSession?.model, activeSession?.reasoningEffort, activeSession?.sandbox]);
+    if (activeSession.approvalPolicy) {
+      setApprovalPolicy(activeSession.approvalPolicy);
+    } else if (activeSession.sandbox) {
+      setApprovalPolicy(defaultApprovalPolicyForSandbox(activeSession.sandbox));
+    }
+  }, [
+    activeSession?.id,
+    activeSession?.model,
+    activeSession?.reasoningEffort,
+    activeSession?.sandbox,
+    activeSession?.approvalPolicy,
+  ]);
 
   const transcript = activeSession?.transcript ?? [];
-  const transcriptStart = Math.max(0, transcript.length - loadedTranscriptCount);
+  const displayTranscript = useMemo(() => {
+    if (!pendingAssistant || pendingAssistant.sessionId !== activeSessionId) {
+      return transcript;
+    }
+    const serverEntries = transcript.slice(pendingAssistant.baseTranscriptCount);
+    const hasServerUser = serverEntries.some(
+      (entry) =>
+        entry.kind === "user" &&
+        entry.text.trim() === pendingAssistant.userEntry.text.trim(),
+    );
+    const hasServerResponse = serverEntries.some((entry) => entry.kind !== "user");
+    return [
+      ...transcript,
+      ...(hasServerUser ? [] : [pendingAssistant.userEntry]),
+      ...(hasServerResponse ? [] : [pendingAssistant.entry]),
+    ];
+  }, [activeSessionId, pendingAssistant, transcript]);
+  const chatTranscript = useMemo(() => buildChatTranscriptRows(displayTranscript), [displayTranscript]);
+  const transcriptStart = Math.max(0, chatTranscript.length - loadedTranscriptCount);
   const visibleTranscript = useMemo(
-    () => transcript.slice(transcriptStart),
-    [transcript, transcriptStart],
+    () => chatTranscript.slice(transcriptStart),
+    [chatTranscript, transcriptStart],
   );
   const hasOlderTranscript = transcriptStart > 0;
   const rowVirtualizer = useVirtualizer({
@@ -269,8 +394,93 @@ function App() {
     creatingSession,
     restoringHistory: Boolean(restoringHistoryId),
     sessionLoading,
+    sendingMessage,
   });
   const activeDaemon = daemons.find((item) => item.id === activeDaemonId) ?? null;
+  const activeWorkspace =
+    workspaceState.workspaces.find((workspace) => workspace.id === workspaceState.activeWorkspaceId) ??
+    workspaceState.workspaces[0];
+  const visibleSessions = useMemo(() => {
+    if (!activeDaemonId || !activeWorkspace) {
+      return [] as SessionSummary[];
+    }
+    const sessionKeys = new Set(activeWorkspace.sessionKeys);
+    return sessions.filter((session) => sessionKeys.has(makeSessionKey(activeDaemonId, session.id)));
+  }, [activeDaemonId, activeWorkspace, sessions]);
+  const overviewSessions = useMemo(
+    () =>
+      [...visibleSessions]
+        .filter((session) => session.status !== "closed")
+        .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)),
+    [visibleSessions],
+  );
+  const filteredHistory = useMemo(() => {
+    const query = historySearch.trim().toLowerCase();
+    const sorted = [...history].sort(
+      (a, b) => Date.parse(b.updatedAt || b.createdAt || "") - Date.parse(a.updatedAt || a.createdAt || ""),
+    );
+    if (!query) {
+      return sorted;
+    }
+    return sorted.filter((item) =>
+      [item.title, item.cwd, item.id, item.source, item.status]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(query)),
+    );
+  }, [history, historySearch]);
+  const groupedHistory = useMemo(() => groupHistoryByDay(filteredHistory), [filteredHistory]);
+  const lastEntrySignature = useMemo(() => {
+    const lastEntry = displayTranscript[displayTranscript.length - 1];
+    if (!lastEntry) {
+      return "";
+    }
+    const lastRow = chatTranscript[chatTranscript.length - 1];
+    return `${lastEntry.id}:${lastEntry.text.length}:${lastEntry.status ?? ""}:${lastRow?.reasoning?.text.length ?? 0}`;
+  }, [chatTranscript, displayTranscript]);
+
+  useEffect(() => {
+    if (!activeDaemonId || viewMode !== "overview" || !overviewSessions.length) {
+      return;
+    }
+    void loadOverviewSessions(
+      activeDaemonId,
+      overviewSessions.map((session) => session.id),
+    );
+  }, [activeDaemonId, overviewSessions, viewMode]);
+
+  useEffect(() => {
+    if (!activeDaemonId) {
+      return;
+    }
+    const sessionIds = sessions.map((session) => session.id);
+    setWorkspaceState((current) =>
+      syncWorkspaceStoreWithSessions(current, activeDaemonId, sessionIds),
+    );
+  }, [activeDaemonId, sessions]);
+
+  useEffect(() => {
+    if (!activeDaemonId || !activeWorkspace) {
+      setActiveSessionId(null);
+      setActiveSession(null);
+      return;
+    }
+    const preferredSessionId = parseSessionId(activeWorkspace.activeSessionKey, activeDaemonId);
+    const nextSessionId =
+      (preferredSessionId && visibleSessions.some((session) => session.id === preferredSessionId)
+        ? preferredSessionId
+        : null) ??
+      (activeSessionId && visibleSessions.some((session) => session.id === activeSessionId)
+        ? activeSessionId
+        : null) ??
+      visibleSessions[0]?.id ??
+      null;
+    if (nextSessionId !== activeSessionId) {
+      setActiveSessionId(nextSessionId);
+    }
+    if (!nextSessionId) {
+      setActiveSession(null);
+    }
+  }, [activeDaemonId, activeSessionId, activeWorkspace, visibleSessions]);
 
   useLayoutEffect(() => {
     const scrollElement = transcriptRef.current;
@@ -282,6 +492,44 @@ function App() {
     scrollElement.scrollTop = pending.previousTop + delta;
     prependPendingRef.current = null;
   }, [visibleTranscript.length]);
+
+  useLayoutEffect(() => {
+    const scrollElement = transcriptRef.current;
+    if (!scrollElement || prependPendingRef.current || !stickToBottomRef.current) {
+      return;
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      scrollElement.scrollTop = scrollElement.scrollHeight;
+      setShowScrollToBottom(false);
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [lastEntrySignature, visibleTranscript.length]);
+
+  useEffect(() => {
+    if (!pendingAssistant || pendingAssistant.sessionId !== activeSessionId) {
+      return;
+    }
+    const serverEntries = transcript.slice(pendingAssistant.baseTranscriptCount);
+    const hasServerUser = serverEntries.some(
+      (entry) =>
+        entry.kind === "user" &&
+        entry.text.trim() === pendingAssistant.userEntry.text.trim(),
+    );
+    const hasServerResponse = serverEntries.some((entry) => entry.kind !== "user");
+    if (hasServerUser && hasServerResponse) {
+      setPendingAssistant(null);
+      setSendingMessage(false);
+      return;
+    }
+    if (activeSession && ["completed", "failed", "interrupted", "idle"].includes(activeSession.status)) {
+      if (hasServerResponse || activeSession.status === "interrupted" || activeSession.status === "failed") {
+        setPendingAssistant(null);
+      }
+      setSendingMessage(false);
+    }
+  }, [activeSession, activeSessionId, pendingAssistant, transcript]);
 
   async function api<T>(path: string, options?: RequestInit) {
     const response = await fetch(new URL(path, normalizeBaseUrl(controlUrl)).toString(), {
@@ -314,7 +562,6 @@ function App() {
   async function loadSessions(daemonId: string) {
     const nextSessions = await api<SessionSummary[]>(`/api/daemons/${daemonId}/sessions`);
     setSessions(nextSessions);
-    setActiveSessionId((current) => current ?? nextSessions[0]?.id ?? null);
   }
 
   async function loadSession(daemonId: string, sessionId: string) {
@@ -322,18 +569,32 @@ function App() {
     try {
       const session = await api<SessionDetails>(`/api/daemons/${daemonId}/sessions/${sessionId}`);
       setActiveSession(session);
-      setExpanded((current) => {
-        const next = new Set(current);
-        for (const entry of session.transcript) {
-          if (entry.kind === "reasoning" && entry.status === "streaming") {
-            next.add(entry.id);
-          }
-        }
-        return next;
-      });
+      setSessionDetailsById((current) => ({
+        ...current,
+        [session.id]: session,
+      }));
     } finally {
       setSessionLoading(false);
     }
+  }
+
+  async function loadOverviewSessions(daemonId: string, sessionIds: string[]) {
+    const missingIds = sessionIds.filter((sessionId) => !sessionDetailsById[sessionId]);
+    if (!missingIds.length) {
+      return;
+    }
+    const details = await Promise.all(
+      missingIds.map((sessionId) =>
+        api<SessionDetails>(`/api/daemons/${daemonId}/sessions/${sessionId}`),
+      ),
+    );
+    setSessionDetailsById((current) => {
+      const next = { ...current };
+      for (const detail of details) {
+        next[detail.id] = detail;
+      }
+      return next;
+    });
   }
 
   async function loadHistory(daemonId: string) {
@@ -359,10 +620,16 @@ function App() {
           model,
           reasoningEffort: effort,
           sandbox,
+          approvalPolicy,
         }),
       });
       setActiveSessionId(session.id);
       setActiveSession(session);
+      setSessionDetailsById((current) => ({ ...current, [session.id]: session }));
+      setSessions((current) => upsertSessionSummary(current, session));
+      setWorkspaceState((current) =>
+        addSessionToWorkspace(current, current.activeWorkspaceId, activeDaemonId, session.id),
+      );
       setComposer("");
       setNewSessionOpen(false);
     } finally {
@@ -385,32 +652,87 @@ function App() {
             model,
             reasoningEffort: effort,
             sandbox,
+            approvalPolicy,
           }),
         },
       );
       setHistoryOpen(false);
       setActiveSessionId(session.id);
       setActiveSession(session);
+      setSessionDetailsById((current) => ({ ...current, [session.id]: session }));
+      setSessions((current) => upsertSessionSummary(current, session));
+      setWorkspaceState((current) =>
+        addSessionToWorkspace(current, current.activeWorkspaceId, activeDaemonId, session.id),
+      );
     } finally {
       setRestoringHistoryId(null);
     }
+  }
+
+  function handleSelectSession(sessionId: string) {
+    setActiveSessionId(sessionId);
+    if (!activeDaemonId) {
+      return;
+    }
+    setWorkspaceState((current) =>
+      setWorkspaceActiveSession(current, current.activeWorkspaceId, activeDaemonId, sessionId),
+    );
+  }
+
+  function handleCreateWorkspace() {
+    setWorkspaceState((current) => createWorkspace(current));
+  }
+
+  function handleDeleteWorkspace() {
+    setWorkspaceState((current) => deleteActiveWorkspace(current));
   }
 
   async function handleSendMessage() {
     if (!activeDaemonId || !activeSessionId || !composer.trim()) {
       return;
     }
-    await api(`/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/messages`, {
-      method: "POST",
-      body: JSON.stringify({ text: composer.trim() }),
+    const text = composer.trim();
+    const since = Date.now();
+    setSendingMessage(true);
+    setPendingAssistant({
+      sessionId: activeSessionId,
+      since,
+      baseTranscriptCount: transcript.length,
+      userEntry: {
+        id: `pending-user-${since}`,
+        kind: "user",
+        text,
+        createdAt: new Date(since).toISOString(),
+      },
+      entry: {
+        id: `pending-assistant-${since}`,
+        kind: "assistant",
+        text: "",
+        createdAt: new Date(since).toISOString(),
+        status: "streaming",
+      },
     });
+    stickToBottomRef.current = true;
+    setShowScrollToBottom(false);
     setComposer("");
+    try {
+      await api(`/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      });
+    } catch (error) {
+      setPendingAssistant(null);
+      setSendingMessage(false);
+      setComposer(text);
+      throw error;
+    }
   }
 
   async function handleSessionConfigChange(next: {
     model?: string;
     reasoningEffort?: string;
     sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+    approvalPolicy?: "untrusted" | "on-failure" | "on-request" | "never";
   }) {
     if (!activeDaemonId || !activeSessionId) {
       return;
@@ -423,6 +745,7 @@ function App() {
       },
     );
     setActiveSession(session);
+    setSessionDetailsById((current) => ({ ...current, [session.id]: session }));
     setSessions((current) => upsertSessionSummary(current, session));
   }
 
@@ -444,8 +767,39 @@ function App() {
     });
   }
 
+  async function handleApprovalAction(entry: TranscriptEntry, decision: "approve" | "deny") {
+    if (!activeDaemonId || !activeSessionId) {
+      return;
+    }
+    const approvalRequestId =
+      typeof entry.meta?.requestId === "string" ? entry.meta.requestId : "";
+    if (!approvalRequestId) {
+      return;
+    }
+
+    setApprovalActionId(entry.id);
+    try {
+      const session = await api<SessionDetails>(
+        `/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/approvals/${encodeURIComponent(approvalRequestId)}`,
+        {
+          method: "POST",
+          body: JSON.stringify({ decision }),
+        },
+      );
+      setActiveSession(session);
+      setSessionDetailsById((current) => ({ ...current, [session.id]: session }));
+      setSessions((current) => upsertSessionSummary(current, session));
+    } finally {
+      setApprovalActionId(null);
+    }
+  }
+
   function handleTranscriptScroll(event: UIEvent<HTMLDivElement>) {
     const element = event.currentTarget;
+    const distanceToBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
+    const isNearBottom = distanceToBottom <= 64;
+    stickToBottomRef.current = isNearBottom;
+    setShowScrollToBottom(!isNearBottom);
     if (!hasOlderTranscript || prependPendingRef.current || element.scrollTop > 120) {
       return;
     }
@@ -458,15 +812,35 @@ function App() {
     );
   }
 
+  function scrollTranscriptToBottom() {
+    const scrollElement = transcriptRef.current;
+    if (!scrollElement) {
+      return;
+    }
+    stickToBottomRef.current = true;
+    setShowScrollToBottom(false);
+    scrollElement.scrollTop = scrollElement.scrollHeight;
+  }
+
   return (
     <div className="h-screen overflow-hidden bg-background text-foreground">
       <div className="grid h-full grid-rows-[48px_minmax(0,1fr)]">
-        <header className="grid grid-cols-[220px_1fr_auto] items-center gap-3 border-b border-border px-3">
-          <div className="text-sm font-semibold tracking-tight">OhMyVibe</div>
-
-          <div className="grid grid-cols-[280px] items-center gap-2">
+        <header className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3 border-b border-border px-3">
+          <div className="flex min-w-0 items-center gap-2 justify-self-start">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 shrink-0"
+              onClick={() => setViewMode((current) => (current === "chat" ? "overview" : "chat"))}
+            >
+              {viewMode === "chat" ? (
+                <LayoutGrid className="h-4 w-4" />
+              ) : (
+                <MessageSquareText className="h-4 w-4" />
+              )}
+            </Button>
             <Select value={activeDaemonId ?? ""} onValueChange={setActiveDaemonId}>
-              <SelectTrigger>
+              <SelectTrigger className="h-8 min-w-[220px] max-w-[360px]">
                 <SelectValue placeholder="Daemon" />
               </SelectTrigger>
               <SelectContent>
@@ -478,8 +852,47 @@ function App() {
               </SelectContent>
             </Select>
           </div>
-
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1 justify-self-center">
+            <div className="flex items-center gap-1 rounded-md border border-border bg-muted/30 px-1 py-1">
+              <LayoutGrid className="mx-1 h-3.5 w-3.5 text-muted-foreground" />
+              {workspaceState.workspaces.map((workspace, index) => (
+                <Button
+                  key={workspace.id}
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className={[
+                    "h-7 min-w-7 px-2 text-xs",
+                    workspace.id === workspaceState.activeWorkspaceId
+                      ? "bg-card text-foreground shadow-sm"
+                      : "text-muted-foreground",
+                  ].join(" ")}
+                  onClick={() =>
+                    setWorkspaceState((current) => ({
+                      ...current,
+                      activeWorkspaceId: workspace.id,
+                    }))
+                  }
+                >
+                  {index + 1}
+                </Button>
+              ))}
+              <Button type="button" variant="ghost" size="icon" className="h-7 w-7" onClick={handleCreateWorkspace}>
+                <Plus className="h-3.5 w-3.5" />
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7"
+                onClick={handleDeleteWorkspace}
+                disabled={workspaceState.workspaces.length <= 1}
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          </div>
+          <div className="flex items-center justify-self-end gap-2">
             <StatusBadge connectionState={connectionState} />
             <Dialog
               open={historyOpen}
@@ -503,32 +916,47 @@ function App() {
                 </DialogHeader>
                 <ScrollArea className="h-[calc(100vh-64px)]">
                   <div className="space-y-2 p-4">
+                    <Input
+                      value={historySearch}
+                      onChange={(event) => setHistorySearch(event.target.value)}
+                      placeholder="Search history"
+                      className="h-8"
+                    />
                     {historyLoading ? (
                       <div className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-xs text-muted-foreground">
                         <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
                         Loading history
                       </div>
                     ) : null}
-                    {history.map((item) => (
-                      <button
-                        key={item.id}
-                        type="button"
-                        className="grid w-full gap-1 rounded-md border border-border px-3 py-2 text-left text-xs hover:bg-accent/50 disabled:cursor-wait disabled:opacity-70"
-                        onClick={() => void handleRestoreSession(item)}
-                        disabled={Boolean(restoringHistoryId)}
-                      >
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="line-clamp-2 text-sm font-medium">{item.title || item.id}</div>
-                          {restoringHistoryId === item.id ? (
-                            <LoaderCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin" />
-                          ) : null}
+                    {groupedHistory.map((item) =>
+                      item.type === "separator" ? (
+                        <div
+                          key={item.key}
+                          className="sticky top-0 z-10 -mx-1 bg-background/95 px-1 py-1 text-[11px] font-medium text-muted-foreground backdrop-blur"
+                        >
+                          {item.label}
                         </div>
-                        <div className="text-muted-foreground">{item.cwd}</div>
-                        <div className="text-muted-foreground">
-                          {formatDateTime(item.updatedAt)} · {item.source || "unknown"} · {restoringHistoryId === item.id ? "restoring" : item.status}
-                        </div>
-                      </button>
-                    ))}
+                      ) : (
+                        <button
+                          key={item.entry.id}
+                          type="button"
+                          className="grid w-full gap-1 rounded-md border border-border px-3 py-2 text-left text-xs hover:bg-accent/50 disabled:cursor-wait disabled:opacity-70"
+                          onClick={() => void handleRestoreSession(item.entry)}
+                          disabled={Boolean(restoringHistoryId)}
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="line-clamp-2 text-sm font-medium">{item.entry.title || item.entry.id}</div>
+                            {restoringHistoryId === item.entry.id ? (
+                              <LoaderCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin" />
+                            ) : null}
+                          </div>
+                          <div className="text-muted-foreground">{item.entry.cwd}</div>
+                          <div className="text-muted-foreground">
+                            {formatDateTime(item.entry.updatedAt)} · {item.entry.source || "unknown"} · {restoringHistoryId === item.entry.id ? "restoring" : item.entry.status}
+                          </div>
+                        </button>
+                      ),
+                    )}
                   </div>
                 </ScrollArea>
               </DialogContent>
@@ -574,217 +1002,320 @@ function App() {
           </div>
         </header>
 
-        <div className="grid min-h-0 grid-cols-[280px_minmax(0,1fr)]">
-          <aside className="grid min-h-0 grid-rows-[40px_minmax(0,1fr)] border-r border-border">
-            <div className="flex items-center justify-between px-3 text-xs uppercase tracking-[0.2em] text-muted-foreground">
-              <span>Sessions</span>
-              <Badge variant="outline">{sessions.length}</Badge>
-            </div>
-            <ScrollArea>
-              <div className="space-y-1.5 p-2">
-                {sessions.map((session) => (
-                  <button
-                    key={session.id}
-                    type="button"
-                    onClick={() => setActiveSessionId(session.id)}
-                    className={[
-                      "grid w-full gap-1 rounded-md border px-2.5 py-2 text-left text-xs transition-colors",
-                      activeSessionId === session.id
-                        ? "border-primary/40 bg-primary/10"
-                        : "border-border hover:bg-accent/60",
-                    ].join(" ")}
-                  >
-                    <div className="line-clamp-2 text-sm font-medium">{session.title}</div>
-                    <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
-                      <Badge variant={session.origin === "restored" ? "warning" : "outline"}>
-                        {session.origin}
-                      </Badge>
-                      <span>{session.model || "default"}</span>
-                      <span>{session.reasoningEffort || "medium"}</span>
-                    </div>
-                    <div className="truncate text-muted-foreground">{session.cwd}</div>
-                    <div className="flex items-center justify-between text-muted-foreground">
-                      <span>{session.status}</span>
-                      <span>{formatDateTime(session.updatedAt)}</span>
-                    </div>
-                  </button>
-                ))}
-              </div>
-            </ScrollArea>
-          </aside>
-
-          <main className="grid min-h-0 grid-rows-[64px_minmax(0,1fr)_auto]">
+        {viewMode === "overview" ? (
+          <main className="grid min-h-0 grid-rows-[64px_minmax(0,1fr)]">
             <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-b border-border px-3">
               <div className="min-w-0">
-                <div className="truncate text-sm font-medium">{activeSession?.title || activeDaemon?.name || "No Session"}</div>
-                <div className="truncate text-xs text-muted-foreground">
-                  {activeSession
-                    ? `${activeSession.cwd} · ${activeSession.model || "default"} · ${activeSession.reasoningEffort || "medium"} · ${activeSession.codexThreadId || "pending"}`
-                    : activeDaemon
-                      ? `${activeDaemon.cwd} · ${activeDaemon.platform} · ${activeDaemon.id}`
-                      : "select daemon"}
-                </div>
-              </div>
-              <div className="flex items-center gap-2">
-                {activeDaemon ? (
-                  <Badge variant={activeDaemon.online ? "success" : "destructive"}>
-                    {activeDaemon.online ? "online" : "offline"}
-                  </Badge>
-                ) : null}
-                {activity ? <Badge variant={activity.variant}>{activity.label}</Badge> : null}
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={!activeDaemonId || !activeSessionId}
-                  onClick={() => void handleInterrupt()}
-                >
-                  <Square className="h-3.5 w-3.5" />
-                  Stop
-                </Button>
-                <Button
-                  variant="destructive"
-                  size="sm"
-                  disabled={!activeDaemonId || !activeSessionId}
-                  onClick={() => void handleDelete()}
-                >
-                  Close
-                </Button>
-              </div>
-            </div>
-
-            <div
-              ref={transcriptRef}
-              className="min-h-0 overflow-auto bg-muted/10"
-              onScroll={handleTranscriptScroll}
-            >
-              {sessionLoading ? (
-                <div className="flex h-full items-center justify-center px-3 py-3">
-                  <div className="flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-sm text-muted-foreground shadow-sm">
-                    <LoaderCircle className="h-4 w-4 animate-spin" />
-                    Loading session
+                <div className="flex items-center gap-2">
+                  {activeDaemon ? (
+                    <Badge variant={activeDaemon.online ? "success" : "destructive"}>
+                      {activeDaemon.online ? "online" : "offline"}
+                    </Badge>
+                  ) : null}
+                  <div className="truncate text-sm font-medium">
+                    {activeDaemon?.name || "No Daemon"}
                   </div>
                 </div>
+                <div className="truncate text-xs text-muted-foreground">
+                  {activeDaemon
+                    ? `${overviewSessions.length} active sessions · ${activeDaemon.cwd}`
+                    : "select daemon"}
+                </div>
+              </div>
+              {activity ? <Badge variant={activity.variant}>{activity.label}</Badge> : null}
+            </div>
+            <div className="min-h-0 overflow-auto bg-muted/10 px-4 py-4">
+              {overviewSessions.length ? (
+                <div className="overview-columns">
+                  {overviewSessions.map((session) => (
+                    <OverviewSessionCard
+                      key={session.id}
+                      session={session}
+                      details={sessionDetailsById[session.id]}
+                      active={session.id === activeSessionId}
+                      onOpen={() => {
+                        handleSelectSession(session.id);
+                        setViewMode("chat");
+                      }}
+                    />
+                  ))}
+                </div>
               ) : (
-                <div
-                  className="relative mx-auto w-full max-w-[1200px] px-3 py-3"
-                  style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
-                >
-                  {hasOlderTranscript ? (
-                    <div className="sticky top-0 z-10 mb-2 flex justify-center">
-                      <div className="rounded-full border border-border bg-background/90 px-3 py-1 text-[11px] text-muted-foreground backdrop-blur">
-                        Scroll top to load older messages
-                      </div>
-                    </div>
-                  ) : null}
-                  {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-                    const entry = visibleTranscript[virtualRow.index];
-                    if (!entry) {
-                      return null;
-                    }
-                    return (
-                      <div
-                        key={entry.id}
-                        data-index={virtualRow.index}
-                        ref={(node) => {
-                          if (node) {
-                            rowVirtualizer.measureElement(node);
-                          }
-                        }}
-                        className="absolute left-0 top-0 w-full px-3"
-                        style={{ transform: `translateY(${virtualRow.start}px)` }}
-                      >
-                        <TranscriptCard
-                          entry={entry}
-                          expanded={expanded.has(entry.id)}
-                          onToggle={() =>
-                            setExpanded((current) => {
-                              const next = new Set(current);
-                              if (next.has(entry.id)) {
-                                next.delete(entry.id);
-                              } else {
-                                next.add(entry.id);
-                              }
-                              return next;
-                            })
-                          }
-                        />
-                      </div>
-                    );
-                  })}
+                <div className="flex h-full items-center justify-center">
+                  <div className="rounded-lg border border-dashed border-border bg-card px-4 py-3 text-sm text-muted-foreground">
+                    No active sessions
+                  </div>
                 </div>
               )}
             </div>
-
-            <div className="grid gap-1.5 border-t border-border p-3">
-              <Textarea
-                value={composer}
-                onChange={(event) => setComposer(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.ctrlKey) {
-                    event.preventDefault();
-                    void handleSendMessage();
-                  }
-                }}
-                placeholder="Enter send · Ctrl+Enter newline"
-                className="min-h-[96px] max-h-[96px]"
-              />
-              <div className="flex items-center gap-1 overflow-x-auto">
-                <InlineSelect
-                  value={sandbox}
-                  onValueChange={(value) => {
-                    const nextValue = value as "read-only" | "workspace-write" | "danger-full-access";
-                    setSandbox(nextValue);
-                    void handleSessionConfigChange({ sandbox: nextValue });
-                  }}
-                  options={SANDBOX_OPTIONS}
-                />
-                <InlineSelect
-                  value={model}
-                  onValueChange={(value) => {
-                    setModel(value);
-                    void handleSessionConfigChange({ model: value });
-                  }}
-                  options={config.models.map((item) => ({
-                    value: item.model,
-                    label: item.model,
-                  }))}
-                />
-                <InlineSelect
-                  value={effort}
-                  onValueChange={(value) => {
-                    setEffort(value);
-                    void handleSessionConfigChange({ reasoningEffort: value });
-                  }}
-                  options={(currentModel?.supportedReasoningEfforts || []).map((item) => ({
-                    value: item.reasoningEffort,
-                    label: formatEffortLabel(item.reasoningEffort),
-                  }))}
-                />
-                <div className="truncate pl-2 text-xs text-muted-foreground">
-                  {activeSession ? activeSession.cwd : cwd}
-                </div>
+          </main>
+        ) : (
+          <div
+            className={`grid min-h-0 ${sessionsCollapsed ? "grid-cols-[0_minmax(0,1fr)]" : "grid-cols-[280px_minmax(0,1fr)]"}`}
+          >
+            <aside
+              className={[
+                "grid min-h-0 grid-rows-[40px_minmax(0,1fr)] transition-all duration-200",
+                sessionsCollapsed
+                  ? "w-0 overflow-hidden border-r-0 opacity-0"
+                  : "border-r border-border opacity-100",
+              ].join(" ")}
+            >
+              <div className="flex items-center justify-between px-3 text-xs uppercase tracking-[0.2em] text-muted-foreground">
+                <span>Sessions</span>
+                <Badge variant="outline">{visibleSessions.length}</Badge>
               </div>
-              <div className="flex items-center justify-end gap-2">
-                <div className="flex items-center gap-2">
-                  {activity ? (
-                    <div className="flex items-center gap-1 text-xs text-muted-foreground">
-                      <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
-                      {activity.label}
-                    </div>
-                  ) : null}
+              <ScrollArea>
+                <div className="space-y-1.5 p-2">
+                  {visibleSessions.map((session) => (
+                    <button
+                      key={session.id}
+                      type="button"
+                      onClick={() => handleSelectSession(session.id)}
+                      className={[
+                        "grid w-full gap-1 rounded-md border px-2.5 py-2 text-left text-xs transition-colors",
+                        activeSessionId === session.id
+                          ? "border-primary/40 bg-primary/10"
+                          : "border-border hover:bg-accent/60",
+                      ].join(" ")}
+                    >
+                      <div className="line-clamp-2 text-sm font-medium">{session.title}</div>
+                      <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
+                        <Badge variant={session.origin === "restored" ? "warning" : "outline"}>
+                          {session.origin}
+                        </Badge>
+                        <span>{session.model || "default"}</span>
+                        <span>{session.reasoningEffort || "medium"}</span>
+                      </div>
+                      <div className="truncate text-muted-foreground">{session.cwd}</div>
+                      <div className="flex items-center justify-between text-muted-foreground">
+                        <span>{session.status}</span>
+                        <span>{formatDateTime(session.updatedAt)}</span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </ScrollArea>
+            </aside>
+
+            <main className="grid min-h-0 grid-rows-[64px_minmax(0,1fr)_auto]">
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-b border-border px-3">
+                <div className="flex min-w-0 items-center gap-2">
                   <Button
-                    size="sm"
-                    disabled={!activeDaemonId || !activeSessionId || !composer.trim()}
-                    onClick={() => void handleSendMessage()}
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8 shrink-0"
+                    onClick={() => setSessionsCollapsed((current) => !current)}
                   >
-                    <Send className="h-3.5 w-3.5" />
-                    Send
+                    <PanelLeftOpen
+                      className={`h-4 w-4 transition-transform ${sessionsCollapsed ? "" : "rotate-180"}`}
+                    />
+                  </Button>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      {activeDaemon ? (
+                        <Badge variant={activeDaemon.online ? "success" : "destructive"}>
+                          {activeDaemon.online ? "online" : "offline"}
+                        </Badge>
+                      ) : null}
+                      <div className="truncate text-sm font-medium">
+                        {activeSession?.title || activeDaemon?.name || "No Session"}
+                      </div>
+                    </div>
+                    <div className="truncate text-xs text-muted-foreground">
+                      {activeSession
+                        ? `${activeSession.cwd} · ${activeSession.model || "default"} · ${activeSession.reasoningEffort || "medium"} · ${activeSession.codexThreadId || "pending"}`
+                        : activeDaemon
+                          ? `${activeDaemon.cwd} · ${activeDaemon.platform} · ${activeDaemon.id}`
+                          : "select daemon"}
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  {activity ? <Badge variant={activity.variant}>{activity.label}</Badge> : null}
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    disabled={!activeDaemonId || !activeSessionId}
+                    onClick={() => void handleDelete()}
+                  >
+                    Close
                   </Button>
                 </div>
               </div>
-            </div>
-          </main>
-        </div>
+
+              <div
+                ref={transcriptRef}
+                className="relative min-h-0 overflow-auto bg-muted/10"
+                onScroll={handleTranscriptScroll}
+              >
+                {sessionLoading ? (
+                  <div className="flex h-full items-center justify-center px-3 py-3">
+                    <div className="flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-sm text-muted-foreground shadow-sm">
+                      <LoaderCircle className="h-4 w-4 animate-spin" />
+                      Loading session
+                    </div>
+                  </div>
+                ) : (
+                  <div
+                    className="relative mx-auto w-full max-w-[1200px] px-3 py-3"
+                    style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
+                  >
+                    {hasOlderTranscript ? (
+                      <div className="sticky top-0 z-10 mb-2 flex justify-center">
+                        <div className="rounded-full border border-border bg-background/90 px-3 py-1 text-[11px] text-muted-foreground backdrop-blur">
+                          Scroll top to load older messages
+                        </div>
+                      </div>
+                    ) : null}
+                    {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                      const row = visibleTranscript[virtualRow.index];
+                      if (!row) {
+                        return null;
+                      }
+                      return (
+                        <div
+                          key={row.id}
+                          data-index={virtualRow.index}
+                          ref={(node) => {
+                            if (node) {
+                              rowVirtualizer.measureElement(node);
+                            }
+                          }}
+                          className="absolute left-0 top-0 w-full px-3"
+                          style={{ transform: `translateY(${virtualRow.start}px)` }}
+                        >
+                          <TranscriptCard
+                            entry={row.entry}
+                            reasoning={row.reasoning}
+                            busy={approvalActionId === row.entry.id}
+                            expanded={expanded.has(row.entry.id)}
+                            onApprovalAction={(decision) => void handleApprovalAction(row.entry, decision)}
+                            onToggle={() =>
+                              setExpanded((current) => {
+                                const next = new Set(current);
+                                if (next.has(row.entry.id)) {
+                                  next.delete(row.entry.id);
+                                } else {
+                                  next.add(row.entry.id);
+                                }
+                                return next;
+                              })
+                            }
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {showScrollToBottom && chatTranscript.length ? (
+                  <div className="pointer-events-none sticky bottom-3 z-20 flex justify-end px-3">
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="outline"
+                      className="pointer-events-auto h-8 w-8 rounded-full shadow-sm"
+                      onClick={scrollTranscriptToBottom}
+                    >
+                      <ArrowDown className="h-4 w-4" />
+                    </Button>
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="grid gap-1.5 border-t border-border p-3">
+                <Textarea
+                  value={composer}
+                  onChange={(event) => setComposer(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.ctrlKey) {
+                      event.preventDefault();
+                      void handleSendMessage();
+                    }
+                  }}
+                  placeholder="Enter send · Ctrl+Enter newline"
+                  className="min-h-[96px] max-h-[96px]"
+                />
+                <div className="flex items-center justify-between gap-3 overflow-hidden">
+                  <div className="flex min-w-0 items-center gap-2">
+                    {activity ? (
+                      <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
+                        {isBusyActivity(activity) ? (
+                          <LoaderCircle className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <Circle className="h-3 w-3 fill-current" />
+                        )}
+                        {activity.label}
+                      </div>
+                    ) : (
+                      <div className="truncate text-[11px] text-muted-foreground">
+                        {activeSession ? activeSession.cwd : cwd}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1 overflow-x-auto">
+                    <InlineSelect
+                      value={sandbox}
+                      onValueChange={(value) => {
+                        const nextValue = value as "read-only" | "workspace-write" | "danger-full-access";
+                        const nextApprovalPolicy = defaultApprovalPolicyForSandbox(nextValue);
+                        setSandbox(nextValue);
+                        setApprovalPolicy(nextApprovalPolicy);
+                        void handleSessionConfigChange({
+                          sandbox: nextValue,
+                          approvalPolicy: nextApprovalPolicy,
+                        });
+                      }}
+                      options={SANDBOX_OPTIONS}
+                    />
+                    <InlineSelect
+                      value={model}
+                      onValueChange={(value) => {
+                        setModel(value);
+                        void handleSessionConfigChange({ model: value });
+                      }}
+                      options={config.models.map((item) => ({
+                        value: item.model,
+                        label: item.model,
+                      }))}
+                    />
+                    <InlineSelect
+                      value={effort}
+                      onValueChange={(value) => {
+                        setEffort(value);
+                        void handleSessionConfigChange({ reasoningEffort: value });
+                      }}
+                      options={(currentModel?.supportedReasoningEfforts || []).map((item) => ({
+                        value: item.reasoningEffort,
+                        label: formatEffortLabel(item.reasoningEffort),
+                      }))}
+                    />
+                    {isTurnBusy(activeSession, sendingMessage) ? (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={!activeDaemonId || !activeSessionId}
+                        onClick={() => void handleInterrupt()}
+                      >
+                        <Square className="h-3.5 w-3.5" />
+                        Stop
+                      </Button>
+                    ) : (
+                      <Button
+                        size="sm"
+                        disabled={!activeDaemonId || !activeSessionId || !composer.trim()}
+                        onClick={() => void handleSendMessage()}
+                      >
+                        <Send className="h-3.5 w-3.5" />
+                        Send
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </main>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -792,24 +1323,35 @@ function App() {
 
 function TranscriptCard({
   entry,
+  reasoning,
+  busy,
   expanded,
+  onApprovalAction,
   onToggle,
 }: {
   entry: TranscriptEntry;
+  reasoning?: TranscriptEntry;
+  busy: boolean;
   expanded: boolean;
+  onApprovalAction: (decision: "approve" | "deny") => void;
   onToggle: () => void;
 }) {
-  const expandable = ["tool", "command", "file_change", "reasoning"].includes(entry.kind);
-  const preview = entry.kind === "reasoning" ? entry.text || "thinking" : lastLines(entry.text, TOOL_LINE_LIMIT);
+  const expandable = ["tool", "command", "file_change"].includes(entry.kind);
+  const preview = lastLines(entry.text, TOOL_LINE_LIMIT);
   const body = expandable && !expanded ? preview : entry.text;
   const rowClassName = getBubbleRowClassName(entry);
   const bubbleClassName = getBubbleClassName(entry);
   const metaBadges = getEntryMetaBadges(entry);
-  const showMetaHeader = metaBadges.length > 0 || !isChatBubble(entry);
+  const compactFileChange = entry.kind === "file_change";
+  const showMetaHeader = !compactFileChange && (metaBadges.length > 0 || !isChatBubble(entry));
 
   return (
     <article className={`mb-4 flex w-full ${rowClassName}`}>
       <div className={bubbleClassName}>
+        {entry.kind === "assistant" && reasoning ? (
+          <AttachedReasoning reasoning={reasoning} expanded={expanded} onToggle={onToggle} />
+        ) : null}
+
         {showMetaHeader ? (
           <div className="mb-2 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
             <div className="flex items-center gap-1.5">
@@ -826,10 +1368,16 @@ function TranscriptCard({
 
         {renderEntryBody(entry, body, expanded)}
 
+        {entry.kind === "approval" ? (
+          <ApprovalActions entry={entry} busy={busy} onApprovalAction={onApprovalAction} />
+        ) : null}
+
+        {isChatBubble(entry) ? <TurnTimingFooter entry={reasoning?.meta ? reasoning : entry} /> : null}
+
         {expandable && entry.text ? (
           <div className="mt-2 flex justify-end">
-            <Button variant="ghost" size="sm" onClick={onToggle}>
-              {expanded ? "Collapse" : "Expand"}
+            <Button variant="ghost" size="icon" className="h-7 w-7" onClick={onToggle}>
+              {expanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
             </Button>
           </div>
         ) : null}
@@ -838,20 +1386,262 @@ function TranscriptCard({
   );
 }
 
+function OverviewSessionCard({
+  session,
+  details,
+  active,
+  onOpen,
+}: {
+  session: SessionSummary;
+  details?: SessionDetails;
+  active: boolean;
+  onOpen: () => void;
+}) {
+  const activity = getSessionOverviewActivity(session, details);
+  const previewEntries = getOverviewPreviewEntries(details);
+
+  return (
+    <button
+      type="button"
+      className={[
+        "overview-card grid max-h-[340px] w-full gap-2 overflow-hidden rounded-xl border bg-card px-3 py-3 text-left shadow-sm transition-colors",
+        active ? "border-primary/40 bg-primary/5" : "border-border hover:bg-accent/40",
+      ].join(" ")}
+      onClick={onOpen}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="line-clamp-2 text-sm font-medium">{session.title}</div>
+          <div className="mt-1 truncate text-[11px] text-muted-foreground">{session.cwd}</div>
+        </div>
+        <Badge variant={activity.variant}>{activity.label}</Badge>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-1 text-[10px] text-muted-foreground">
+        <Badge variant={session.origin === "restored" ? "warning" : "outline"}>{session.origin}</Badge>
+        <span>{session.model || "default"}</span>
+        <span>{session.reasoningEffort || "medium"}</span>
+        <span>{formatDateTime(session.updatedAt)}</span>
+      </div>
+
+      <div className="grid min-h-0 gap-1 overflow-hidden">
+        {previewEntries.length ? (
+          previewEntries.map((entry) => <OverviewEntryPreview key={entry.id} entry={entry} />)
+        ) : (
+          <div className="text-xs text-muted-foreground">
+            {details ? "No messages yet" : "Loading transcript"}
+          </div>
+        )}
+      </div>
+    </button>
+  );
+}
+
+function OverviewEntryPreview({ entry }: { entry: TranscriptEntry }) {
+  const label = getOverviewEntryLabel(entry);
+  const body = getOverviewEntryPreviewText(entry);
+
+  return (
+    <div className="grid gap-0.5 text-left">
+      <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+        <span className="uppercase tracking-[0.16em]">{label}</span>
+        <span>{formatTime(entry.createdAt)}</span>
+      </div>
+      <div className="line-clamp-6 whitespace-pre-wrap break-words text-[12px] leading-4.5 text-foreground/90">
+        {body}
+      </div>
+    </div>
+  );
+}
+
+function ApprovalActions({
+  entry,
+  busy,
+  onApprovalAction,
+}: {
+  entry: TranscriptEntry;
+  busy: boolean;
+  onApprovalAction: (decision: "approve" | "deny") => void;
+}) {
+  if (entry.status && entry.status !== "pending") {
+    return (
+      <div className="mt-3 text-[11px] text-muted-foreground">
+        {entry.status === "approved" ? "Approved" : entry.status === "declined" ? "Denied" : entry.status}
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-3 flex items-center justify-end gap-2">
+      <Button size="sm" variant="outline" disabled={busy} onClick={() => onApprovalAction("deny")}>
+        {busy ? <LoaderCircle className="h-3 w-3 animate-spin" /> : null}
+        Deny
+      </Button>
+      <Button size="sm" disabled={busy} onClick={() => onApprovalAction("approve")}>
+        {busy ? <LoaderCircle className="h-3 w-3 animate-spin" /> : null}
+        Approve
+      </Button>
+    </div>
+  );
+}
+
+function TurnTimingFooter({ entry }: { entry: TranscriptEntry }) {
+  const firstByteMs =
+    typeof entry.meta?.firstByteMs === "number" ? entry.meta.firstByteMs : undefined;
+  const totalMs = typeof entry.meta?.totalMs === "number" ? entry.meta.totalMs : undefined;
+  if (typeof firstByteMs !== "number" && typeof totalMs !== "number") {
+    return null;
+  }
+
+  const parts = [
+    typeof firstByteMs === "number" ? `首字 ${formatDurationMs(firstByteMs)}` : "",
+    typeof totalMs === "number" ? `总耗时 ${formatDurationMs(totalMs)}` : "",
+  ].filter(Boolean);
+
+  if (!parts.length) {
+    return null;
+  }
+
+  return <div className="mt-2 text-[11px] text-muted-foreground">{parts.join(" · ")}</div>;
+}
+
+function AttachedReasoning({
+  reasoning,
+  expanded,
+  onToggle,
+}: {
+  reasoning: TranscriptEntry;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const text = getAttachedReasoningText(reasoning, expanded);
+  if (!text) {
+    return null;
+  }
+
+  return reasoning.status === "streaming" ? (
+    <div className="mb-3">
+      <MarkdownBody text={text} muted />
+    </div>
+  ) : (
+    <div className="mb-3">
+      <div
+        className={[
+          "overflow-hidden",
+          expanded ? "" : "line-clamp-1",
+        ].join(" ")}
+      >
+        <MarkdownBody text={text} muted />
+      </div>
+      <div className="mt-1 flex justify-end">
+        <Button variant="ghost" size="icon" className="h-6 w-6" onClick={onToggle}>
+          {expanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function getReasoningFullText(reasoning?: TranscriptEntry) {
+  if (!reasoning) {
+    return "";
+  }
+  const text = (reasoning.text || "").trim();
+  if (!text) {
+    return reasoning.status === "streaming" ? "Thinking..." : "";
+  }
+  return text;
+}
+
+function getAttachedReasoningText(reasoning?: TranscriptEntry, expanded: boolean = false) {
+  const text = getReasoningFullText(reasoning);
+  if (!text) {
+    return "";
+  }
+  if (reasoning?.status === "streaming") {
+    return text;
+  }
+  if (expanded) {
+    return text;
+  }
+  const firstLine = text.split(/\r?\n/).find((line) => line.trim());
+  return firstLine?.trim() ?? text;
+}
+
+function buildChatTranscriptRows(transcript: TranscriptEntry[]): ChatTranscriptRow[] {
+  const rows: ChatTranscriptRow[] = [];
+  let pendingReasoning: TranscriptEntry | undefined;
+
+  const flushReasoning = () => {
+    if (!pendingReasoning) {
+      return;
+    }
+    rows.push({
+      id: `reasoning-host:${pendingReasoning.id}`,
+      entry: {
+        id: `reasoning-host:${pendingReasoning.id}`,
+        kind: "assistant",
+        text: "",
+        createdAt: pendingReasoning.createdAt,
+        status: pendingReasoning.status === "streaming" ? "streaming" : "completed",
+      },
+      reasoning: pendingReasoning,
+    });
+    pendingReasoning = undefined;
+  };
+
+  for (const entry of transcript) {
+    if (entry.kind === "reasoning") {
+      pendingReasoning = entry;
+      continue;
+    }
+
+    if (entry.kind === "assistant") {
+      rows.push({
+        id: entry.id,
+        entry,
+        reasoning: pendingReasoning,
+      });
+      pendingReasoning = undefined;
+      continue;
+    }
+
+    if (pendingReasoning) {
+      flushReasoning();
+    }
+
+    rows.push({
+      id: entry.id,
+      entry,
+    });
+  }
+
+  if (pendingReasoning) {
+    flushReasoning();
+  }
+
+  return rows;
+}
+
 function renderEntryBody(entry: TranscriptEntry, body: string, expanded: boolean) {
   if (entry.kind === "assistant" || entry.kind === "user") {
+    if (entry.kind === "assistant" && entry.status === "streaming" && !body.trim()) {
+      return <TypingPlaceholder />;
+    }
     return <MarkdownBody text={body} />;
   }
 
   if (entry.kind === "file_change") {
-    return expanded ? (
-      <div className="max-h-80 overflow-auto rounded-md border border-border bg-background/70">
+    return (
+      <div
+        className={
+          expanded
+            ? "max-h-80 overflow-auto rounded-md border border-border bg-background/70"
+            : "max-h-56 overflow-hidden rounded-md border border-border bg-background/70"
+        }
+      >
         <DiffViewer text={body} />
       </div>
-    ) : (
-      <pre className="overflow-hidden whitespace-pre-wrap break-words font-mono text-xs leading-5 text-foreground/90">
-        {body}
-      </pre>
     );
   }
 
@@ -879,7 +1669,69 @@ function renderEntryBody(entry: TranscriptEntry, body: string, expanded: boolean
     );
   }
 
+  if (entry.kind === "approval") {
+    return <ApprovalBody entry={entry} />;
+  }
+
   return <MarkdownBody text={body || ""} muted={entry.kind === "system"} />;
+}
+
+function ApprovalBody({ entry }: { entry: TranscriptEntry }) {
+  const approvalKind = typeof entry.meta?.approvalKind === "string" ? entry.meta.approvalKind : "";
+  const payload = (entry.meta?.payload ?? {}) as Record<string, unknown>;
+
+  if (approvalKind === "item/permissions/requestApproval") {
+    return (
+      <div className="grid gap-2 text-sm">
+        <div className="font-medium">Additional permissions requested</div>
+        {typeof payload.reason === "string" && payload.reason ? (
+          <div className="text-muted-foreground">{payload.reason}</div>
+        ) : null}
+        <pre className="overflow-auto rounded-md border border-border bg-background/70 p-3 font-mono text-xs leading-5 whitespace-pre-wrap">
+          {JSON.stringify(payload.permissions ?? {}, null, 2)}
+        </pre>
+      </div>
+    );
+  }
+
+  if (
+    approvalKind === "execCommandApproval" ||
+    approvalKind === "item/commandExecution/requestApproval"
+  ) {
+    return (
+      <div className="grid gap-2 text-sm">
+        <div className="font-medium">Command approval requested</div>
+        {typeof payload.reason === "string" && payload.reason ? (
+          <div className="text-muted-foreground">{payload.reason}</div>
+        ) : null}
+        <pre className="overflow-auto rounded-md border border-border bg-background/70 p-3 font-mono text-xs leading-5 whitespace-pre-wrap">
+          {Array.isArray(payload.command) ? payload.command.join(" ") : String(payload.command ?? "")}
+        </pre>
+        {typeof payload.cwd === "string" && payload.cwd ? (
+          <div className="text-[11px] text-muted-foreground">{payload.cwd}</div>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (
+    approvalKind === "applyPatchApproval" ||
+    approvalKind === "item/fileChange/requestApproval"
+  ) {
+    return (
+      <div className="grid gap-2 text-sm">
+        <div className="font-medium">File change approval requested</div>
+        {typeof payload.reason === "string" && payload.reason ? (
+          <div className="text-muted-foreground">{payload.reason}</div>
+        ) : null}
+        <pre className="max-h-64 overflow-auto rounded-md border border-border bg-background/70 p-3 font-mono text-xs leading-5 whitespace-pre-wrap">
+          {JSON.stringify(payload.fileChanges ?? {}, null, 2)}
+        </pre>
+      </div>
+    );
+  }
+
+  return <MarkdownBody text={entry.text} muted />;
 }
 
 function MarkdownBody({ text, muted = false }: { text: string; muted?: boolean }) {
@@ -949,7 +1801,7 @@ function InlineSelect({
 }) {
   return (
     <Select value={value} onValueChange={onValueChange}>
-      <SelectTrigger className="h-7 w-auto shrink-0 gap-1 border-transparent bg-transparent px-2 text-[14px] font-medium text-foreground shadow-none hover:bg-accent/50 focus:ring-0">
+      <SelectTrigger className="h-6 w-auto shrink-0 gap-1 border-0 bg-transparent px-1.5 text-[12px] font-medium text-foreground shadow-none ring-0 outline-none hover:bg-transparent focus:ring-0 focus:ring-offset-0 data-[placeholder]:text-muted-foreground">
         <SelectValue placeholder="Select" />
       </SelectTrigger>
       <SelectContent>
@@ -960,6 +1812,15 @@ function InlineSelect({
         ))}
       </SelectContent>
     </Select>
+  );
+}
+
+function TypingPlaceholder() {
+  return (
+    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+      <LoaderCircle className="h-4 w-4 animate-spin" />
+      <span>Thinking</span>
+    </div>
   );
 }
 
@@ -1002,6 +1863,7 @@ function getActivity(
     creatingSession?: boolean;
     restoringHistory?: boolean;
     sessionLoading?: boolean;
+    sendingMessage?: boolean;
   },
 ): ActivityState | null {
   if (pending?.restoringHistory) {
@@ -1013,6 +1875,9 @@ function getActivity(
   if (pending?.sessionLoading) {
     return { label: "loading", variant: "default" };
   }
+  if (pending?.sendingMessage) {
+    return { label: "sending", variant: "default" };
+  }
   if (!session) {
     return null;
   }
@@ -1022,6 +1887,12 @@ function getActivity(
     .find((entry) => entry.kind === "reasoning" && entry.status === "streaming");
   if (reasoning) {
     return { label: "thinking", variant: "warning" };
+  }
+  const approval = [...transcript]
+    .reverse()
+    .find((entry) => entry.kind === "approval" && entry.status === "pending");
+  if (approval) {
+    return { label: "approval", variant: "warning" };
   }
   const assistant = [...transcript]
     .reverse()
@@ -1041,12 +1912,30 @@ function getActivity(
   return null;
 }
 
+function isBusyActivity(activity: ActivityState) {
+  return ["restoring", "starting", "loading", "sending", "thinking", "replying", "running"].includes(
+    activity.label,
+  );
+}
+
+function isTurnBusy(session: SessionDetails | null, sendingMessage: boolean) {
+  if (sendingMessage) {
+    return true;
+  }
+  if (!session) {
+    return false;
+  }
+  return session.status === "running";
+}
+
 function variantForEntry(entry: TranscriptEntry): "default" | "outline" | "warning" | "destructive" | "success" {
   switch (entry.kind) {
     case "assistant":
       return "default";
     case "reasoning":
       return "warning";
+    case "approval":
+      return entry.status === "approved" ? "success" : entry.status === "declined" ? "destructive" : "warning";
     case "system":
       return entry.status === "failed" ? "destructive" : "outline";
     case "user":
@@ -1076,6 +1965,19 @@ function getEntryMetaBadges(entry: TranscriptEntry): Array<{
     return badges;
   }
 
+  if (entry.kind === "approval" && entry.status) {
+    badges.push({
+      label: entry.status,
+      variant:
+        entry.status === "approved"
+          ? "success"
+          : entry.status === "declined"
+            ? "destructive"
+            : "warning",
+    });
+    return badges;
+  }
+
   if (!isChatBubble(entry) && entry.status) {
     badges.push({
       label: entry.status,
@@ -1100,8 +2002,14 @@ function getBubbleClassName(entry: TranscriptEntry) {
   if (entry.kind === "reasoning") {
     return "inline-block w-fit max-w-[min(82%,880px)] rounded-2xl rounded-bl-md border border-amber-500/20 bg-amber-500/6 px-4 py-3 shadow-sm";
   }
+  if (entry.kind === "approval") {
+    return "w-full max-w-full rounded-xl border border-amber-500/30 bg-amber-500/6 px-3 py-3 shadow-sm";
+  }
   if (entry.kind === "system") {
     return "w-full max-w-full rounded-xl border border-border bg-muted/40 px-3 py-2 shadow-sm";
+  }
+  if (entry.kind === "file_change") {
+    return "w-full max-w-full rounded-xl border border-border bg-card px-2.5 py-2 shadow-sm";
   }
   return "w-full max-w-full rounded-xl border border-border bg-card px-3 py-3 shadow-sm";
 }
@@ -1114,6 +2022,89 @@ function getBubbleRowClassName(entry: TranscriptEntry) {
     return "justify-start";
   }
   return "justify-start";
+}
+
+function getSessionOverviewActivity(session: SessionSummary, details?: SessionDetails): ActivityState {
+  const detailActivity = details ? getActivity(details) : null;
+  if (detailActivity) {
+    return detailActivity;
+  }
+  if (session.status === "failed") {
+    return { label: "failed", variant: "destructive" };
+  }
+  if (session.status === "completed") {
+    return { label: "completed", variant: "success" };
+  }
+  if (session.status === "running" || session.status === "starting") {
+    return { label: session.status, variant: "default" };
+  }
+  if (session.status === "interrupted") {
+    return { label: "interrupted", variant: "warning" };
+  }
+  return { label: "idle", variant: "outline" };
+}
+
+function getOverviewPreviewEntries(details?: SessionDetails) {
+  if (!details?.transcript?.length) {
+    return [];
+  }
+  const selected: TranscriptEntry[] = [];
+  let textBudget = 520;
+  for (let index = details.transcript.length - 1; index >= 0; index -= 1) {
+    const entry = details.transcript[index];
+    if (!entry) {
+      continue;
+    }
+    const previewText = getOverviewEntryPreviewText(entry);
+    const cost = Math.max(40, previewText.length);
+    if (selected.length && textBudget - cost < 0) {
+      break;
+    }
+    selected.unshift(entry);
+    textBudget -= cost;
+    if (selected.length >= 6) {
+      break;
+    }
+  }
+  return selected;
+}
+
+function getOverviewEntryLabel(entry: TranscriptEntry) {
+  switch (entry.kind) {
+    case "user":
+      return "User";
+    case "assistant":
+      return entry.status === "streaming" ? "Assistant" : "Reply";
+    case "reasoning":
+      return "Thinking";
+    case "tool":
+      return "Tool";
+    case "command":
+      return "Command";
+    case "file_change":
+      return "Diff";
+    case "approval":
+      return "Approval";
+    default:
+      return "System";
+  }
+}
+
+function getOverviewEntryPreviewText(entry: TranscriptEntry) {
+  if (entry.kind === "assistant" && entry.status === "streaming" && !entry.text.trim()) {
+    return "Thinking…";
+  }
+  if (entry.kind === "approval") {
+    const approvalKind = typeof entry.meta?.approvalKind === "string" ? entry.meta.approvalKind : "approval";
+    return approvalKind;
+  }
+  if (entry.kind === "tool" || entry.kind === "command" || entry.kind === "file_change") {
+    return lastLines(entry.text, 6) || `${getOverviewEntryLabel(entry)} output`;
+  }
+  const collapsed = String(entry.text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return collapsed || getOverviewEntryLabel(entry);
 }
 
 function parseDiffSections(text: string) {
@@ -1223,6 +2214,246 @@ function upsertDaemon(current: DaemonDescriptor[], daemon: DaemonDescriptor) {
   return next;
 }
 
+function defaultApprovalPolicyForSandbox(
+  sandbox: "read-only" | "workspace-write" | "danger-full-access",
+) {
+  return sandbox === "danger-full-access" ? "never" : "on-request";
+}
+
+function groupHistoryByDay(history: CodexHistoryEntry[]) {
+  const grouped: Array<
+    | { type: "separator"; key: string; label: string }
+    | { type: "item"; entry: CodexHistoryEntry }
+  > = [];
+  let currentDay = "";
+
+  for (const entry of history) {
+    const dateKey = formatHistoryDayKey(entry.updatedAt || entry.createdAt);
+    if (dateKey !== currentDay) {
+      currentDay = dateKey;
+      grouped.push({
+        type: "separator",
+        key: `separator-${dateKey}`,
+        label: formatHistoryDayLabel(entry.updatedAt || entry.createdAt),
+      });
+    }
+    grouped.push({ type: "item", entry });
+  }
+
+  return grouped;
+}
+
+function formatHistoryDayKey(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`;
+}
+
+function formatHistoryDayLabel(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleDateString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    weekday: "short",
+  });
+}
+
+function loadWorkspaceState(): WorkspaceStore {
+  try {
+    const raw = localStorage.getItem(WORKSPACE_STORAGE_KEY);
+    if (!raw) {
+      return createDefaultWorkspaceStore();
+    }
+    const parsed = JSON.parse(raw) as Partial<WorkspaceStore>;
+    const workspaces = Array.isArray(parsed.workspaces)
+      ? parsed.workspaces
+          .map((workspace) => ({
+            id: typeof workspace?.id === "string" ? workspace.id : createWorkspaceId(),
+            sessionKeys: Array.isArray(workspace?.sessionKeys)
+              ? workspace.sessionKeys.filter((item): item is string => typeof item === "string")
+              : [],
+            activeSessionKey: typeof workspace?.activeSessionKey === "string" ? workspace.activeSessionKey : null,
+          }))
+          .filter((workspace) => workspace.id)
+      : [];
+    if (!workspaces.length) {
+      return createDefaultWorkspaceStore();
+    }
+    const activeWorkspaceId =
+      typeof parsed.activeWorkspaceId === "string" &&
+      workspaces.some((workspace) => workspace.id === parsed.activeWorkspaceId)
+        ? parsed.activeWorkspaceId
+        : workspaces[0].id;
+    return { activeWorkspaceId, workspaces };
+  } catch {
+    return createDefaultWorkspaceStore();
+  }
+}
+
+function createDefaultWorkspaceStore(): WorkspaceStore {
+  const workspaces = Array.from({ length: 3 }, () => ({
+    id: createWorkspaceId(),
+    sessionKeys: [],
+    activeSessionKey: null,
+  }));
+  return {
+    activeWorkspaceId: workspaces[0].id,
+    workspaces,
+  };
+}
+
+function createWorkspaceId() {
+  return `ws-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function makeSessionKey(daemonId: string, sessionId: string) {
+  return `${daemonId}::${sessionId}`;
+}
+
+function parseSessionId(sessionKey: string | null | undefined, daemonId: string) {
+  if (!sessionKey) {
+    return null;
+  }
+  const prefix = `${daemonId}::`;
+  return sessionKey.startsWith(prefix) ? sessionKey.slice(prefix.length) : null;
+}
+
+function syncWorkspaceStoreWithSessions(
+  state: WorkspaceStore,
+  daemonId: string,
+  sessionIds: string[],
+) {
+  const validKeys = new Set(sessionIds.map((sessionId) => makeSessionKey(daemonId, sessionId)));
+  const assignedKeys = new Set<string>();
+  const activeWorkspaceId =
+    state.workspaces.some((workspace) => workspace.id === state.activeWorkspaceId)
+      ? state.activeWorkspaceId
+      : state.workspaces[0]?.id ?? createWorkspaceId();
+
+  const workspaces = state.workspaces.length ? state.workspaces : createDefaultWorkspaceStore().workspaces;
+  const nextWorkspaces = workspaces.map((workspace) => {
+    const sessionKeys = workspace.sessionKeys.filter((key) => {
+      if (!key.startsWith(`${daemonId}::`)) {
+        assignedKeys.add(key);
+        return true;
+      }
+      if (validKeys.has(key)) {
+        assignedKeys.add(key);
+        return true;
+      }
+      return false;
+    });
+    const activeSessionKey =
+      workspace.activeSessionKey && sessionKeys.includes(workspace.activeSessionKey)
+        ? workspace.activeSessionKey
+        : null;
+    return { ...workspace, sessionKeys, activeSessionKey };
+  });
+
+  const unassignedKeys = [...validKeys].filter((key) => !assignedKeys.has(key));
+  if (unassignedKeys.length) {
+    const targetWorkspace =
+      nextWorkspaces.find((workspace) => workspace.id === activeWorkspaceId) ?? nextWorkspaces[0];
+    if (targetWorkspace) {
+      targetWorkspace.sessionKeys = [...targetWorkspace.sessionKeys, ...unassignedKeys];
+      if (!targetWorkspace.activeSessionKey) {
+        targetWorkspace.activeSessionKey = unassignedKeys[0] ?? null;
+      }
+    }
+  }
+
+  return {
+    activeWorkspaceId,
+    workspaces: nextWorkspaces,
+  };
+}
+
+function addSessionToWorkspace(
+  state: WorkspaceStore,
+  workspaceId: string,
+  daemonId: string,
+  sessionId: string,
+) {
+  const sessionKey = makeSessionKey(daemonId, sessionId);
+  return {
+    ...state,
+    activeWorkspaceId: workspaceId,
+    workspaces: state.workspaces.map((workspace) => {
+      const nextKeys = workspace.sessionKeys.filter((key) => key !== sessionKey);
+      if (workspace.id !== workspaceId) {
+        return {
+          ...workspace,
+          sessionKeys: nextKeys,
+          activeSessionKey: workspace.activeSessionKey === sessionKey ? null : workspace.activeSessionKey,
+        };
+      }
+      return {
+        ...workspace,
+        sessionKeys: [...nextKeys, sessionKey],
+        activeSessionKey: sessionKey,
+      };
+    }),
+  };
+}
+
+function setWorkspaceActiveSession(
+  state: WorkspaceStore,
+  workspaceId: string,
+  daemonId: string,
+  sessionId: string,
+) {
+  const sessionKey = makeSessionKey(daemonId, sessionId);
+  return {
+    ...state,
+    workspaces: state.workspaces.map((workspace) =>
+      workspace.id === workspaceId
+        ? {
+            ...workspace,
+            sessionKeys: workspace.sessionKeys.includes(sessionKey)
+              ? workspace.sessionKeys
+              : [...workspace.sessionKeys, sessionKey],
+            activeSessionKey: sessionKey,
+          }
+        : workspace,
+    ),
+  };
+}
+
+function createWorkspace(state: WorkspaceStore) {
+  const workspace = {
+    id: createWorkspaceId(),
+    sessionKeys: [],
+    activeSessionKey: null,
+  };
+  return {
+    activeWorkspaceId: workspace.id,
+    workspaces: [...state.workspaces, workspace],
+  };
+}
+
+function deleteActiveWorkspace(state: WorkspaceStore) {
+  if (state.workspaces.length <= 1) {
+    return state;
+  }
+  const index = state.workspaces.findIndex((workspace) => workspace.id === state.activeWorkspaceId);
+  if (index === -1) {
+    return state;
+  }
+  const nextWorkspaces = state.workspaces.filter((workspace) => workspace.id !== state.activeWorkspaceId);
+  const nextActive =
+    nextWorkspaces[Math.max(0, index - 1)]?.id ?? nextWorkspaces[0]?.id ?? state.activeWorkspaceId;
+  return {
+    activeWorkspaceId: nextActive,
+    workspaces: nextWorkspaces,
+  };
+}
+
 function normalizeBaseUrl(value: string) {
   const normalized = value.trim() || DEFAULT_CONTROL_URL;
   return normalized.endsWith("/") ? normalized.slice(0, -1) : normalized;
@@ -1236,18 +2467,22 @@ function toWsUrl(value: string) {
   return url.toString();
 }
 
-function estimateEntryHeight(entry: TranscriptEntry | undefined) {
-  if (!entry) {
+function estimateEntryHeight(row: ChatTranscriptRow | undefined) {
+  if (!row) {
     return 80;
   }
-  const lines = String(entry.text || "").split(/\r?\n/).length;
+
+  const reasoningText = getAttachedReasoningText(row.reasoning);
+  const reasoningLines = reasoningText ? Math.min(String(reasoningText).split(/\r?\n/).length, row.reasoning?.status === "streaming" ? 18 : 1) : 0;
+  const lines = String(row.entry.text || "").split(/\r?\n/).length;
   const previewLines =
-    entry.kind === "tool" || entry.kind === "command" || entry.kind === "file_change"
+    row.entry.kind === "tool" || row.entry.kind === "command" || row.entry.kind === "file_change"
       ? Math.min(lines, TOOL_LINE_LIMIT)
-      : entry.kind === "assistant" || entry.kind === "user"
+      : row.entry.kind === "assistant" || row.entry.kind === "user"
         ? Math.min(lines + 1, 24)
-      : Math.min(lines, 16);
-  return Math.max(88, 56 + previewLines * 20);
+        : Math.min(lines, 16);
+
+  return Math.max(88, 56 + previewLines * 20 + reasoningLines * 20);
 }
 
 export default App;

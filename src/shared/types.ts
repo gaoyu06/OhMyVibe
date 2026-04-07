@@ -14,6 +14,7 @@ export type TranscriptEntryKind =
   | "command"
   | "file_change"
   | "tool"
+  | "approval"
   | "system";
 
 export interface TranscriptEntry {

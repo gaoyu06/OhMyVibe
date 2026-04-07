@@ -143,6 +143,20 @@ app.post("/api/daemons/:daemonId/sessions/:sessionId/interrupt", async (req, res
   }
 });
 
+app.post("/api/daemons/:daemonId/sessions/:sessionId/approvals/:approvalId", async (req, res) => {
+  try {
+    res.json(
+      await requestDaemon(req.params.daemonId, "respondApproval", {
+        sessionId: req.params.sessionId,
+        approvalRequestId: req.params.approvalId,
+        decision: req.body?.decision === "deny" ? "deny" : "approve",
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 app.delete("/api/daemons/:daemonId/sessions/:sessionId", async (req, res) => {
   try {
     await requestDaemon(req.params.daemonId, "closeSession", {

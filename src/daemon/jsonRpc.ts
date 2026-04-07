@@ -6,8 +6,15 @@ export interface JsonRpcNotification {
   params?: any;
 }
 
+export interface JsonRpcRequest {
+  id: string | number;
+  method: string;
+  params?: any;
+}
+
 export class JsonRpcProcess extends EventEmitter<{
   notification: [JsonRpcNotification];
+  request: [JsonRpcRequest];
   stderr: [string];
   exit: [{ code: number | null; signal: NodeJS.Signals | null }];
 }> {
@@ -74,6 +81,23 @@ export class JsonRpcProcess extends EventEmitter<{
     this.child.stdin.write(`${JSON.stringify(payload)}\n`, "utf8");
   }
 
+  respond(id: string | number, result: unknown): void {
+    const payload = { jsonrpc: "2.0", id, result };
+    this.child.stdin.write(`${JSON.stringify(payload)}\n`, "utf8");
+  }
+
+  respondError(id: string | number, code: number, message: string): void {
+    const payload = {
+      jsonrpc: "2.0",
+      id,
+      error: {
+        code,
+        message,
+      },
+    };
+    this.child.stdin.write(`${JSON.stringify(payload)}\n`, "utf8");
+  }
+
   async close(): Promise<void> {
     this.child.kill();
   }
@@ -96,6 +120,14 @@ export class JsonRpcProcess extends EventEmitter<{
       const message = JSON.parse(line);
       if (typeof message.id !== "undefined") {
         const pending = this.pending.get(Number(message.id));
+        if (!pending && message.method) {
+          this.emit("request", {
+            id: message.id,
+            method: message.method,
+            params: message.params,
+          });
+          continue;
+        }
         if (!pending) {
           continue;
         }

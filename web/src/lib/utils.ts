@@ -36,3 +36,13 @@ export function lastLines(text: string, count: number) {
     .slice(-count)
     .join("\n");
 }
+
+export function formatDurationMs(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return "";
+  }
+  if (value < 1000) {
+    return `${Math.round(value)}ms`;
+  }
+  return `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)}s`;
+}

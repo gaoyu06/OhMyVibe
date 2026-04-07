@@ -1,5 +1,5 @@
 import { AvailableModel } from "../shared/types.js";
-import { JsonRpcNotification, JsonRpcProcess } from "./jsonRpc.js";
+import { JsonRpcNotification, JsonRpcProcess, JsonRpcRequest } from "./jsonRpc.js";
 
 export interface CodexClientOptions {
   cwd: string;
@@ -20,6 +20,10 @@ export class CodexAppServerClient {
 
   onNotification(listener: (notification: JsonRpcNotification) => void): void {
     this.rpc.on("notification", listener);
+  }
+
+  onRequest(listener: (request: JsonRpcRequest) => void): void {
+    this.rpc.on("request", listener);
   }
 
   onStderr(listener: (chunk: string) => void): void {
@@ -75,14 +79,24 @@ export class CodexAppServerClient {
     });
   }
 
-  turnStart(threadId: string, text: string, effort?: string): Promise<any> {
+  turnStart(params: {
+    threadId: string;
+    text: string;
+    effort?: string;
+    model?: string;
+    approvalPolicy?: "untrusted" | "on-failure" | "on-request" | "never";
+    summary?: "auto" | "concise" | "detailed" | "none";
+  }): Promise<any> {
     return this.rpc.request("turn/start", {
-      threadId,
-      effort: effort ?? null,
+      threadId: params.threadId,
+      effort: params.effort ?? null,
+      model: params.model ?? null,
+      approvalPolicy: params.approvalPolicy ?? null,
+      summary: params.summary ?? "detailed",
       input: [
         {
           type: "text",
-          text,
+          text: params.text,
         },
       ],
     });
@@ -112,8 +126,8 @@ export class CodexAppServerClient {
     });
   }
 
-  turnInterrupt(threadId: string): Promise<any> {
-    return this.rpc.request("turn/interrupt", { threadId });
+  turnInterrupt(threadId: string, turnId: string): Promise<any> {
+    return this.rpc.request("turn/interrupt", { threadId, turnId });
   }
 
   modelList(): Promise<{ data: AvailableModel[]; nextCursor: string | null }> {
@@ -121,6 +135,14 @@ export class CodexAppServerClient {
       includeHidden: false,
       limit: 50,
     });
+  }
+
+  respond(requestId: string | number, result: unknown): void {
+    this.rpc.respond(requestId, result);
+  }
+
+  respondError(requestId: string | number, message: string, code: number = -32601): void {
+    this.rpc.respondError(requestId, code, message);
   }
 
   close(): Promise<void> {

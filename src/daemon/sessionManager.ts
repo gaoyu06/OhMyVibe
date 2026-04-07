@@ -36,8 +36,24 @@ interface ManagedSession {
   codex?: CodexAppServerClient;
   liveMessages: Map<string, TranscriptEntry>;
   liveReasoning: Map<string, TranscriptEntry>;
+  pendingApprovals: Map<
+    string,
+    {
+      entryId: string;
+      requestIdRaw: string | number;
+      method: string;
+      params: any;
+    }
+  >;
   configDirty?: boolean;
   suppressNextExitFailure?: boolean;
+  startupPromise?: Promise<void>;
+  activeTurnId?: string;
+  currentTurnMetrics?: {
+    startedAt: number;
+    firstOutputAt?: number;
+    outputEntryIds: Set<string>;
+  };
 }
 
 export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
@@ -126,12 +142,13 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       transcript: [],
       liveMessages: new Map(),
       liveReasoning: new Map(),
+      pendingApprovals: new Map(),
     };
 
     this.sessions.set(sessionId, session);
     this.persist();
     this.emitChange({ type: "session-created", session: this.toSummary(session) });
-    void this.startSessionInBackground(session, input);
+    session.startupPromise = this.trackStartup(session, this.startSessionInBackground(session, input));
     return this.getOrThrow(sessionId);
   }
 
@@ -162,12 +179,13 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       transcript: [],
       liveMessages: new Map(),
       liveReasoning: new Map(),
+      pendingApprovals: new Map(),
     };
 
     this.sessions.set(session.id, session);
     this.persist();
     this.emitChange({ type: "session-created", session: this.toSummary(session) });
-    void this.restoreSessionInBackground(session, input);
+    session.startupPromise = this.trackStartup(session, this.restoreSessionInBackground(session, input));
     return this.getOrThrow(session.id);
   }
 
@@ -179,10 +197,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     );
     const sandbox = input.sandbox ?? session.sandbox ?? "workspace-write";
     const approvalPolicy = input.approvalPolicy ?? session.approvalPolicy ?? "never";
-    const runtimeChanged =
-      model !== session.model ||
-      sandbox !== session.sandbox ||
-      approvalPolicy !== session.approvalPolicy;
+    const runtimeChanged = sandbox !== session.sandbox;
 
     session.model = model;
     session.reasoningEffort = reasoningEffort;
@@ -210,25 +225,66 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
 
     this.addEntry(session, { kind: "user", text });
     session.status = "running";
+    session.currentTurnMetrics = {
+      startedAt: Date.now(),
+      outputEntryIds: new Set(),
+    };
     this.persist();
     this.emitChange({ type: "session-updated", session: this.toSummary(session) });
-    await session.codex.turnStart(session.codexThreadId, text, session.reasoningEffort);
+    void this.startTurnInBackground(session, text);
   }
 
   async interrupt(sessionId: string): Promise<void> {
     const session = this.getSessionOrThrow(sessionId);
-    if (!session.codexThreadId) {
+    if (!session.codexThreadId || !session.activeTurnId) {
       return;
     }
     await this.ensureCodexClient(session);
     if (!session.codex) {
       return;
     }
-    await session.codex.turnInterrupt(session.codexThreadId);
+    await session.codex.turnInterrupt(session.codexThreadId, session.activeTurnId);
     session.status = "interrupted";
+    session.activeTurnId = undefined;
     this.touch(session);
     this.persist();
     this.emitChange({ type: "session-updated", session: this.toSummary(session) });
+  }
+
+  async respondApproval(
+    sessionId: string,
+    approvalRequestId: string,
+    decision: "approve" | "deny",
+  ): Promise<SessionDetails> {
+    const session = this.getSessionOrThrow(sessionId);
+    const pending = session.pendingApprovals.get(approvalRequestId);
+    if (!pending || !session.codex) {
+      throw new Error(`Approval request not found: ${approvalRequestId}`);
+    }
+
+    const response = this.mapApprovalResponse(pending.method, pending.params, decision);
+    session.codex.respond(pending.requestIdRaw, response);
+    session.pendingApprovals.delete(approvalRequestId);
+
+    const entry = session.transcript.find((item) => item.id === pending.entryId);
+    if (entry) {
+      entry.status = decision === "approve" ? "approved" : "declined";
+      entry.meta = {
+        ...(entry.meta ?? {}),
+        resolvedAt: new Date().toISOString(),
+        decision,
+      };
+    }
+
+    this.touch(session);
+    this.persist();
+    this.emitChange({
+      type: "session-reset",
+      sessionId: session.id,
+      transcript: [...session.transcript],
+    });
+    this.emitChange({ type: "session-updated", session: this.toSummary(session) });
+    return this.getOrThrow(sessionId);
   }
 
   async close(sessionId: string): Promise<void> {
@@ -263,6 +319,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
         transcript: Array.isArray(persisted.transcript) ? persisted.transcript : [],
         liveMessages: new Map(),
         liveReasoning: new Map(),
+        pendingApprovals: new Map(),
       });
     }
   }
@@ -282,6 +339,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     try {
       await this.startFreshThread(session, input);
     } catch (error) {
+      session.activeTurnId = undefined;
       session.status = "failed";
       session.lastError = this.errorMessage(error);
       this.addEntry(session, {
@@ -301,11 +359,54 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     try {
       await this.ensureCodexClient(session, input);
     } catch (error) {
+      session.activeTurnId = undefined;
       session.status = "failed";
       session.lastError = this.errorMessage(error);
       this.addEntry(session, {
         kind: "system",
         text: `Session restore failed: ${session.lastError}`,
+        status: "failed",
+      });
+      this.persist();
+      this.emitChange({ type: "session-updated", session: this.toSummary(session) });
+    }
+  }
+
+  private async startTurnInBackground(session: ManagedSession, text: string): Promise<void> {
+    if (!session.codex || !session.codexThreadId) {
+      session.activeTurnId = undefined;
+      session.status = "failed";
+      session.lastError = "Session is not ready";
+      this.addEntry(session, {
+        kind: "system",
+        text: `Turn start failed: ${session.lastError}`,
+        status: "failed",
+      });
+      this.persist();
+      this.emitChange({ type: "session-updated", session: this.toSummary(session) });
+      return;
+    }
+
+    try {
+      const response = await session.codex.turnStart({
+        threadId: session.codexThreadId,
+        text,
+        effort: session.reasoningEffort,
+        model: session.model,
+        approvalPolicy: session.approvalPolicy,
+        summary: "detailed",
+      });
+      if (typeof response?.turn?.id === "string") {
+        session.activeTurnId = response.turn.id;
+      }
+    } catch (error) {
+      session.activeTurnId = undefined;
+      session.currentTurnMetrics = undefined;
+      session.status = "failed";
+      session.lastError = this.errorMessage(error);
+      this.addEntry(session, {
+        kind: "system",
+        text: `Turn start failed: ${session.lastError}`,
         status: "failed",
       });
       this.persist();
@@ -349,55 +450,68 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       return;
     }
 
-    if (!session.codexThreadId) {
-      await this.startFreshThread(session, {
-        cwd: session.cwd,
+    if (session.startupPromise) {
+      await session.startupPromise;
+      if (session.codex && session.codexThreadId) {
+        return;
+      }
+    }
+
+    const startup = (async () => {
+      if (!session.codexThreadId) {
+        await this.startFreshThread(session, {
+          cwd: session.cwd,
+          model: overrides?.model ?? session.model,
+          reasoningEffort: this.normalizeReasoningEffort(
+            overrides?.reasoningEffort ?? session.reasoningEffort,
+          ),
+          sandbox: overrides?.sandbox ?? session.sandbox,
+          approvalPolicy: overrides?.approvalPolicy ?? session.approvalPolicy,
+        });
+        return;
+      }
+
+      const codex = new CodexAppServerClient({ cwd: session.cwd });
+      session.codex = codex;
+      this.attachCodexHooks(session, codex);
+      await codex.initialize();
+
+      const response = await codex.threadResume({
+        threadId: session.codexThreadId,
+        cwd: overrides?.cwd ?? session.cwd,
         model: overrides?.model ?? session.model,
-        reasoningEffort: this.normalizeReasoningEffort(
-          overrides?.reasoningEffort ?? session.reasoningEffort,
-        ),
         sandbox: overrides?.sandbox ?? session.sandbox,
         approvalPolicy: overrides?.approvalPolicy ?? session.approvalPolicy,
       });
-      return;
-    }
 
-    const codex = new CodexAppServerClient({ cwd: session.cwd });
-    session.codex = codex;
-    this.attachCodexHooks(session, codex);
-    await codex.initialize();
+      session.cwd = response.cwd || session.cwd;
+      session.model = response.model || session.model;
+      session.reasoningEffort = this.normalizeReasoningEffort(
+        overrides?.reasoningEffort ?? response.reasoningEffort ?? session.reasoningEffort,
+      );
+      session.sandbox = overrides?.sandbox ?? session.sandbox;
+      session.approvalPolicy = overrides?.approvalPolicy ?? session.approvalPolicy;
+      session.codexPath = response.thread?.path || session.codexPath;
+      session.codexSource = response.thread?.source || session.codexSource;
+      session.title = response.thread?.name || response.thread?.preview || session.title;
+      session.status = this.mapThreadStatus(response.thread?.status);
+      session.transcript = this.threadToTranscript(response.thread);
+      session.liveMessages.clear();
+      session.liveReasoning.clear();
+      session.pendingApprovals.clear();
+      session.configDirty = false;
+      this.touch(session);
+      this.persist();
+      this.emitChange({
+        type: "session-reset",
+        sessionId: session.id,
+        transcript: [...session.transcript],
+      });
+      this.emitChange({ type: "session-updated", session: this.toSummary(session) });
+    })();
 
-    const response = await codex.threadResume({
-      threadId: session.codexThreadId,
-      cwd: overrides?.cwd ?? session.cwd,
-      model: overrides?.model ?? session.model,
-      sandbox: overrides?.sandbox ?? session.sandbox,
-      approvalPolicy: overrides?.approvalPolicy ?? session.approvalPolicy,
-    });
-
-    session.cwd = response.cwd || session.cwd;
-    session.model = response.model || session.model;
-    session.reasoningEffort = this.normalizeReasoningEffort(
-      overrides?.reasoningEffort ?? response.reasoningEffort ?? session.reasoningEffort,
-    );
-    session.sandbox = overrides?.sandbox ?? session.sandbox;
-    session.approvalPolicy = overrides?.approvalPolicy ?? session.approvalPolicy;
-    session.codexPath = response.thread?.path || session.codexPath;
-    session.codexSource = response.thread?.source || session.codexSource;
-    session.title = response.thread?.name || response.thread?.preview || session.title;
-    session.status = this.mapThreadStatus(response.thread?.status);
-    session.transcript = this.threadToTranscript(response.thread);
-    session.liveMessages.clear();
-    session.liveReasoning.clear();
-    session.configDirty = false;
-    this.touch(session);
-    this.persist();
-    this.emitChange({
-      type: "session-reset",
-      sessionId: session.id,
-      transcript: [...session.transcript],
-    });
-    this.emitChange({ type: "session-updated", session: this.toSummary(session) });
+    session.startupPromise = this.trackStartup(session, startup);
+    await session.startupPromise;
   }
 
   private attachCodexHooks(session: ManagedSession, codex: CodexAppServerClient): void {
@@ -417,6 +531,10 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       }
     });
 
+    codex.onRequest((request) => {
+      this.handleCodexRequest(session, request);
+    });
+
     codex.onStderr((chunk) => {
       const text = this.cleanStderr(chunk);
       if (!text || this.shouldIgnoreStderr(text)) {
@@ -431,6 +549,8 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
 
     codex.onExit(({ code, signal }) => {
       session.codex = undefined;
+      session.activeTurnId = undefined;
+      session.currentTurnMetrics = undefined;
       if (session.suppressNextExitFailure) {
         session.suppressNextExitFailure = false;
         return;
@@ -485,6 +605,9 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
         return;
       }
       case "turn/started": {
+        if (typeof notification.params?.turn?.id === "string") {
+          session.activeTurnId = notification.params.turn.id;
+        }
         session.status = "running";
         this.touch(session);
         this.persist();
@@ -496,6 +619,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
         if (item?.type === "agentMessage") {
           const entry = this.ensureAssistantEntry(session, item.id);
           entry.status = "streaming";
+          this.trackTurnEntry(session, entry);
         }
         this.touch(session);
         this.persist();
@@ -509,6 +633,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
           const entry = this.ensureAssistantEntry(session, itemId);
           entry.text += delta;
           entry.status = "streaming";
+          this.markTurnOutput(session, entry);
           this.touch(session);
           this.persist();
           this.emitChange({
@@ -527,6 +652,21 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
           const entry = this.ensureReasoningEntry(session, itemId);
           entry.text += delta;
           entry.status = "streaming";
+          this.markTurnOutput(session, entry);
+          this.touch(session);
+          this.persist();
+          this.emitChange({
+            type: "session-reset",
+            sessionId: session.id,
+            transcript: [...session.transcript],
+          });
+        }
+        return;
+      }
+      case "item/reasoning/summaryPartAdded": {
+        const itemId = notification.params?.itemId;
+        if (typeof itemId === "string") {
+          this.ensureReasoningEntry(session, itemId);
           this.touch(session);
           this.persist();
           this.emitChange({
@@ -539,7 +679,9 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       }
       case "turn/completed": {
         const turn = notification.params?.turn;
+        session.activeTurnId = undefined;
         session.status = this.mapTurnStatus(turn?.status);
+        this.finalizeTurnMetrics(session);
         for (const entry of session.liveMessages.values()) {
           entry.status = "completed";
         }
@@ -552,6 +694,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
         }
         session.liveMessages.clear();
         session.liveReasoning.clear();
+        session.currentTurnMetrics = undefined;
         this.touch(session);
         this.persist();
         this.emitChange({
@@ -570,10 +713,47 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
         if (!entry) {
           return;
         }
+        this.trackTurnEntry(session, entry);
+        this.markTurnOutput(session, entry);
         this.upsertEntry(session, entry);
         return;
       }
       default:
+        return;
+    }
+  }
+
+  private handleCodexRequest(
+    session: ManagedSession,
+    request: { id: string | number; method: string; params?: any },
+  ): void {
+    switch (request.method) {
+      case "item/commandExecution/requestApproval":
+      case "item/fileChange/requestApproval":
+      case "item/permissions/requestApproval":
+      case "execCommandApproval":
+      case "applyPatchApproval": {
+        const requestId = String(request.id);
+        const entry = this.addEntry(session, {
+          kind: "approval",
+          text: this.describeApprovalRequest(request.method, request.params),
+          status: "pending",
+          meta: {
+            requestId,
+            approvalKind: request.method,
+            payload: request.params,
+          },
+        });
+        session.pendingApprovals.set(requestId, {
+          entryId: entry.id,
+          requestIdRaw: request.id,
+          method: request.method,
+          params: request.params,
+        });
+        return;
+      }
+      default:
+        session.codex?.respondError(request.id, `Unsupported client request: ${request.method}`);
         return;
     }
   }
@@ -875,12 +1055,128 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
   }
 
   private shouldIgnoreStderr(text: string): boolean {
+    const normalized = text.toLowerCase().replace(/\s+/g, " ").trim();
     return (
-      (text.includes("rmcp::transport::worker") &&
-        text.includes("data did not match any variant of untagged enum JsonRpcMessage")) ||
-      (text.includes("failed to refresh available models") &&
-        text.includes("timeout waiting for child process to exit"))
+      (normalized.includes("rmcp::transport::worker") &&
+        normalized.includes("data did not match any variant of untagged enum jsonrpcmessage")) ||
+      (normalized.includes("rmcp::transport::worker") &&
+        normalized.includes("transport channel closed") &&
+        normalized.includes("unexpected eof during handshake")) ||
+      (normalized.includes("responses_websocket") &&
+        normalized.includes("failed to connect to websocket") &&
+        normalized.includes("tls handshake eof")) ||
+      (normalized.includes("models_manager::manager") &&
+        normalized.includes("failed to refresh available models")) ||
+      normalized.includes("timeout waiting for child process to exit")
     );
+  }
+
+  private describeApprovalRequest(method: string, params: any): string {
+    if (method === "item/permissions/requestApproval") {
+      const lines = ["Additional permissions requested"];
+      if (params?.reason) {
+        lines.push(`Reason: ${params.reason}`);
+      }
+      const payload = this.prettyJson(params?.permissions);
+      if (payload) {
+        lines.push("", payload);
+      }
+      return lines.join("\n");
+    }
+
+    if (method === "item/commandExecution/requestApproval") {
+      const lines = ["Command approval requested"];
+      if (params?.command) {
+        lines.push(`Command: ${params.command}`);
+      }
+      if (params?.cwd) {
+        lines.push(`Cwd: ${params.cwd}`);
+      }
+      if (params?.reason) {
+        lines.push(`Reason: ${params.reason}`);
+      }
+      return lines.join("\n");
+    }
+
+    if (method === "item/fileChange/requestApproval") {
+      const lines = ["File change approval requested"];
+      if (params?.grantRoot) {
+        lines.push(`Grant root: ${params.grantRoot}`);
+      }
+      if (params?.reason) {
+        lines.push(`Reason: ${params.reason}`);
+      }
+      return lines.join("\n");
+    }
+
+    if (method === "execCommandApproval") {
+      const lines = ["Command approval requested"];
+      const command = Array.isArray(params?.command) ? params.command.join(" ") : "";
+      if (command) {
+        lines.push(`Command: ${command}`);
+      }
+      if (params?.cwd) {
+        lines.push(`Cwd: ${params.cwd}`);
+      }
+      if (params?.reason) {
+        lines.push(`Reason: ${params.reason}`);
+      }
+      return lines.join("\n");
+    }
+
+    if (method === "applyPatchApproval") {
+      const lines = ["File change approval requested"];
+      if (params?.grantRoot) {
+        lines.push(`Grant root: ${params.grantRoot}`);
+      }
+      if (params?.reason) {
+        lines.push(`Reason: ${params.reason}`);
+      }
+      const changes = this.prettyJson(params?.fileChanges);
+      if (changes) {
+        lines.push("", changes);
+      }
+      return lines.join("\n");
+    }
+
+    return JSON.stringify(params ?? {}, null, 2);
+  }
+
+  private mapApprovalResponse(method: string, params: any, decision: "approve" | "deny"): unknown {
+    switch (method) {
+      case "item/permissions/requestApproval":
+        return {
+          permissions: decision === "approve" ? (params?.permissions ?? {}) : {},
+          scope: "turn",
+        };
+      case "item/commandExecution/requestApproval":
+        return {
+          decision: decision === "approve" ? "accept" : "decline",
+        };
+      case "item/fileChange/requestApproval":
+        return {
+          decision: decision === "approve" ? "accept" : "decline",
+        };
+      case "execCommandApproval":
+        return {
+          decision: decision === "approve" ? "approved" : "denied",
+        };
+      case "applyPatchApproval":
+        return {
+          decision: decision === "approve" ? "approved" : "denied",
+        };
+      default:
+        throw new Error(`Unsupported approval method: ${method}`);
+    }
+  }
+
+  private trackStartup(session: ManagedSession, promise: Promise<void>): Promise<void> {
+    const tracked = promise.finally(() => {
+      if (session.startupPromise === tracked) {
+        session.startupPromise = undefined;
+      }
+    });
+    return tracked;
   }
 
   private async readConfig(): Promise<DaemonConfig> {
@@ -911,6 +1207,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       };
       session.liveMessages.set(itemId, entry);
       session.transcript.push(entry);
+      this.trackTurnEntry(session, entry);
       this.persist();
       this.emitChange({ type: "session-entry", sessionId: session.id, entry });
     }
@@ -929,10 +1226,62 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       };
       session.liveReasoning.set(itemId, entry);
       session.transcript.push(entry);
+      this.trackTurnEntry(session, entry);
       this.persist();
       this.emitChange({ type: "session-entry", sessionId: session.id, entry });
     }
     return entry;
+  }
+
+  private trackTurnEntry(session: ManagedSession, entry: TranscriptEntry): void {
+    if (!session.currentTurnMetrics || (entry.kind !== "assistant" && entry.kind !== "reasoning")) {
+      return;
+    }
+    session.currentTurnMetrics.outputEntryIds.add(entry.id);
+  }
+
+  private markTurnOutput(session: ManagedSession, entry: TranscriptEntry): void {
+    if (
+      !session.currentTurnMetrics ||
+      (entry.kind !== "assistant" && entry.kind !== "reasoning") ||
+      !entry.text.trim()
+    ) {
+      return;
+    }
+
+    this.trackTurnEntry(session, entry);
+    if (!session.currentTurnMetrics.firstOutputAt) {
+      session.currentTurnMetrics.firstOutputAt = Date.now();
+    }
+
+    const meta = { ...(entry.meta ?? {}) };
+    meta.firstByteMs = Math.max(0, session.currentTurnMetrics.firstOutputAt - session.currentTurnMetrics.startedAt);
+    entry.meta = meta;
+  }
+
+  private finalizeTurnMetrics(session: ManagedSession): void {
+    if (!session.currentTurnMetrics) {
+      return;
+    }
+
+    const totalMs = Math.max(0, Date.now() - session.currentTurnMetrics.startedAt);
+    const firstByteMs = session.currentTurnMetrics.firstOutputAt
+      ? Math.max(0, session.currentTurnMetrics.firstOutputAt - session.currentTurnMetrics.startedAt)
+      : undefined;
+
+    for (const entryId of session.currentTurnMetrics.outputEntryIds) {
+      const entry = session.transcript.find((item) => item.id === entryId);
+      if (!entry) {
+        continue;
+      }
+
+      const meta = { ...(entry.meta ?? {}) };
+      if (typeof firstByteMs === "number") {
+        meta.firstByteMs = firstByteMs;
+      }
+      meta.totalMs = totalMs;
+      entry.meta = meta;
+    }
   }
 
   private extractRichText(item: any): string {

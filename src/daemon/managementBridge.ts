@@ -161,6 +161,12 @@ export class ManagementBridge {
       case "interruptSession":
         await this.sessionManager.interrupt(String(params.sessionId));
         return { ok: true };
+      case "respondApproval":
+        return this.sessionManager.respondApproval(
+          String(params.sessionId),
+          String(params.approvalRequestId),
+          params.decision === "deny" ? "deny" : "approve",
+        );
       case "closeSession":
         await this.sessionManager.close(String(params.sessionId));
         return { ok: true };
