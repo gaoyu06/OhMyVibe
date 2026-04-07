@@ -97,10 +97,175 @@ body {
     sans-serif;
 }
 
+.ui-layout-motion {
+  transition: grid-template-columns 220ms ease;
+}
+
+.ui-panel-motion {
+  transition:
+    width 220ms ease,
+    opacity 180ms ease,
+    border-color 180ms ease;
+}
+
+.ui-session-item {
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease,
+    transform 160ms ease;
+}
+
+.ui-session-item:hover {
+  transform: translateY(-1px);
+}
+
+.ui-overview-card {
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    transform 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.ui-overview-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px color-mix(in oklab, var(--foreground) 10%, transparent);
+}
+
+.ui-entry-reveal {
+  animation: ui-fade-up 220ms ease both;
+}
+
+.ui-fab-reveal {
+  animation: ui-fade-in 160ms ease both;
+}
+
+.ui-dialog-overlay[data-state="open"] {
+  animation: ui-dialog-overlay-in 180ms ease both;
+}
+
+.ui-dialog-overlay[data-state="closed"] {
+  animation: ui-dialog-overlay-out 150ms ease both;
+}
+
+.ui-dialog-content--drawer[data-state="open"] {
+  animation: ui-dialog-drawer-in 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.ui-dialog-content--drawer[data-state="closed"] {
+  animation: ui-dialog-drawer-out 180ms ease both;
+}
+
+.ui-dialog-content:not(.ui-dialog-content--drawer)[data-state="open"] {
+  animation: ui-dialog-modal-in 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.ui-dialog-content:not(.ui-dialog-content--drawer)[data-state="closed"] {
+  animation: ui-dialog-modal-out 140ms ease both;
+}
+
+@keyframes ui-fade-up {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes ui-fade-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes ui-dialog-overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes ui-dialog-overlay-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes ui-dialog-drawer-in {
+  from {
+    opacity: 0;
+    transform: translateX(28px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes ui-dialog-drawer-out {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(20px);
+  }
+}
+
+@keyframes ui-dialog-modal-in {
+  from {
+    opacity: 0;
+    transform: scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes ui-dialog-modal-out {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.985);
+  }
+}
+
 button,
 input,
 textarea {
   font: inherit;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-layout-motion,
+  .ui-panel-motion,
+  .ui-session-item,
+  .ui-overview-card {
+    transition: none;
+  }
+
+  .ui-entry-reveal,
+  .ui-fab-reveal,
+  .ui-dialog-overlay[data-state],
+  .ui-dialog-content[data-state] {
+    animation: none;
+  }
 }
 
 .overview-columns {

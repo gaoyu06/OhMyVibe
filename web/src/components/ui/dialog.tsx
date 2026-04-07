@@ -14,7 +14,10 @@ const DialogOverlay = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Overlay
     ref={ref}
-    className={cn("fixed inset-0 z-50 bg-black/50 backdrop-blur-[1px]", className)}
+    className={cn(
+      "ui-dialog-overlay fixed inset-0 z-50 bg-black/50 backdrop-blur-[1px]",
+      className,
+    )}
     {...props}
   />
 ));
@@ -23,24 +26,46 @@ DialogOverlay.displayName = DialogPrimitive.Overlay.displayName;
 const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content>
->(({ className, children, ...props }, ref) => (
-  <DialogPortal>
-    <DialogOverlay />
-    <DialogPrimitive.Content
-      ref={ref}
-      className={cn(
-        "fixed right-0 top-0 z-50 h-full w-full max-w-[540px] border-l border-border bg-background p-0 shadow-2xl",
-        className,
+>(({ className, children, ...props }, ref) => {
+  const isDrawer = className?.includes("ui-dialog-content--drawer");
+
+  return (
+    <DialogPortal>
+      <DialogOverlay />
+      {isDrawer ? (
+        <DialogPrimitive.Content
+          ref={ref}
+          className={cn(
+            "ui-dialog-content ui-dialog-content--drawer fixed inset-y-0 right-0 z-50 h-full w-full max-w-[540px] border-l border-border bg-background p-0 shadow-2xl outline-none",
+            className,
+          )}
+          {...props}
+        >
+          {children}
+          <DialogPrimitive.Close className="absolute right-3 top-3 rounded-sm p-1 text-muted-foreground hover:bg-accent hover:text-foreground">
+            <X className="h-4 w-4" />
+          </DialogPrimitive.Close>
+        </DialogPrimitive.Content>
+      ) : (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3">
+          <DialogPrimitive.Content
+            ref={ref}
+            className={cn(
+              "ui-dialog-content relative z-50 h-auto w-full max-w-[min(560px,calc(100vw-24px))] rounded-lg border border-border bg-background p-0 shadow-2xl outline-none",
+              className,
+            )}
+            {...props}
+          >
+            {children}
+            <DialogPrimitive.Close className="absolute right-3 top-3 rounded-sm p-1 text-muted-foreground hover:bg-accent hover:text-foreground">
+              <X className="h-4 w-4" />
+            </DialogPrimitive.Close>
+          </DialogPrimitive.Content>
+        </div>
       )}
-      {...props}
-    >
-      {children}
-      <DialogPrimitive.Close className="absolute right-3 top-3 rounded-sm p-1 text-muted-foreground hover:bg-accent hover:text-foreground">
-        <X className="h-4 w-4" />
-      </DialogPrimitive.Close>
-    </DialogPrimitive.Content>
-  </DialogPortal>
-));
+    </DialogPortal>
+  );
+});
 DialogContent.displayName = DialogPrimitive.Content.displayName;
 
 const DialogHeader = ({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (

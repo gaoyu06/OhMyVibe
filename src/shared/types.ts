@@ -100,6 +100,10 @@ export interface UpdateSessionConfigInput {
   approvalPolicy?: "untrusted" | "on-failure" | "on-request" | "never";
 }
 
+export interface RenameSessionInput {
+  title: string;
+}
+
 export interface CodexHistoryEntry {
   id: string;
   title: string;

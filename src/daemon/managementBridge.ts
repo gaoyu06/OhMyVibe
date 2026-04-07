@@ -158,6 +158,10 @@ export class ManagementBridge {
           approvalPolicy:
             typeof params.approvalPolicy === "string" ? (params.approvalPolicy as any) : undefined,
         });
+      case "renameSession":
+        return this.sessionManager.rename(String(params.sessionId), {
+          title: String(params.title ?? ""),
+        });
       case "interruptSession":
         await this.sessionManager.interrupt(String(params.sessionId));
         return { ok: true };

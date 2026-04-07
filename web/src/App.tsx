@@ -8,7 +8,9 @@ import {
   ChevronDown,
   ChevronUp,
   Circle,
+  Edit3,
   GitCommitHorizontal,
+  History,
   LayoutGrid,
   LoaderCircle,
   MessageSquareText,
@@ -17,6 +19,7 @@ import {
   Play,
   Plus,
   Send,
+  Server,
   Square,
   Sun,
   Trash2,
@@ -118,6 +121,9 @@ function App() {
   const [sessionLoading, setSessionLoading] = useState(false);
   const [creatingSession, setCreatingSession] = useState(false);
   const [restoringHistoryId, setRestoringHistoryId] = useState<string | null>(null);
+  const [renameSessionOpen, setRenameSessionOpen] = useState(false);
+  const [renameTitle, setRenameTitle] = useState("");
+  const [renamingSession, setRenamingSession] = useState(false);
   const [approvalActionId, setApprovalActionId] = useState<string | null>(null);
   const [sendingMessage, setSendingMessage] = useState(false);
   const [pendingAssistant, setPendingAssistant] = useState<PendingAssistantState | null>(null);
@@ -313,6 +319,10 @@ function App() {
     stickToBottomRef.current = true;
     setShowScrollToBottom(false);
   }, [activeSessionId]);
+
+  useEffect(() => {
+    setRenameTitle(activeSession?.title ?? "");
+  }, [activeSession?.id, activeSession?.title]);
 
   const currentModel = useMemo(
     () => config.models.find((item) => item.model === model) ?? config.models[0],
@@ -758,13 +768,35 @@ function App() {
     });
   }
 
-  async function handleDelete() {
-    if (!activeDaemonId || !activeSessionId) {
+  async function handleDeleteSession(sessionId: string) {
+    if (!activeDaemonId) {
       return;
     }
-    await api(`/api/daemons/${activeDaemonId}/sessions/${activeSessionId}`, {
+    await api(`/api/daemons/${activeDaemonId}/sessions/${sessionId}`, {
       method: "DELETE",
     });
+  }
+
+  async function handleRenameSession() {
+    if (!activeDaemonId || !activeSessionId || !renameTitle.trim()) {
+      return;
+    }
+    setRenamingSession(true);
+    try {
+      const session = await api<SessionDetails>(
+        `/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/title`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ title: renameTitle.trim() }),
+        },
+      );
+      setActiveSession(session);
+      setSessionDetailsById((current) => ({ ...current, [session.id]: session }));
+      setSessions((current) => upsertSessionSummary(current, session));
+      setRenameSessionOpen(false);
+    } finally {
+      setRenamingSession(false);
+    }
   }
 
   async function handleApprovalAction(entry: TranscriptEntry, decision: "approve" | "deny") {
@@ -824,9 +856,9 @@ function App() {
 
   return (
     <div className="h-screen overflow-hidden bg-background text-foreground">
-      <div className="grid h-full grid-rows-[48px_minmax(0,1fr)]">
-        <header className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3 border-b border-border px-3">
-          <div className="flex min-w-0 items-center gap-2 justify-self-start">
+      <div className="grid h-full grid-rows-[auto_minmax(0,1fr)]">
+        <header className="flex items-center gap-2 overflow-x-auto border-b border-border px-3 py-2 whitespace-nowrap">
+          <div className="flex min-w-0 flex-1 items-center gap-2">
             <Button
               variant="ghost"
               size="icon"
@@ -840,8 +872,14 @@ function App() {
               )}
             </Button>
             <Select value={activeDaemonId ?? ""} onValueChange={setActiveDaemonId}>
-              <SelectTrigger className="h-8 min-w-[220px] max-w-[360px]">
-                <SelectValue placeholder="Daemon" />
+              <SelectTrigger
+                aria-label="Select daemon"
+                className="h-9 w-9 shrink-0 justify-center rounded-lg border-border/80 bg-card/60 px-0 text-sm shadow-none [&>svg:last-child]:hidden md:h-8 md:min-w-[220px] md:max-w-[360px] md:flex-1 md:justify-between md:bg-transparent md:px-2 md:[&>svg:last-child]:inline-flex"
+              >
+                <Server className="h-4 w-4 shrink-0" />
+                <span className="hidden min-w-0 flex-1 truncate md:block">
+                  <SelectValue placeholder="Daemon" />
+                </span>
               </SelectTrigger>
               <SelectContent>
                 {daemons.map((item) => (
@@ -852,9 +890,8 @@ function App() {
               </SelectContent>
             </Select>
           </div>
-          <div className="flex items-center gap-1 justify-self-center">
-            <div className="flex items-center gap-1 rounded-md border border-border bg-muted/30 px-1 py-1">
-              <LayoutGrid className="mx-1 h-3.5 w-3.5 text-muted-foreground" />
+          <div className="min-w-0 max-w-[42vw] shrink md:max-w-none">
+            <div className="flex items-center gap-1 overflow-x-auto rounded-md border border-border bg-muted/30 px-1 py-1">
               {workspaceState.workspaces.map((workspace, index) => (
                 <Button
                   key={workspace.id}
@@ -892,113 +929,116 @@ function App() {
               </Button>
             </div>
           </div>
-          <div className="flex items-center justify-self-end gap-2">
+          <div className="flex shrink-0 items-center gap-2">
             <StatusBadge connectionState={connectionState} />
-            <Dialog
-              open={historyOpen}
-              onOpenChange={(open) => {
-                setHistoryOpen(open);
-                if (open && activeDaemonId) {
-                  void loadHistory(activeDaemonId);
-                }
-              }}
-            >
-              <DialogTrigger asChild>
-                <Button variant="outline" size="sm" disabled={!activeDaemonId}>
-                  <PanelLeftOpen className="h-3.5 w-3.5" />
-                  History
-                </Button>
-              </DialogTrigger>
-              <DialogContent>
-                <DialogHeader>
-                  <DialogTitle>History</DialogTitle>
-                  <DialogDescription>restore from daemon-bound Codex sessions</DialogDescription>
-                </DialogHeader>
-                <ScrollArea className="h-[calc(100vh-64px)]">
-                  <div className="space-y-2 p-4">
-                    <Input
-                      value={historySearch}
-                      onChange={(event) => setHistorySearch(event.target.value)}
-                      placeholder="Search history"
-                      className="h-8"
-                    />
-                    {historyLoading ? (
-                      <div className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-xs text-muted-foreground">
-                        <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
-                        Loading history
-                      </div>
-                    ) : null}
-                    {groupedHistory.map((item) =>
-                      item.type === "separator" ? (
-                        <div
-                          key={item.key}
-                          className="sticky top-0 z-10 -mx-1 bg-background/95 px-1 py-1 text-[11px] font-medium text-muted-foreground backdrop-blur"
-                        >
-                          {item.label}
+            <div className="flex shrink-0 items-center gap-1">
+              <Dialog
+                open={historyOpen}
+                onOpenChange={(open) => {
+                  setHistoryOpen(open);
+                  if (open && activeDaemonId) {
+                    void loadHistory(activeDaemonId);
+                  }
+                }}
+              >
+                <DialogTrigger asChild>
+                  <Button variant="outline" size="sm" className="h-8 px-2 sm:px-2.5" disabled={!activeDaemonId}>
+                    <History className="h-3.5 w-3.5" />
+                    <span className="hidden sm:inline">History</span>
+                  </Button>
+                </DialogTrigger>
+                <DialogContent className="ui-dialog-content--drawer">
+                  <DialogHeader>
+                    <DialogTitle>History</DialogTitle>
+                    <DialogDescription>restore from daemon-bound Codex sessions</DialogDescription>
+                  </DialogHeader>
+                  <ScrollArea className="h-[calc(100vh-64px)]">
+                    <div className="space-y-2 p-4">
+                      <Input
+                        value={historySearch}
+                        onChange={(event) => setHistorySearch(event.target.value)}
+                        placeholder="Search history"
+                        className="h-8"
+                      />
+                      {historyLoading ? (
+                        <div className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-xs text-muted-foreground">
+                          <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                          Loading history
                         </div>
-                      ) : (
-                        <button
-                          key={item.entry.id}
-                          type="button"
-                          className="grid w-full gap-1 rounded-md border border-border px-3 py-2 text-left text-xs hover:bg-accent/50 disabled:cursor-wait disabled:opacity-70"
-                          onClick={() => void handleRestoreSession(item.entry)}
-                          disabled={Boolean(restoringHistoryId)}
-                        >
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="line-clamp-2 text-sm font-medium">{item.entry.title || item.entry.id}</div>
-                            {restoringHistoryId === item.entry.id ? (
-                              <LoaderCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin" />
-                            ) : null}
+                      ) : null}
+                      {groupedHistory.map((item) =>
+                        item.type === "separator" ? (
+                          <div
+                            key={item.key}
+                            className="sticky top-0 z-10 -mx-1 bg-background/95 px-1 py-1 text-[11px] font-medium text-muted-foreground backdrop-blur"
+                          >
+                            {item.label}
                           </div>
-                          <div className="text-muted-foreground">{item.entry.cwd}</div>
-                          <div className="text-muted-foreground">
-                            {formatDateTime(item.entry.updatedAt)} · {item.entry.source || "unknown"} · {restoringHistoryId === item.entry.id ? "restoring" : item.entry.status}
-                          </div>
-                        </button>
-                      ),
-                    )}
+                        ) : (
+                          <button
+                            key={item.entry.id}
+                            type="button"
+                            className="grid w-full gap-1 rounded-md border border-border px-3 py-2 text-left text-xs hover:bg-accent/50 disabled:cursor-wait disabled:opacity-70"
+                            onClick={() => void handleRestoreSession(item.entry)}
+                            disabled={Boolean(restoringHistoryId)}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="line-clamp-2 text-sm font-medium">{item.entry.title || item.entry.id}</div>
+                              {restoringHistoryId === item.entry.id ? (
+                                <LoaderCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin" />
+                              ) : null}
+                            </div>
+                            <div className="text-muted-foreground">{item.entry.cwd}</div>
+                            <div className="text-muted-foreground">
+                              {formatDateTime(item.entry.updatedAt)} · {item.entry.source || "unknown"} · {restoringHistoryId === item.entry.id ? "restoring" : item.entry.status}
+                            </div>
+                          </button>
+                        ),
+                      )}
+                    </div>
+                  </ScrollArea>
+                </DialogContent>
+              </Dialog>
+              <Dialog open={newSessionOpen} onOpenChange={setNewSessionOpen}>
+                <DialogTrigger asChild>
+                  <Button size="sm" className="h-8 px-2 sm:px-2.5" disabled={!activeDaemonId}>
+                    <Play className="h-3.5 w-3.5" />
+                    <span className="hidden sm:inline">New</span>
+                  </Button>
+                </DialogTrigger>
+                <DialogContent className="max-w-[560px] md:w-full">
+                  <DialogHeader>
+                    <DialogTitle>New Session</DialogTitle>
+                    <DialogDescription>cwd</DialogDescription>
+                  </DialogHeader>
+                  <div className="grid gap-3 p-4">
+                    <Input
+                      value={cwd}
+                      onChange={(event) => setCwd(event.target.value)}
+                      placeholder="Working directory"
+                    />
+                    <div className="flex justify-end">
+                      <Button
+                        size="sm"
+                        disabled={!activeDaemonId || !cwd.trim() || creatingSession}
+                        onClick={() => void handleCreateSession()}
+                      >
+                        {creatingSession ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : null}
+                        Create
+                      </Button>
+                    </div>
                   </div>
-                </ScrollArea>
-              </DialogContent>
-            </Dialog>
-            <Dialog open={newSessionOpen} onOpenChange={setNewSessionOpen}>
-              <DialogTrigger asChild>
-                <Button size="sm" disabled={!activeDaemonId}>
-                  <Play className="h-3.5 w-3.5" />
-                  New
-                </Button>
-              </DialogTrigger>
-              <DialogContent className="top-1/2 right-1/2 h-auto max-w-[560px] translate-x-1/2 -translate-y-1/2 rounded-lg border">
-                <DialogHeader>
-                  <DialogTitle>New Session</DialogTitle>
-                  <DialogDescription>cwd</DialogDescription>
-                </DialogHeader>
-                <div className="grid gap-3 p-4">
-                  <Input
-                    value={cwd}
-                    onChange={(event) => setCwd(event.target.value)}
-                    placeholder="Working directory"
-                  />
-                  <div className="flex justify-end">
-                    <Button
-                      size="sm"
-                      disabled={!activeDaemonId || !cwd.trim() || creatingSession}
-                      onClick={() => void handleCreateSession()}
-                    >
-                      {creatingSession ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : null}
-                      Create
-                    </Button>
-                  </div>
-                </div>
-              </DialogContent>
-            </Dialog>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
-            >
-              {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-            </Button>
+                </DialogContent>
+              </Dialog>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8 shrink-0"
+                onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
+              >
+                {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+              </Button>
+            </div>
           </div>
         </header>
 
@@ -1022,7 +1062,6 @@ function App() {
                     : "select daemon"}
                 </div>
               </div>
-              {activity ? <Badge variant={activity.variant}>{activity.label}</Badge> : null}
             </div>
             <div className="min-h-0 overflow-auto bg-muted/10 px-4 py-4">
               {overviewSessions.length ? (
@@ -1051,96 +1090,143 @@ function App() {
           </main>
         ) : (
           <div
-            className={`grid min-h-0 ${sessionsCollapsed ? "grid-cols-[0_minmax(0,1fr)]" : "grid-cols-[280px_minmax(0,1fr)]"}`}
+            className={[
+              "ui-layout-motion relative grid min-h-0 grid-cols-1",
+              sessionsCollapsed ? "md:grid-cols-[52px_minmax(0,1fr)]" : "md:grid-cols-[248px_minmax(0,1fr)]",
+            ].join(" ")}
           >
+            {!sessionsCollapsed ? (
+              <button
+                type="button"
+                aria-label="Close sessions"
+                className="absolute inset-0 z-20 bg-background/50 backdrop-blur-[1px] md:hidden"
+                onClick={() => setSessionsCollapsed(true)}
+              />
+            ) : null}
             <aside
               className={[
-                "grid min-h-0 grid-rows-[40px_minmax(0,1fr)] transition-all duration-200",
+                "ui-panel-motion absolute inset-y-0 left-0 z-30 grid min-h-0 w-[min(85vw,320px)] grid-rows-[40px_minmax(0,1fr)] bg-background shadow-2xl md:static md:z-auto md:w-auto md:bg-transparent md:shadow-none",
                 sessionsCollapsed
-                  ? "w-0 overflow-hidden border-r-0 opacity-0"
+                  ? "pointer-events-none -translate-x-full overflow-hidden border-r-0 opacity-0 md:pointer-events-auto md:w-[52px] md:translate-x-0 md:border-r md:opacity-100"
                   : "border-r border-border opacity-100",
               ].join(" ")}
             >
-              <div className="flex items-center justify-between px-3 text-xs uppercase tracking-[0.2em] text-muted-foreground">
-                <span>Sessions</span>
-                <Badge variant="outline">{visibleSessions.length}</Badge>
+              <div className="flex items-center gap-2 px-2.5 text-xs uppercase tracking-[0.2em] text-muted-foreground">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8 shrink-0"
+                  aria-label={sessionsCollapsed ? "Expand sessions" : "Collapse sessions"}
+                  onClick={() => setSessionsCollapsed((current) => !current)}
+                >
+                  <PanelLeftOpen
+                    className={`h-4 w-4 transition-transform ${sessionsCollapsed ? "" : "rotate-180"}`}
+                  />
+                </Button>
+                {!sessionsCollapsed ? <span className="truncate">Sessions</span> : null}
+                {!sessionsCollapsed ? <Badge variant="outline">{visibleSessions.length}</Badge> : null}
               </div>
-              <ScrollArea>
-                <div className="space-y-1.5 p-2">
-                  {visibleSessions.map((session) => (
-                    <button
-                      key={session.id}
-                      type="button"
-                      onClick={() => handleSelectSession(session.id)}
-                      className={[
-                        "grid w-full gap-1 rounded-md border px-2.5 py-2 text-left text-xs transition-colors",
-                        activeSessionId === session.id
-                          ? "border-primary/40 bg-primary/10"
-                          : "border-border hover:bg-accent/60",
-                      ].join(" ")}
-                    >
-                      <div className="line-clamp-2 text-sm font-medium">{session.title}</div>
-                      <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
-                        <Badge variant={session.origin === "restored" ? "warning" : "outline"}>
-                          {session.origin}
-                        </Badge>
-                        <span>{session.model || "default"}</span>
-                        <span>{session.reasoningEffort || "medium"}</span>
-                      </div>
-                      <div className="truncate text-muted-foreground">{session.cwd}</div>
-                      <div className="flex items-center justify-between text-muted-foreground">
-                        <span>{session.status}</span>
-                        <span>{formatDateTime(session.updatedAt)}</span>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </ScrollArea>
+              {!sessionsCollapsed ? (
+                <ScrollArea>
+                  <div className="space-y-1.5 p-2">
+                    {visibleSessions.map((session) => (
+                      <button
+                        key={session.id}
+                        type="button"
+                        onClick={() => handleSelectSession(session.id)}
+                        className={[
+                          "ui-session-item grid w-full gap-1 rounded-md border px-2 py-1.5 text-left text-xs",
+                          activeSessionId === session.id
+                            ? "border-primary/40 bg-primary/10"
+                            : "border-border hover:bg-accent/60",
+                        ].join(" ")}
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="line-clamp-2 text-[13px] font-medium leading-5">{session.title}</div>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive"
+                            aria-label="Delete session"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void handleDeleteSession(session.id);
+                            }}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                        <div className="text-[11px] text-muted-foreground">{formatDateTime(session.updatedAt)}</div>
+                        <div className="truncate text-[11px] text-muted-foreground">{session.cwd}</div>
+                      </button>
+                    ))}
+                  </div>
+                </ScrollArea>
+              ) : null}
             </aside>
 
-            <main className="grid min-h-0 grid-rows-[64px_minmax(0,1fr)_auto]">
-              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-b border-border px-3">
-                <div className="flex min-w-0 items-center gap-2">
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 shrink-0"
-                    onClick={() => setSessionsCollapsed((current) => !current)}
-                  >
-                    <PanelLeftOpen
-                      className={`h-4 w-4 transition-transform ${sessionsCollapsed ? "" : "rotate-180"}`}
-                    />
-                  </Button>
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      {activeDaemon ? (
-                        <Badge variant={activeDaemon.online ? "success" : "destructive"}>
-                          {activeDaemon.online ? "online" : "offline"}
-                        </Badge>
-                      ) : null}
-                      <div className="truncate text-sm font-medium">
-                        {activeSession?.title || activeDaemon?.name || "No Session"}
-                      </div>
-                    </div>
-                    <div className="truncate text-xs text-muted-foreground">
-                      {activeSession
-                        ? `${activeSession.cwd} · ${activeSession.model || "default"} · ${activeSession.reasoningEffort || "medium"} · ${activeSession.codexThreadId || "pending"}`
-                        : activeDaemon
-                          ? `${activeDaemon.cwd} · ${activeDaemon.platform} · ${activeDaemon.id}`
-                          : "select daemon"}
-                    </div>
+            <main className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto]">
+              <div className="flex items-center justify-between gap-3 border-b border-border px-3 py-2 overflow-hidden">
+                <div className="flex min-w-0 flex-1 items-center gap-2">
+                  {sessionsCollapsed ? (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8 shrink-0 md:hidden"
+                      aria-label="Expand sessions"
+                      onClick={() => setSessionsCollapsed(false)}
+                    >
+                      <PanelLeftOpen className="h-4 w-4" />
+                    </Button>
+                  ) : null}
+                  <div className="truncate text-sm font-medium">
+                    {activeSession?.title || activeDaemon?.name || "No Session"}
                   </div>
                 </div>
-                <div className="flex items-center gap-2">
-                  {activity ? <Badge variant={activity.variant}>{activity.label}</Badge> : null}
-                  <Button
-                    variant="destructive"
-                    size="sm"
-                    disabled={!activeDaemonId || !activeSessionId}
-                    onClick={() => void handleDelete()}
-                  >
-                    Close
-                  </Button>
+                <div className="flex shrink-0 items-center gap-2">
+                  <Dialog open={renameSessionOpen} onOpenChange={setRenameSessionOpen}>
+                    <DialogTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8"
+                        aria-label="Rename session"
+                        disabled={!activeSessionId}
+                      >
+                        <Edit3 className="h-4 w-4" />
+                      </Button>
+                    </DialogTrigger>
+                    <DialogContent className="max-w-[420px] md:w-full">
+                      <DialogHeader>
+                        <DialogTitle>Rename Session</DialogTitle>
+                        <DialogDescription>Update the local session title</DialogDescription>
+                      </DialogHeader>
+                      <div className="grid gap-3 p-4">
+                        <Input
+                          value={renameTitle}
+                          onChange={(event) => setRenameTitle(event.target.value)}
+                          placeholder="Session title"
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              void handleRenameSession();
+                            }
+                          }}
+                        />
+                        <div className="flex justify-end">
+                          <Button
+                            size="sm"
+                            disabled={!activeSessionId || !renameTitle.trim() || renamingSession}
+                            onClick={() => void handleRenameSession()}
+                          >
+                            {renamingSession ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : null}
+                            Save
+                          </Button>
+                        </div>
+                      </div>
+                    </DialogContent>
+                  </Dialog>
                 </div>
               </div>
 
@@ -1182,7 +1268,7 @@ function App() {
                               rowVirtualizer.measureElement(node);
                             }
                           }}
-                          className="absolute left-0 top-0 w-full px-3"
+                          className="absolute left-0 top-0 w-full px-3 ui-entry-reveal"
                           style={{ transform: `translateY(${virtualRow.start}px)` }}
                         >
                           <TranscriptCard
@@ -1209,7 +1295,7 @@ function App() {
                   </div>
                 )}
                 {showScrollToBottom && chatTranscript.length ? (
-                  <div className="pointer-events-none sticky bottom-3 z-20 flex justify-end px-3">
+                  <div className="ui-fab-reveal pointer-events-none sticky bottom-3 z-20 flex justify-end px-3">
                     <Button
                       type="button"
                       size="icon"
@@ -1223,7 +1309,7 @@ function App() {
                 ) : null}
               </div>
 
-              <div className="grid gap-1.5 border-t border-border p-3">
+              <div className="grid gap-2 border-t border-border p-3">
                 <Textarea
                   value={composer}
                   onChange={(event) => setComposer(event.target.value)}
@@ -1234,9 +1320,9 @@ function App() {
                     }
                   }}
                   placeholder="Enter send · Ctrl+Enter newline"
-                  className="min-h-[96px] max-h-[96px]"
+                  className="min-h-[96px] max-h-[128px] md:max-h-[96px]"
                 />
-                <div className="flex items-center justify-between gap-3 overflow-hidden">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                   <div className="flex min-w-0 items-center gap-2">
                     {activity ? (
                       <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
@@ -1253,7 +1339,7 @@ function App() {
                       </div>
                     )}
                   </div>
-                  <div className="flex shrink-0 items-center gap-1 overflow-x-auto">
+                  <div className="flex flex-wrap items-center gap-1 sm:justify-end">
                     <InlineSelect
                       value={sandbox}
                       onValueChange={(value) => {
@@ -1404,7 +1490,7 @@ function OverviewSessionCard({
     <button
       type="button"
       className={[
-        "overview-card grid max-h-[340px] w-full gap-2 overflow-hidden rounded-xl border bg-card px-3 py-3 text-left shadow-sm transition-colors",
+        "overview-card ui-overview-card grid max-h-[340px] w-full gap-2 overflow-hidden rounded-xl border bg-card px-3 py-3 text-left shadow-sm",
         active ? "border-primary/40 bg-primary/5" : "border-border hover:bg-accent/40",
       ].join(" ")}
       onClick={onOpen}
@@ -1414,7 +1500,7 @@ function OverviewSessionCard({
           <div className="line-clamp-2 text-sm font-medium">{session.title}</div>
           <div className="mt-1 truncate text-[11px] text-muted-foreground">{session.cwd}</div>
         </div>
-        <Badge variant={activity.variant}>{activity.label}</Badge>
+        {activity ? <Badge variant={activity.variant}>{activity.label}</Badge> : null}
       </div>
 
       <div className="flex flex-wrap items-center gap-1 text-[10px] text-muted-foreground">
@@ -1829,7 +1915,7 @@ function StatusBadge({ connectionState }: { connectionState: "connecting" | "ope
     return (
       <div className="flex items-center gap-1 text-xs text-muted-foreground">
         <Circle className="h-3.5 w-3.5 fill-emerald-500 text-emerald-500" />
-        control
+        <span className="hidden sm:inline">control</span>
       </div>
     );
   }
@@ -1837,7 +1923,7 @@ function StatusBadge({ connectionState }: { connectionState: "connecting" | "ope
     return (
       <div className="flex items-center gap-1 text-xs text-muted-foreground">
         <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
-        connecting
+        <span className="hidden sm:inline">connecting</span>
       </div>
     );
   }
@@ -1845,14 +1931,14 @@ function StatusBadge({ connectionState }: { connectionState: "connecting" | "ope
     return (
       <div className="flex items-center gap-1 text-xs text-red-400">
         <AlertCircle className="h-3.5 w-3.5" />
-        error
+        <span className="hidden sm:inline">error</span>
       </div>
     );
   }
   return (
     <div className="flex items-center gap-1 text-xs text-muted-foreground">
       <Unplug className="h-3.5 w-3.5" />
-      closed
+      <span className="hidden sm:inline">closed</span>
     </div>
   );
 }
@@ -1905,9 +1991,6 @@ function getActivity(
   }
   if (session.status === "failed") {
     return { label: "failed", variant: "destructive" };
-  }
-  if (session.status === "completed") {
-    return { label: "completed", variant: "success" };
   }
   return null;
 }
@@ -2024,7 +2107,7 @@ function getBubbleRowClassName(entry: TranscriptEntry) {
   return "justify-start";
 }
 
-function getSessionOverviewActivity(session: SessionSummary, details?: SessionDetails): ActivityState {
+function getSessionOverviewActivity(session: SessionSummary, details?: SessionDetails): ActivityState | null {
   const detailActivity = details ? getActivity(details) : null;
   if (detailActivity) {
     return detailActivity;
@@ -2032,16 +2115,13 @@ function getSessionOverviewActivity(session: SessionSummary, details?: SessionDe
   if (session.status === "failed") {
     return { label: "failed", variant: "destructive" };
   }
-  if (session.status === "completed") {
-    return { label: "completed", variant: "success" };
-  }
   if (session.status === "running" || session.status === "starting") {
     return { label: session.status, variant: "default" };
   }
   if (session.status === "interrupted") {
     return { label: "interrupted", variant: "warning" };
   }
-  return { label: "idle", variant: "outline" };
+  return null;
 }
 
 function getOverviewPreviewEntries(details?: SessionDetails) {

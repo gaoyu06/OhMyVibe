@@ -131,6 +131,19 @@ app.patch("/api/daemons/:daemonId/sessions/:sessionId/config", async (req, res) 
   }
 });
 
+app.patch("/api/daemons/:daemonId/sessions/:sessionId/title", async (req, res) => {
+  try {
+    res.json(
+      await requestDaemon(req.params.daemonId, "renameSession", {
+        sessionId: req.params.sessionId,
+        title: req.body?.title ?? "",
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 app.post("/api/daemons/:daemonId/sessions/:sessionId/interrupt", async (req, res) => {
   try {
     res.status(202).json(

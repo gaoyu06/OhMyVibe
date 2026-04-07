@@ -6,6 +6,7 @@ import {
   CreateSessionInput,
   DaemonConfig,
   DaemonEvent,
+  RenameSessionInput,
   RestoreSessionInput,
   SessionDetails,
   SessionStatus,
@@ -212,6 +213,20 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       await this.applyPendingConfig(session);
     }
 
+    return this.getOrThrow(sessionId);
+  }
+
+  async rename(sessionId: string, input: RenameSessionInput): Promise<SessionDetails> {
+    const session = this.getSessionOrThrow(sessionId);
+    const nextTitle = typeof input.title === "string" ? input.title.trim() : "";
+    if (!nextTitle) {
+      throw new Error("Session title is required");
+    }
+
+    session.title = nextTitle;
+    this.touch(session);
+    this.persist();
+    this.emitChange({ type: "session-updated", session: this.toSummary(session) });
     return this.getOrThrow(sessionId);
   }
 
