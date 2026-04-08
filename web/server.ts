@@ -411,6 +411,7 @@ function requestDaemon(daemonId: string, method: string, params: Record<string, 
 }
 
 function dispatchDaemonEvent(daemonId: string, event: DaemonEvent) {
+  let serialized: string | undefined;
   for (const client of clientWss.clients) {
     if (client.readyState !== WebSocket.OPEN) {
       continue;
@@ -419,13 +420,12 @@ function dispatchDaemonEvent(daemonId: string, event: DaemonEvent) {
     if (!shouldSendDaemonEvent(subscription, daemonId, event)) {
       continue;
     }
-    client.send(
-      JSON.stringify({
-        type: "daemon-event",
-        daemonId,
-        event,
-      }),
-    );
+    serialized ??= JSON.stringify({
+      type: "daemon-event",
+      daemonId,
+      event,
+    });
+    client.send(serialized);
   }
 }
 
@@ -434,6 +434,7 @@ function dispatchDaemonEvents(daemonId: string, events: DaemonEvent[]) {
     return;
   }
 
+  const clientsBySessionId = new Map<string | null, WebSocket[]>();
   for (const client of clientWss.clients) {
     if (client.readyState !== WebSocket.OPEN) {
       continue;
@@ -443,19 +444,89 @@ function dispatchDaemonEvents(daemonId: string, events: DaemonEvent[]) {
       continue;
     }
 
-    const filteredEvents = events.filter((event) => shouldSendDaemonEvent(subscription, daemonId, event));
+    const sessionId = subscription.sessionId ?? null;
+    const clients = clientsBySessionId.get(sessionId);
+    if (clients) {
+      clients.push(client);
+      continue;
+    }
+    clientsBySessionId.set(sessionId, [client]);
+  }
+
+  const partitionedEvents = partitionDaemonEvents(events);
+  const serializedPayloads = new Map<string | null, string>();
+
+  for (const [sessionId, clients] of clientsBySessionId) {
+    const filteredEvents = getPartitionedEventsForSession(partitionedEvents, sessionId);
     if (!filteredEvents.length) {
       continue;
     }
 
-    client.send(
-      JSON.stringify({
+    let serialized = serializedPayloads.get(sessionId);
+    if (!serialized) {
+      serialized = JSON.stringify({
         type: "daemon-events",
         daemonId,
         events: filteredEvents,
-      }),
-    );
+      });
+      serializedPayloads.set(sessionId, serialized);
+    }
+
+    for (const client of clients) {
+      client.send(serialized);
+    }
   }
+}
+
+function partitionDaemonEvents(events: DaemonEvent[]) {
+  const sharedEvents: DaemonEvent[] = [];
+  const sessionEvents = new Map<string, DaemonEvent[]>();
+
+  for (const event of events) {
+    switch (event.type) {
+      case "session-created":
+      case "session-updated":
+      case "session-deleted":
+        sharedEvents.push(event);
+        break;
+      case "session-entry":
+      case "session-entry-updated":
+      case "session-entries-updated":
+      case "session-reset": {
+        const bucket = sessionEvents.get(event.sessionId);
+        if (bucket) {
+          bucket.push(event);
+          continue;
+        }
+        sessionEvents.set(event.sessionId, [event]);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  return { sharedEvents, sessionEvents };
+}
+
+function getPartitionedEventsForSession(
+  partitioned: ReturnType<typeof partitionDaemonEvents>,
+  sessionId: string | null,
+) {
+  if (!sessionId) {
+    return partitioned.sharedEvents;
+  }
+
+  const targetedEvents = partitioned.sessionEvents.get(sessionId);
+  if (!targetedEvents?.length) {
+    return partitioned.sharedEvents;
+  }
+
+  if (!partitioned.sharedEvents.length) {
+    return targetedEvents;
+  }
+
+  return [...partitioned.sharedEvents, ...targetedEvents];
 }
 
 function shouldSendDaemonEvent(

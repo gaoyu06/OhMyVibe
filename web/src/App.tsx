@@ -530,20 +530,24 @@ function App() {
   );
   const overviewLayoutKey = activeDaemonId && activeWorkspace ? `${activeDaemonId}:${activeWorkspace.id}` : "";
   const currentOverviewLayout = overviewLayoutKey ? overviewLayouts[overviewLayoutKey] ?? {} : {};
+  const sortedHistory = useMemo(
+    () =>
+      [...history].sort(
+        (a, b) => Date.parse(b.updatedAt || b.createdAt || "") - Date.parse(a.updatedAt || a.createdAt || ""),
+      ),
+    [history],
+  );
   const filteredHistory = useMemo(() => {
     const query = historySearch.trim().toLowerCase();
-    const sorted = [...history].sort(
-      (a, b) => Date.parse(b.updatedAt || b.createdAt || "") - Date.parse(a.updatedAt || a.createdAt || ""),
-    );
     if (!query) {
-      return sorted;
+      return sortedHistory;
     }
-    return sorted.filter((item) =>
+    return sortedHistory.filter((item) =>
       [item.title, item.cwd, item.id, item.source, item.status]
         .filter(Boolean)
         .some((value) => String(value).toLowerCase().includes(query)),
     );
-  }, [history, historySearch]);
+  }, [historySearch, sortedHistory]);
   const groupedHistory = useMemo(() => groupHistoryByDay(filteredHistory), [filteredHistory]);
   const lastEntrySignature = useMemo(() => {
     const lastEntry = displayTranscript[displayTranscript.length - 1];
