@@ -48,6 +48,7 @@ const AGENT_RETRY_BASE_DELAY_MS = 1_500;
 const AGENT_PROMPT_TRANSCRIPT_PREVIEW_LIMIT = 6;
 const AGENT_PROMPT_LOG_PREVIEW_LIMIT = 6;
 const AGENT_PROMPT_TEXT_LIMIT = 600;
+const FOREMAN_WAKE_STATUSES = new Set(["completed", "failed", "interrupted", "idle"] as const);
 
 interface GitCacheEntry {
   summary?: SessionGitSummary;
@@ -69,6 +70,8 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
   private readonly runningAgents = new Set<string>();
   private readonly agentRetryCounts = new Map<string, number>();
   private readonly agentRetryTimers = new Map<string, NodeJS.Timeout>();
+  private readonly foremanWakeStatusBySession = new Map<string, string>();
+  private readonly lastSessionStatusBySession = new Map<string, SessionSummary["status"]>();
 
   constructor(sessionManager: SessionManager) {
     super();
@@ -422,10 +425,15 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
         const enriched = this.enrichSessionSummary(event.session);
         this.emit("event", { ...event, session: enriched });
         void this.refreshGitForSession(enriched);
+        if (event.type === "session-updated") {
+          this.handleForemanWakeForSession(enriched);
+        }
         return;
       }
       case "session-deleted": {
         const projectId = this.state.sessionProjectIds[event.sessionId];
+        this.foremanWakeStatusBySession.delete(event.sessionId);
+        this.lastSessionStatusBySession.delete(event.sessionId);
         if (projectId) {
           delete this.state.sessionProjectIds[event.sessionId];
           const project = this.state.projects.find((item) => item.id === projectId);
@@ -678,7 +686,13 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
     this.appendAgentLog(agent, {
       kind: "decision",
       direction: "internal",
-      text: JSON.stringify(decision),
+      text: `Selected action ${decision.action}`,
+      meta: {
+        action: decision.action,
+        actionInput: decision.actionInput,
+        stopReason: decision.stopReason,
+        userFacingText: decision.userFacingText,
+      },
     });
 
     switch (decision.action) {
@@ -705,13 +719,23 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
         this.appendAgentLog(agent, {
           kind: "action",
           direction: "outbound",
-          text: `Created session ${session.title} (${session.id}).`,
+          text: `Created execution lane ${session.title} (${session.id}).`,
+          meta: {
+            action: "create_session",
+            sessionId: session.id,
+            sessionTitle: session.title,
+            cwd: session.cwd,
+          },
         });
 
         const instruction =
           typeof decision.actionInput?.instruction === "string" ? decision.actionInput.instruction.trim() : "";
         if (instruction) {
-          await this.sendMessage(session.id, instruction);
+          if (agent.role === "steward") {
+            await this.delegateInstructionToForeman(project.id, session.id, instruction, agent.id);
+          } else {
+            await this.sendMessage(session.id, instruction);
+          }
         }
         return;
       }
@@ -727,11 +751,24 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
         if (!sessionId || !instruction) {
           throw new Error("send_session_instruction requires sessionId/instruction");
         }
-        await this.sendMessage(sessionId, instruction);
+        if (agent.role === "steward") {
+          await this.delegateInstructionToForeman(project.id, sessionId, instruction, agent.id);
+        } else {
+          await this.sendMessage(sessionId, instruction);
+        }
         this.appendAgentLog(agent, {
           kind: "action",
           direction: "outbound",
-          text: `Sent instruction to session ${sessionId}: ${instruction}`,
+          text:
+            agent.role === "steward"
+              ? `Delegated instruction for session ${sessionId} to its foreman.`
+              : `Sent instruction to session ${sessionId}: ${instruction}`,
+          meta: {
+            action: "send_session_instruction",
+            sessionId,
+            instruction,
+            delegatedToForeman: agent.role === "steward",
+          },
         });
         return;
       }
@@ -743,19 +780,7 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
           throw new Error("message_agent requires targetAgentId/text");
         }
         const target = this.getAgentOrThrow(targetAgentId);
-        this.appendAgentLog(target, {
-          kind: "agent_message",
-          direction: "inbound",
-          sourceAgentId: agent.id,
-          text,
-        });
-        this.appendAgentLog(agent, {
-          kind: "action",
-          direction: "outbound",
-          targetAgentId,
-          text: `Sent message to agent ${target.name}: ${text}`,
-        });
-        this.enqueueAgent(target.id);
+        this.deliverAgentMessage(agent, target, text);
         return;
       }
       case "notify_user": {
@@ -858,6 +883,96 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
     return this.state.agents.find((agent) => agent.projectId === projectId && agent.role === role);
   }
 
+  private findForemanForSession(sessionId: string): AgentDetails | undefined {
+    return this.state.agents.find((agent) => agent.role === "foreman" && agent.boundSessionId === sessionId);
+  }
+
+  private async delegateInstructionToForeman(
+    projectId: string,
+    sessionId: string,
+    instruction: string,
+    sourceAgentId: string,
+  ): Promise<void> {
+    const foreman = this.findForemanForSession(sessionId);
+    if (!foreman || foreman.projectId !== projectId) {
+      throw new Error(`No foreman found for session ${sessionId}`);
+    }
+
+    const sourceAgent = this.getAgentOrThrow(sourceAgentId);
+    const text = [
+      `Session ${sessionId} requires execution.`,
+      "Review the repository and current session state, decide the next concrete step, then instruct your bound session.",
+      "",
+      "Assigned task:",
+      instruction,
+    ].join("\n");
+
+    this.deliverAgentMessage(sourceAgent, foreman, text);
+  }
+
+  private deliverAgentMessage(source: AgentDetails, target: AgentDetails, text: string): void {
+    this.appendAgentLog(target, {
+      kind: "agent_message",
+      direction: "inbound",
+      sourceAgentId: source.id,
+      text,
+      meta: {
+        sourceAgentId: source.id,
+        sourceAgentName: source.name,
+      },
+    });
+    this.appendAgentLog(source, {
+      kind: "action",
+      direction: "outbound",
+      targetAgentId: target.id,
+      text: `Sent message to agent ${target.name}.`,
+      meta: {
+        action: "message_agent",
+        targetAgentId: target.id,
+        targetAgentName: target.name,
+        text,
+      },
+    });
+    this.enqueueAgent(target.id);
+  }
+
+  private handleForemanWakeForSession(session: SessionSummary): void {
+    const previousStatus = this.lastSessionStatusBySession.get(session.id);
+    const currentStatus = session.status;
+    this.lastSessionStatusBySession.set(session.id, currentStatus);
+
+    if (!FOREMAN_WAKE_STATUSES.has(currentStatus as "completed" | "failed" | "interrupted" | "idle")) {
+      return;
+    }
+
+    if (previousStatus !== "running" && previousStatus !== "starting") {
+      return;
+    }
+
+    const wakeKey = `${session.id}:${session.transcriptCount}`;
+    if (this.foremanWakeStatusBySession.get(session.id) === wakeKey) {
+      return;
+    }
+
+    this.foremanWakeStatusBySession.set(session.id, wakeKey);
+    const foreman = this.findForemanForSession(session.id);
+    if (!foreman) {
+      return;
+    }
+
+    this.appendAgentLog(foreman, {
+      kind: "observation",
+      direction: "internal",
+      text: `Bound session ${session.title} (${session.id}) is now ${currentStatus}. Review the outcome, decide the next step, and report status back to Steward.`,
+      meta: {
+        sessionId: session.id,
+        sessionTitle: session.title,
+        sessionStatus: currentStatus,
+      },
+    });
+    this.enqueueAgent(foreman.id);
+  }
+
   private buildAgentSystemPrompt(agent: AgentDetails, project: ProjectSummary): string {
     const commonLines = [
       `You are ${agent.role} for project "${project.name}".`,
@@ -871,17 +986,21 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
 
     if (agent.role === "steward") {
       commonLines.push(
-        "You manage the whole project across multiple sessions.",
+        "You manage the whole project across multiple sessions and foremen.",
         "Before assigning work or writing a plan, ensure the current codebase has been inspected in a session.",
-        "If no session has inspected the repository or the existing evidence is stale, use create_session or send_session_instruction to inspect the repository first.",
-        "Only after repository inspection should you break work down and assign or sequence tasks.",
-        "You may create new sessions when that improves parallel progress or isolates work."
+        "Do not instruct execution sessions directly.",
+        "When a new execution lane is needed, use create_session to create a new session plus its foreman.",
+        "After that, communicate task intent to the relevant foreman, which is the only agent that should direct a session.",
+        "If no session has inspected the repository or the existing evidence is stale, create a new execution lane or message an existing foreman to inspect the repository first.",
+        "Only after repository inspection should you break work down and assign or sequence tasks."
       );
     } else if (agent.role === "foreman") {
       commonLines.push(
         "You supervise one execution session and drive it to the next concrete step.",
+        "You are the only agent that should instruct your bound session.",
         "Before requesting implementation or planning, first make sure the bound session has inspected the repository and identified relevant files.",
         "Once the repository has been inspected, ask for a concrete plan, then drive execution step by step.",
+        "When the bound session completes, fails, or is interrupted, review the outcome and report it to Steward before deciding the next step.",
         "If blocked, message Steward or notify the user with the specific blocker."
       );
     } else {

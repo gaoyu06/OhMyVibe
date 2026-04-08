@@ -105,11 +105,28 @@ export function createProject(
     name: string;
     rootDir: string;
     goal: string;
-    runPolicy: { mode: "until_blocked" };
+    runPolicy: import("@/lib/types").ProjectRunPolicy;
   },
 ) {
   return fetchControlApi<ProjectSummary>(controlUrl, `/api/daemons/${daemonId}/projects`, {
     method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function patchProject(
+  controlUrl: string,
+  daemonId: string,
+  projectId: string,
+  body: {
+    name?: string;
+    goal?: string;
+    status?: "idle" | "running" | "paused" | "blocked" | "completed" | "failed";
+    runPolicy?: import("@/lib/types").ProjectRunPolicy;
+  },
+) {
+  return fetchControlApi<ProjectSummary>(controlUrl, `/api/daemons/${daemonId}/projects/${projectId}`, {
+    method: "PATCH",
     body: JSON.stringify(body),
   });
 }

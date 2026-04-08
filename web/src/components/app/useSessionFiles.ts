@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { fetchControlApi } from "@/lib/controlApi";
 import type { ProjectFileBrowseResult, ProjectFileReadResult } from "@/lib/types";
 
-export type SessionPane = "chat" | "files";
+export type SessionPane = "chat" | "files" | "git";
 
 export function useSessionFiles({
   controlUrl,

@@ -10,7 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Textarea } from "@/components/ui/textarea";
-import type { AgentDetails, ProjectNotification } from "@/lib/types";
+import type { AgentDetails, AgentLogEntry, ProjectNotification } from "@/lib/types";
 import { formatDateTime } from "@/lib/utils";
 
 export function AgentPane({
@@ -88,7 +88,7 @@ export function AgentPane({
                     </div>
                     <span>{formatDateTime(entry.createdAt)}</span>
                   </div>
-                  <div className="mt-2 whitespace-pre-wrap break-words text-sm leading-6">{entry.text}</div>
+                  {renderAgentLogContent(entry)}
                 </div>
               ))
             ) : (
@@ -164,6 +164,184 @@ export function AgentPane({
       </div>
     </>
   );
+}
+
+function renderAgentLogContent(entry: AgentLogEntry) {
+  const structured = readStructuredAgentLog(entry);
+  if (!structured) {
+    return <div className="mt-2 whitespace-pre-wrap break-words text-sm leading-6">{entry.text}</div>;
+  }
+
+  const fields = [
+    structured.action ? { label: "Action", value: structured.action } : null,
+    structured.sessionTitle
+      ? { label: "Session", value: `${structured.sessionTitle}${structured.sessionId ? ` (${structured.sessionId})` : ""}` }
+      : structured.sessionId
+        ? { label: "Session", value: structured.sessionId }
+        : null,
+    structured.targetAgentName
+      ? {
+          label: "Target",
+          value: `${structured.targetAgentName}${structured.targetAgentId ? ` (${structured.targetAgentId})` : ""}`,
+        }
+      : structured.targetAgentId
+        ? { label: "Target", value: structured.targetAgentId }
+        : null,
+    structured.sourceAgentName
+      ? {
+          label: "Source",
+          value: `${structured.sourceAgentName}${structured.sourceAgentId ? ` (${structured.sourceAgentId})` : ""}`,
+        }
+      : structured.sourceAgentId
+        ? { label: "Source", value: structured.sourceAgentId }
+        : null,
+    structured.cwd ? { label: "Cwd", value: structured.cwd } : null,
+    structured.delegatedToForeman ? { label: "Delegated", value: "via foreman" } : null,
+    structured.sessionStatus ? { label: "Status", value: structured.sessionStatus } : null,
+  ].filter((item): item is { label: string; value: string } => Boolean(item?.value));
+
+  return (
+    <div className="mt-2 rounded-lg border border-border/70 bg-muted/20 p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge variant="outline">{structured.action || entry.kind}</Badge>
+        {structured.stopReason ? <Badge variant="outline">stop</Badge> : null}
+      </div>
+      {fields.length ? (
+        <div className="mt-3 grid gap-2 text-sm">
+          {fields.map((field) => (
+            <div key={`${entry.id}-${field.label}`} className="grid gap-1">
+              <div className="text-[11px] uppercase tracking-[0.14em] text-muted-foreground">{field.label}</div>
+              <div className="break-words leading-6">{field.value}</div>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {structured.instruction ? (
+        <div className="mt-3 grid gap-1">
+          <div className="text-[11px] uppercase tracking-[0.14em] text-muted-foreground">Instruction</div>
+          <div className="whitespace-pre-wrap break-words text-sm leading-6">{structured.instruction}</div>
+        </div>
+      ) : null}
+      {structured.text ? (
+        <div className="mt-3 grid gap-1">
+          <div className="text-[11px] uppercase tracking-[0.14em] text-muted-foreground">Message</div>
+          <div className="whitespace-pre-wrap break-words text-sm leading-6">{structured.text}</div>
+        </div>
+      ) : null}
+      {structured.userFacingText ? (
+        <div className="mt-3 grid gap-1">
+          <div className="text-[11px] uppercase tracking-[0.14em] text-muted-foreground">User Update</div>
+          <div className="whitespace-pre-wrap break-words text-sm leading-6">{structured.userFacingText}</div>
+        </div>
+      ) : null}
+      {structured.stopReason ? (
+        <div className="mt-3 grid gap-1">
+          <div className="text-[11px] uppercase tracking-[0.14em] text-muted-foreground">Stop Reason</div>
+          <div className="whitespace-pre-wrap break-words text-sm leading-6">{structured.stopReason}</div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function readStructuredAgentLog(entry: AgentLogEntry) {
+  const fromMeta = entry.meta && typeof entry.meta === "object" ? entry.meta : null;
+  if (fromMeta && typeof fromMeta.action === "string") {
+    const actionInput =
+      fromMeta.actionInput && typeof fromMeta.actionInput === "object"
+        ? (fromMeta.actionInput as Record<string, unknown>)
+        : null;
+    return {
+      action: typeof fromMeta.action === "string" ? fromMeta.action : "",
+      delegatedToForeman: Boolean(fromMeta.delegatedToForeman),
+      instruction:
+        typeof fromMeta.instruction === "string"
+          ? fromMeta.instruction
+          : actionInput && typeof actionInput.instruction === "string"
+            ? actionInput.instruction
+            : "",
+      sessionId:
+        typeof fromMeta.sessionId === "string"
+          ? fromMeta.sessionId
+          : actionInput && typeof actionInput.sessionId === "string"
+            ? actionInput.sessionId
+            : "",
+      sessionTitle: typeof fromMeta.sessionTitle === "string" ? fromMeta.sessionTitle : "",
+      sessionStatus: typeof fromMeta.sessionStatus === "string" ? fromMeta.sessionStatus : "",
+      targetAgentId:
+        typeof fromMeta.targetAgentId === "string"
+          ? fromMeta.targetAgentId
+          : actionInput && typeof actionInput.targetAgentId === "string"
+            ? actionInput.targetAgentId
+            : "",
+      targetAgentName: typeof fromMeta.targetAgentName === "string" ? fromMeta.targetAgentName : "",
+      sourceAgentId: typeof fromMeta.sourceAgentId === "string" ? fromMeta.sourceAgentId : "",
+      sourceAgentName: typeof fromMeta.sourceAgentName === "string" ? fromMeta.sourceAgentName : "",
+      cwd:
+        typeof fromMeta.cwd === "string"
+          ? fromMeta.cwd
+          : actionInput && typeof actionInput.cwd === "string"
+            ? actionInput.cwd
+            : "",
+      text: typeof fromMeta.text === "string" ? fromMeta.text : "",
+      stopReason: typeof fromMeta.stopReason === "string" ? fromMeta.stopReason : "",
+      userFacingText: typeof fromMeta.userFacingText === "string" ? fromMeta.userFacingText : "",
+    };
+  }
+
+  if (entry.kind !== "decision") {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(entry.text) as Record<string, unknown>;
+    if (typeof parsed.action !== "string") {
+      return null;
+    }
+    return {
+      action: parsed.action,
+      delegatedToForeman: false,
+      instruction:
+        typeof parsed.actionInput === "object" &&
+        parsed.actionInput &&
+        typeof (parsed.actionInput as Record<string, unknown>).instruction === "string"
+          ? ((parsed.actionInput as Record<string, unknown>).instruction as string)
+          : "",
+      sessionId:
+        typeof parsed.actionInput === "object" &&
+        parsed.actionInput &&
+        typeof (parsed.actionInput as Record<string, unknown>).sessionId === "string"
+          ? ((parsed.actionInput as Record<string, unknown>).sessionId as string)
+          : "",
+      sessionTitle: "",
+      sessionStatus: "",
+      targetAgentId:
+        typeof parsed.actionInput === "object" &&
+        parsed.actionInput &&
+        typeof (parsed.actionInput as Record<string, unknown>).targetAgentId === "string"
+          ? ((parsed.actionInput as Record<string, unknown>).targetAgentId as string)
+          : "",
+      targetAgentName: "",
+      sourceAgentId: "",
+      sourceAgentName: "",
+      cwd:
+        typeof parsed.actionInput === "object" &&
+        parsed.actionInput &&
+        typeof (parsed.actionInput as Record<string, unknown>).cwd === "string"
+          ? ((parsed.actionInput as Record<string, unknown>).cwd as string)
+          : "",
+      text:
+        typeof parsed.actionInput === "object" &&
+        parsed.actionInput &&
+        typeof (parsed.actionInput as Record<string, unknown>).text === "string"
+          ? ((parsed.actionInput as Record<string, unknown>).text as string)
+          : "",
+      stopReason: typeof parsed.stopReason === "string" ? parsed.stopReason : "",
+      userFacingText: typeof parsed.userFacingText === "string" ? parsed.userFacingText : "",
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function SettingsEditor({

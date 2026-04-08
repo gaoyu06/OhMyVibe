@@ -25,6 +25,7 @@ import {
   listProjectAgents,
   listProjectNotifications,
   patchNotificationSettings,
+  patchProject,
   patchProviderSettings,
   patchSessionConfig,
   pauseProject,
@@ -42,6 +43,7 @@ import type {
   DaemonEvent,
   GlobalSettings,
   ProjectNotification,
+  ProjectRunPolicy,
   ProjectSummary,
   SessionDetails,
   SessionTranscriptPage,
@@ -708,10 +710,14 @@ function App() {
     await sendMessageText(composer);
   }
 
-  async function handleRunProject() {
+  async function handleRunProject(runPolicy: ProjectRunPolicy) {
     if (!activeDaemonId || !activeProjectId) {
       return;
     }
+    const updatedProject = await patchProject(controlUrl, activeDaemonId, activeProjectId, {
+      runPolicy,
+    });
+    setProjects((current) => upsertProjectSummary(current, updatedProject));
     const project = await runProject(controlUrl, activeDaemonId, activeProjectId);
     setProjects((current) => upsertProjectSummary(current, project));
   }
@@ -946,7 +952,7 @@ function App() {
               activeProjectId={activeProjectId}
               onOpenFilesPane={() => void openFilesPane()}
               onPauseProject={() => void handlePauseProject()}
-              onRunProject={() => void handleRunProject()}
+              onRunProject={(runPolicy) => void handleRunProject(runPolicy)}
               renameSessionOpen={renameSessionOpen}
               setRenameSessionOpen={setRenameSessionOpen}
               renameTitle={renameTitle}

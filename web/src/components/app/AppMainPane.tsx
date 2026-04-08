@@ -1,11 +1,14 @@
-import { lazy, Suspense, type Key, type UIEvent } from "react";
-import { ArrowDown, Circle, Edit3, FolderOpen, LoaderCircle, MessageSquareText, PanelLeftOpen, Play, Send, Square } from "lucide-react";
+import { lazy, Suspense, useEffect, useState, type Key, type UIEvent } from "react";
+import { ArrowDown, Circle, Edit3, FolderOpen, GitBranch, GitCommitHorizontal, LoaderCircle, MessageSquareText, PanelLeftOpen, Play, Send, Square } from "lucide-react";
 import { AgentPane } from "@/components/app/AgentPane";
 import { getActivity, InlineSelect, isBusyActivity, isTurnBusy, TranscriptCard } from "@/components/app/SessionUi";
 import type { ChatTranscriptRow } from "@/components/app/useChatTranscript";
+import type { SessionPane } from "@/components/app/useSessionFiles";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { Textarea } from "@/components/ui/textarea";
 import type {
   AgentDetails,
@@ -13,9 +16,11 @@ import type {
   ProjectFileBrowseResult,
   ProjectFileReadResult,
   ProjectNotification,
+  ProjectRunPolicy,
   ProjectSummary,
   SessionDetails,
 } from "@/lib/types";
+import { formatDateTime } from "@/lib/utils";
 
 const FilePaneLazy = lazy(() => import("../session/FilePane"));
 
@@ -23,8 +28,8 @@ export function AppMainPane(props: {
   sessionsCollapsed: boolean;
   onExpandSessions: () => void;
   sidebarMode: "sessions" | "agents";
-  sessionPane: "chat" | "files";
-  setSessionPane: (value: "chat" | "files") => void;
+  sessionPane: SessionPane;
+  setSessionPane: (value: SessionPane) => void;
   activeSessionId: string | null;
   activeSession: SessionDetails | null;
   activeProject: ProjectSummary | null;
@@ -33,7 +38,7 @@ export function AppMainPane(props: {
   activeProjectId: string | null;
   onOpenFilesPane: () => void;
   onPauseProject: () => void;
-  onRunProject: () => void;
+  onRunProject: (runPolicy: ProjectRunPolicy) => void;
   renameSessionOpen: boolean;
   setRenameSessionOpen: (value: boolean) => void;
   renameTitle: string;
@@ -102,6 +107,19 @@ export function AppMainPane(props: {
     sessionLoading: props.sessionLoading,
     sendingMessage: props.sendingMessage,
   });
+  const [runProjectOpen, setRunProjectOpen] = useState(false);
+  const [runPolicyMode, setRunPolicyMode] = useState<ProjectRunPolicy["mode"]>("until_blocked");
+  const [runPolicyUntil, setRunPolicyUntil] = useState("");
+
+  useEffect(() => {
+    if (!props.activeProject) {
+      setRunPolicyMode("until_blocked");
+      setRunPolicyUntil("");
+      return;
+    }
+    setRunPolicyMode(props.activeProject.runPolicy.mode);
+    setRunPolicyUntil(toDateTimeLocalValue(props.activeProject.runPolicy.runUntil));
+  }, [props.activeProject?.id, props.activeProject?.runPolicy.mode, props.activeProject?.runPolicy.runUntil]);
 
   return (
     <main className="grid min-h-0 min-w-0 grid-rows-[auto_minmax(0,1fr)_auto]">
@@ -134,6 +152,16 @@ export function AppMainPane(props: {
                 <FolderOpen className="h-3.5 w-3.5" />
                 Files
               </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className={props.sessionPane === "git" ? "h-7 bg-card px-2 text-xs shadow-sm" : "h-7 px-2 text-xs"}
+                onClick={() => props.setSessionPane("git")}
+                disabled={!props.activeSessionId}
+              >
+                <GitBranch className="h-3.5 w-3.5" />
+                Git
+              </Button>
             </div>
           ) : null}
           <div className="min-w-0">
@@ -161,10 +189,63 @@ export function AppMainPane(props: {
                 Pause Project
               </Button>
             ) : (
-              <Button size="sm" className="h-8 px-2" onClick={props.onRunProject}>
-                <Play className="h-3.5 w-3.5" />
-                Run Project
-              </Button>
+              <Dialog open={runProjectOpen} onOpenChange={setRunProjectOpen}>
+                <DialogTrigger asChild>
+                  <Button size="sm" className="h-8 px-2">
+                    <Play className="h-3.5 w-3.5" />
+                    Run Project
+                  </Button>
+                </DialogTrigger>
+                <DialogContent className="max-w-[460px] md:w-full">
+                  <DialogHeader>
+                    <DialogTitle>Run Project</DialogTitle>
+                    <DialogDescription>Choose the run policy before starting automation.</DialogDescription>
+                  </DialogHeader>
+                  <div className="grid gap-3 p-4">
+                    <div className="grid gap-2">
+                      <div className="text-sm font-medium">Run Policy</div>
+                      <select
+                        className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
+                        value={runPolicyMode}
+                        onChange={(event) => setRunPolicyMode(event.target.value as ProjectRunPolicy["mode"])}
+                      >
+                        <option value="until_blocked">Until Blocked</option>
+                        <option value="until_complete">Until Complete</option>
+                        <option value="until_time">Until Time</option>
+                      </select>
+                    </div>
+                    {runPolicyMode === "until_time" ? (
+                      <div className="grid gap-2">
+                        <div className="text-sm font-medium">Run Until</div>
+                        <Input
+                          type="datetime-local"
+                          value={runPolicyUntil}
+                          onChange={(event) => setRunPolicyUntil(event.target.value)}
+                        />
+                      </div>
+                    ) : null}
+                    <div className="flex justify-end">
+                      <Button
+                        size="sm"
+                        disabled={runPolicyMode === "until_time" && !runPolicyUntil}
+                        onClick={() => {
+                          props.onRunProject({
+                            mode: runPolicyMode,
+                            runUntil:
+                              runPolicyMode === "until_time" && runPolicyUntil
+                                ? new Date(runPolicyUntil).toISOString()
+                                : undefined,
+                          });
+                          setRunProjectOpen(false);
+                        }}
+                      >
+                        <Play className="h-3.5 w-3.5" />
+                        Start
+                      </Button>
+                    </div>
+                  </div>
+                </DialogContent>
+              </Dialog>
             )
           ) : null}
           <Dialog open={props.renameSessionOpen} onOpenChange={props.setRenameSessionOpen}>
@@ -238,6 +319,24 @@ export function AppMainPane(props: {
           </Suspense>
           <div className="flex items-center justify-between gap-2 border-t border-border px-3 py-2">
             <div className="truncate text-[11px] text-muted-foreground">{props.activeSession ? props.activeSession.cwd : props.cwd}</div>
+            <Button variant="outline" size="sm" className="h-7 px-2" onClick={() => props.setSessionPane("chat")}>
+              <MessageSquareText className="h-3.5 w-3.5" />
+              Back to Chat
+            </Button>
+          </div>
+        </>
+      ) : props.sessionPane === "git" ? (
+        <>
+          <ScrollArea className="min-h-0 bg-muted/10">
+            <div className="mx-auto grid w-full max-w-[1200px] gap-4 p-4">
+              <GitSessionPane session={props.activeSession} />
+            </div>
+          </ScrollArea>
+          <div className="flex items-center justify-between gap-2 border-t border-border px-3 py-2">
+            <div className="truncate text-[11px] text-muted-foreground">
+              {props.activeSession?.git?.branch ? `${props.activeSession.git.branch} · ` : ""}
+              {props.activeSession ? props.activeSession.cwd : props.cwd}
+            </div>
             <Button variant="outline" size="sm" className="h-7 px-2" onClick={() => props.setSessionPane("chat")}>
               <MessageSquareText className="h-3.5 w-3.5" />
               Back to Chat
@@ -375,4 +474,91 @@ export function AppMainPane(props: {
       )}
     </main>
   );
+}
+
+function GitSessionPane({ session }: { session: SessionDetails | null }) {
+  if (!session) {
+    return (
+      <div className="rounded-xl border border-dashed border-border p-5 text-sm text-muted-foreground">
+        Select a session to view git details.
+      </div>
+    );
+  }
+
+  const details = session.gitDetails;
+  if (!details?.isRepo) {
+    return (
+      <div className="rounded-xl border border-dashed border-border p-5 text-sm text-muted-foreground">
+        This session directory is not a git repository.
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="rounded-xl border border-border bg-card p-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="outline">
+            <GitBranch className="h-3.5 w-3.5" />
+            {details.branch || "detached"}
+          </Badge>
+          <Badge variant="outline">Modified {details.modifiedFileCount}</Badge>
+          <Badge variant="outline">Staged {details.stagedFileCount}</Badge>
+          <Badge variant="outline">Untracked {details.untrackedFileCount}</Badge>
+        </div>
+        {details.head ? (
+          <div className="mt-4 rounded-lg border border-border/70 bg-muted/20 p-3">
+            <div className="flex items-center gap-2 text-xs uppercase tracking-[0.14em] text-muted-foreground">
+              <GitCommitHorizontal className="h-3.5 w-3.5" />
+              Latest Commit
+            </div>
+            <div className="mt-2 text-sm font-medium">{details.head.subject || details.head.hash}</div>
+            <div className="mt-1 text-xs text-muted-foreground">
+              {details.head.hash.slice(0, 12)}
+              {details.head.committedAt ? ` · ${formatDateTime(details.head.committedAt)}` : ""}
+            </div>
+          </div>
+        ) : null}
+      </div>
+      <GitFileList title="Modified Files" files={details.modifiedFiles} />
+      <GitFileList title="Staged Files" files={details.stagedFiles} />
+      <GitFileList title="Untracked Files" files={details.untrackedFiles} />
+    </>
+  );
+}
+
+function GitFileList({ title, files }: { title: string; files: string[] }) {
+  return (
+    <div className="rounded-xl border border-border bg-card p-4">
+      <div className="text-sm font-medium">{title}</div>
+      {files.length ? (
+        <div className="mt-3 grid gap-2">
+          {files.map((file) => (
+            <div
+              key={`${title}-${file}`}
+              className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2 text-sm leading-6 break-all"
+            >
+              {file}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="mt-3 text-sm text-muted-foreground">No files</div>
+      )}
+    </div>
+  );
+}
+
+function toDateTimeLocalValue(value?: string) {
+  if (!value) {
+    return "";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "";
+  }
+
+  const offsetMs = parsed.getTimezoneOffset() * 60_000;
+  return new Date(parsed.getTime() - offsetMs).toISOString().slice(0, 16);
 }
