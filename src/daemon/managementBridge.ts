@@ -16,6 +16,8 @@ export class ManagementBridge {
   private readonly sessionManager: SessionManager;
   private socket?: WebSocket;
   private reconnectTimer?: NodeJS.Timeout;
+  private eventFlushTimer?: NodeJS.Timeout;
+  private readonly pendingEvents: unknown[] = [];
 
   constructor(sessionManager: SessionManager, options: BridgeOptions) {
     this.sessionManager = sessionManager;
@@ -27,11 +29,7 @@ export class ManagementBridge {
   start(): void {
     this.connect();
     this.sessionManager.on("event", (event) => {
-      this.send({
-        type: "daemon-event",
-        daemonId: this.daemonId,
-        event,
-      });
+      this.enqueueEvent(event);
     });
   }
 
@@ -99,6 +97,7 @@ export class ManagementBridge {
   }
 
   private sendHello(): void {
+    this.flushPendingEvents();
     this.send({
       type: "daemon-hello",
       daemon: {
@@ -112,6 +111,29 @@ export class ManagementBridge {
         sessionCount: this.sessionManager.list().length,
       },
       sessions: this.sessionManager.list(),
+    });
+  }
+
+  private enqueueEvent(event: unknown): void {
+    this.pendingEvents.push(event);
+    if (this.eventFlushTimer) {
+      return;
+    }
+    this.eventFlushTimer = setTimeout(() => {
+      this.eventFlushTimer = undefined;
+      this.flushPendingEvents();
+    }, 16);
+  }
+
+  private flushPendingEvents(): void {
+    if (!this.pendingEvents.length) {
+      return;
+    }
+    const events = this.pendingEvents.splice(0, this.pendingEvents.length);
+    this.send({
+      type: "daemon-events",
+      daemonId: this.daemonId,
+      events,
     });
   }
 

@@ -315,6 +315,19 @@ daemonWss.on("connection", (socket) => {
         daemonId,
         event: payload.event,
       });
+      return;
+    }
+
+    if (payload.type === "daemon-events" && daemonId && Array.isArray(payload.events)) {
+      const current = daemons.get(daemonId);
+      if (current) {
+        current.descriptor.lastSeenAt = new Date().toISOString();
+      }
+      broadcast({
+        type: "daemon-events",
+        daemonId,
+        events: payload.events,
+      });
     }
   });
 

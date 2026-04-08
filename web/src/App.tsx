@@ -1,7 +1,5 @@
-import { type UIEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, type UIEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import {
   AlertCircle,
   ArrowDown,
@@ -10,12 +8,8 @@ import {
   ChevronUp,
   Circle,
   Edit3,
-  FileCode2,
-  FileImage,
-  FileText,
   Folder,
   FolderOpen,
-  GitCommitHorizontal,
   History,
   LayoutGrid,
   LoaderCircle,
@@ -24,7 +18,6 @@ import {
   PanelLeftOpen,
   Play,
   Plus,
-  Save,
   Send,
   Server,
   Square,
@@ -65,6 +58,9 @@ const WORKSPACE_STORAGE_KEY = "ohmyvibe-workspaces";
 const TOOL_LINE_LIMIT = 30;
 const TRANSCRIPT_INITIAL_COUNT = 80;
 const TRANSCRIPT_CHUNK_SIZE = 60;
+const MarkdownBodyLazy = lazy(() => import("./components/chat/MarkdownBody"));
+const DiffViewerLazy = lazy(() => import("./components/chat/DiffViewer"));
+const FilePaneLazy = lazy(() => import("./components/session/FilePane"));
 
 type ThemeMode = "light" | "dark";
 
@@ -201,7 +197,8 @@ function App() {
         | { type: "hello"; sessions: SessionSummary[] }
         | { type: "daemon-connected"; daemon: DaemonDescriptor }
         | { type: "daemon-disconnected"; daemonId: string }
-        | { type: "daemon-event"; daemonId: string; event: DaemonEvent };
+        | { type: "daemon-event"; daemonId: string; event: DaemonEvent }
+        | { type: "daemon-events"; daemonId: string; events: DaemonEvent[] };
 
       if (payload.type === "hello") {
         const nextDaemons = Array.isArray((payload as { daemons?: DaemonDescriptor[] }).daemons)
@@ -229,8 +226,15 @@ function App() {
         return;
       }
 
-      if (payload.type === "daemon-event" && payload.daemonId === activeDaemonId) {
-        const event = payload.event;
+      const incomingEvents =
+        payload.type === "daemon-event" && payload.daemonId === activeDaemonId
+          ? [payload.event]
+          : payload.type === "daemon-events" && payload.daemonId === activeDaemonId
+            ? payload.events
+            : null;
+
+      if (incomingEvents) {
+        for (const event of incomingEvents) {
         if (event.type === "session-created" || event.type === "session-updated") {
           setSessions((current) => upsertSessionSummary(current, event.session));
           setSessionDetailsById((current) => {
@@ -265,22 +269,54 @@ function App() {
             if (!existing) {
               return current;
             }
-            const nextTranscript = [...existing.transcript, event.entry];
             return {
               ...current,
-              [event.sessionId]: {
-                ...existing,
-                transcript: nextTranscript,
-                transcriptCount: nextTranscript.length,
-              },
+              [event.sessionId]: appendTranscriptEntry(existing, event.entry),
             };
           });
           setActiveSession((current) => {
             if (!current || current.id !== event.sessionId) {
               return current;
             }
-            const nextTranscript = [...current.transcript, event.entry];
-            return { ...current, transcript: nextTranscript, transcriptCount: nextTranscript.length };
+            return appendTranscriptEntry(current, event.entry);
+          });
+          return;
+        }
+        if (event.type === "session-entry-updated") {
+          setSessionDetailsById((current) => {
+            const existing = current[event.sessionId];
+            if (!existing) {
+              return current;
+            }
+            return {
+              ...current,
+              [event.sessionId]: updateTranscriptEntry(existing, event.entry),
+            };
+          });
+          setActiveSession((current) => {
+            if (!current || current.id !== event.sessionId) {
+              return current;
+            }
+            return updateTranscriptEntry(current, event.entry);
+          });
+          return;
+        }
+        if (event.type === "session-entries-updated") {
+          setSessionDetailsById((current) => {
+            const existing = current[event.sessionId];
+            if (!existing) {
+              return current;
+            }
+            return {
+              ...current,
+              [event.sessionId]: updateTranscriptEntries(existing, event.entries, event.removedEntryIds),
+            };
+          });
+          setActiveSession((current) => {
+            if (!current || current.id !== event.sessionId) {
+              return current;
+            }
+            return updateTranscriptEntries(current, event.entries, event.removedEntryIds);
           });
           return;
         }
@@ -304,6 +340,7 @@ function App() {
               ? { ...current, transcript: event.transcript, transcriptCount: event.transcript.length }
               : current,
           );
+        }
         }
       }
     };
@@ -1506,134 +1543,30 @@ function App() {
 
               {sessionPane === "files" ? (
                 <>
-                  <div className="grid min-h-0 grid-cols-1 bg-muted/10 md:grid-cols-[280px_minmax(0,1fr)]">
-                    <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] border-b border-border md:border-r md:border-b-0">
-                      <div className="grid gap-2 border-b border-border px-3 py-3">
-                        <div className="truncate text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-                          Project Files
-                        </div>
-                        <div className="truncate text-xs text-muted-foreground">
-                          {projectFiles?.currentPath || activeSession?.cwd || ""}
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            className="h-7 px-2"
-                            disabled={!projectFiles?.parentPath || projectFilesLoading}
-                            onClick={() => void handleBrowseProjectPath(projectFiles?.parentPath)}
-                          >
-                            <ArrowUp className="h-3.5 w-3.5" />
-                            Up
-                          </Button>
-                          {projectFilesLoading ? (
-                            <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
-                              <LoaderCircle className="h-3 w-3 animate-spin" />
-                              Loading
-                            </div>
-                          ) : null}
-                        </div>
+                  <Suspense
+                    fallback={
+                      <div className="flex min-h-0 items-center justify-center bg-muted/10 p-4 text-sm text-muted-foreground">
+                        <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+                        Loading file pane
                       </div>
-                      <ScrollArea>
-                        <div className="grid gap-1 p-2">
-                          {!projectFilesLoading && !projectFiles?.entries.length ? (
-                            <div className="px-2 py-2 text-sm text-muted-foreground">No files</div>
-                          ) : null}
-                          {projectFiles?.entries.map((entry) => (
-                            <button
-                              key={entry.path}
-                              type="button"
-                              className={[
-                                "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-accent/50",
-                                selectedFile?.path === entry.path ? "bg-accent/60" : "",
-                              ].join(" ")}
-                              onClick={() =>
-                                entry.kind === "directory"
-                                  ? void handleBrowseProjectPath(entry.path)
-                                  : void handleOpenProjectFile(entry.path)
-                              }
-                            >
-                              {entry.kind === "directory" ? (
-                                <Folder className="h-4 w-4 shrink-0 text-muted-foreground" />
-                              ) : getProjectFileIcon(entry.path)}
-                              <div className="min-w-0 flex-1 truncate">{entry.name}</div>
-                              {entry.kind === "file" && typeof entry.size === "number" ? (
-                                <div className="shrink-0 text-[10px] text-muted-foreground">
-                                  {formatFileSize(entry.size)}
-                                </div>
-                              ) : null}
-                            </button>
-                          ))}
-                        </div>
-                      </ScrollArea>
-                    </div>
-
-                    <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)]">
-                      <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
-                        <div className="min-w-0 truncate text-xs text-muted-foreground">
-                          {selectedFile?.path || "Select a file"}
-                        </div>
-                        <div className="flex items-center gap-2">
-                          {selectedFile?.kind === "text" ? (
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              className="h-7 px-2"
-                              onClick={handleQuoteFileSelection}
-                            >
-                              <FileCode2 className="h-3.5 w-3.5" />
-                              Quote
-                            </Button>
-                          ) : null}
-                          {selectedFile?.kind === "text" ? (
-                            <Button
-                              type="button"
-                              size="sm"
-                              className="h-7 px-2"
-                              onClick={() => void handleSaveProjectFile()}
-                              disabled={savingFile}
-                            >
-                              {savingFile ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
-                              Save
-                            </Button>
-                          ) : null}
-                        </div>
-                      </div>
-                      <div className="min-h-0 overflow-auto">
-                        {selectedFileLoading ? (
-                          <div className="flex h-full items-center justify-center px-4 py-4 text-sm text-muted-foreground">
-                            <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
-                            Loading file
-                          </div>
-                        ) : selectedFile?.kind === "image" ? (
-                          <div className="flex h-full items-start justify-center p-4">
-                            <img
-                              src={selectedFile.content}
-                              alt={selectedFile.path}
-                              className="max-h-full max-w-full rounded-md border border-border bg-background object-contain"
-                            />
-                          </div>
-                        ) : selectedFile?.kind === "binary" ? (
-                          <div className="flex h-full items-center justify-center p-4 text-sm text-muted-foreground">
-                            Binary preview is not supported
-                          </div>
-                        ) : selectedFile?.kind === "text" ? (
-                          <Textarea
-                            id="project-file-editor"
-                            value={fileEditorValue}
-                            onChange={(event) => setFileEditorValue(event.target.value)}
-                            className="h-full min-h-full w-full resize-none border-0 rounded-none bg-transparent px-4 py-3 font-mono text-[12px] leading-6 shadow-none focus-visible:ring-0"
-                          />
-                        ) : (
-                          <div className="flex h-full items-center justify-center p-4 text-sm text-muted-foreground">
-                            Select a file to preview
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  </div>
+                    }
+                  >
+                    <FilePaneLazy
+                      projectFiles={projectFiles}
+                      projectFilesLoading={projectFilesLoading}
+                      selectedFile={selectedFile}
+                      selectedFileLoading={selectedFileLoading}
+                      fileEditorValue={fileEditorValue}
+                      savingFile={savingFile}
+                      activeSession={activeSession}
+                      cwd={cwd}
+                      onBrowseProjectPath={(value?: string) => void handleBrowseProjectPath(value)}
+                      onOpenProjectFile={(filePath: string) => void handleOpenProjectFile(filePath)}
+                      onQuoteFileSelection={handleQuoteFileSelection}
+                      onSaveProjectFile={() => void handleSaveProjectFile()}
+                      onFileEditorValueChange={setFileEditorValue}
+                    />
+                  </Suspense>
                   <div className="flex items-center justify-between gap-2 border-t border-border px-3 py-2">
                     <div className="truncate text-[11px] text-muted-foreground">
                       {activeSession ? activeSession.cwd : cwd}
@@ -2240,57 +2173,29 @@ function ApprovalBody({ entry }: { entry: TranscriptEntry }) {
 
 function MarkdownBody({ text, muted = false }: { text: string; muted?: boolean }) {
   return (
-    <div className={muted ? "markdown-body text-sm leading-6 text-muted-foreground" : "markdown-body text-sm leading-6"}>
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          code(props) {
-            const { children, className } = props;
-            const inline = !className;
-            if (inline) {
-              return <code className="rounded bg-muted px-1 py-0.5 font-mono text-[0.92em]">{children}</code>;
-            }
-            return (
-              <pre className="overflow-auto rounded-md border border-border bg-background/70 p-3">
-                <code className={className}>{children}</code>
-              </pre>
-            );
-          },
-        }}
-      >
-        {text}
-      </ReactMarkdown>
-    </div>
+    <Suspense
+      fallback={
+        <div className={muted ? "markdown-body text-sm leading-6 text-muted-foreground" : "markdown-body text-sm leading-6"}>
+          {text}
+        </div>
+      }
+    >
+      <MarkdownBodyLazy text={text} muted={muted} />
+    </Suspense>
   );
 }
 
 function DiffViewer({ text }: { text: string }) {
-  const sections = parseDiffSections(text);
-
   return (
-    <div className="divide-y divide-border">
-      {sections.map((section, index) => (
-        <div key={`${section.path}-${index}`} className="overflow-hidden">
-          <div className="flex items-center gap-2 border-b border-border bg-muted/40 px-3 py-2 text-xs font-medium">
-            <GitCommitHorizontal className="h-3.5 w-3.5" />
-            <span className="truncate">{section.path || `Change ${index + 1}`}</span>
-          </div>
-          <div className="font-mono text-xs leading-5">
-            {section.lines.map((line, lineIndex) => (
-              <div
-                key={`${section.path}-${lineIndex}`}
-                className={getDiffLineClassName(line)}
-              >
-                <span className="select-none pr-3 text-[10px] text-muted-foreground/70">
-                  {lineIndex + 1}
-                </span>
-                <span className="whitespace-pre-wrap break-words">{line || " "}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      ))}
-    </div>
+    <Suspense
+      fallback={
+        <pre className="overflow-auto p-3 font-mono text-xs leading-5 whitespace-pre-wrap">
+          {text}
+        </pre>
+      }
+    >
+      <DiffViewerLazy text={text} />
+    </Suspense>
   );
 }
 
@@ -2605,124 +2510,11 @@ function getOverviewEntryPreviewText(entry: TranscriptEntry) {
   return collapsed || getOverviewEntryLabel(entry);
 }
 
-function getProjectFileIcon(filePath: string) {
-  const extension = pathLikeExtension(filePath);
-  if (["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico"].includes(extension)) {
-    return <FileImage className="h-4 w-4 shrink-0 text-muted-foreground" />;
-  }
-  if (
-    [
-      "ts",
-      "tsx",
-      "js",
-      "jsx",
-      "json",
-      "css",
-      "html",
-      "md",
-      "py",
-      "rs",
-      "go",
-      "java",
-      "c",
-      "cpp",
-      "h",
-      "hpp",
-      "yml",
-      "yaml",
-      "toml",
-      "sh",
-      "ps1",
-    ].includes(extension)
-  ) {
-    return <FileCode2 className="h-4 w-4 shrink-0 text-muted-foreground" />;
-  }
-  return <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />;
-}
-
 function pathLikeExtension(filePath: string) {
   const normalized = String(filePath || "").replace(/\\/g, "/");
   const lastSegment = normalized.split("/").pop() || "";
   const parts = lastSegment.split(".");
   return parts.length > 1 ? parts.pop()!.toLowerCase() : "";
-}
-
-function formatFileSize(size: number) {
-  if (size < 1024) {
-    return `${size} B`;
-  }
-  if (size < 1024 * 1024) {
-    return `${(size / 1024).toFixed(1)} KB`;
-  }
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function parseDiffSections(text: string) {
-  const lines = String(text || "").split(/\r?\n/);
-  const sections: Array<{ path: string; lines: string[] }> = [];
-  let current: { path: string; lines: string[] } | null = null;
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index] ?? "";
-
-    if (line.startsWith("diff --git ")) {
-      const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
-      current = {
-        path: match?.[2] || match?.[1] || line,
-        lines: [line],
-      };
-      sections.push(current);
-      continue;
-    }
-
-    if (!current) {
-      const nextLine = lines[index + 1] ?? "";
-      if (line && !isDiffLine(line) && (isDiffLine(nextLine) || nextLine.startsWith("diff --git "))) {
-        current = { path: line, lines: [] };
-        sections.push(current);
-        continue;
-      }
-      current = { path: "output", lines: [] };
-      sections.push(current);
-    }
-
-    current.lines.push(line);
-  }
-
-  return sections.filter((section) => section.lines.length || section.path);
-}
-
-function isDiffLine(line: string) {
-  return (
-    line.startsWith("@@") ||
-    line.startsWith("+") ||
-    line.startsWith("-") ||
-    line.startsWith(" ") ||
-    line.startsWith("---") ||
-    line.startsWith("+++") ||
-    line.startsWith("index ") ||
-    line.startsWith("new file mode") ||
-    line.startsWith("deleted file mode")
-  );
-}
-
-function getDiffLineClassName(line: string) {
-  if (line.startsWith("@@")) {
-    return "grid grid-cols-[auto_1fr] gap-0 border-b border-border/60 bg-blue-500/8 px-3 py-1 text-blue-700 dark:text-blue-300";
-  }
-  if (line.startsWith("+++")) {
-    return "grid grid-cols-[auto_1fr] gap-0 bg-emerald-500/10 px-3 py-1 text-emerald-800 dark:text-emerald-300";
-  }
-  if (line.startsWith("---")) {
-    return "grid grid-cols-[auto_1fr] gap-0 bg-rose-500/10 px-3 py-1 text-rose-800 dark:text-rose-300";
-  }
-  if (line.startsWith("+")) {
-    return "grid grid-cols-[auto_1fr] gap-0 bg-emerald-500/8 px-3 py-1 text-emerald-800 dark:text-emerald-200";
-  }
-  if (line.startsWith("-")) {
-    return "grid grid-cols-[auto_1fr] gap-0 bg-rose-500/8 px-3 py-1 text-rose-800 dark:text-rose-200";
-  }
-  return "grid grid-cols-[auto_1fr] gap-0 px-3 py-1 text-foreground/90";
 }
 
 function formatEffortLabel(value: string) {
@@ -2752,6 +2544,65 @@ function upsertSessionSummary(current: SessionSummary[], session: SessionSummary
   const next = [...current];
   next[index] = { ...next[index], ...session };
   return next.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+function appendTranscriptEntry(details: SessionDetails, entry: TranscriptEntry): SessionDetails {
+  if (details.transcript.some((item) => item.id === entry.id)) {
+    return updateTranscriptEntry(details, entry);
+  }
+  const transcript = [...details.transcript, entry];
+  return {
+    ...details,
+    transcript,
+    transcriptCount: transcript.length,
+  };
+}
+
+function updateTranscriptEntry(details: SessionDetails, entry: TranscriptEntry): SessionDetails {
+  const index = details.transcript.findIndex((item) => item.id === entry.id);
+  if (index === -1) {
+    return appendTranscriptEntry(details, entry);
+  }
+  const transcript = [...details.transcript];
+  transcript[index] = {
+    ...transcript[index],
+    ...entry,
+  };
+  return {
+    ...details,
+    transcript,
+    transcriptCount: transcript.length,
+  };
+}
+
+function updateTranscriptEntries(
+  details: SessionDetails,
+  entries: TranscriptEntry[],
+  removedEntryIds?: string[],
+): SessionDetails {
+  const nextById = new Map(details.transcript.map((entry) => [entry.id, entry]));
+  for (const entry of entries) {
+    const existing = nextById.get(entry.id);
+    nextById.set(entry.id, existing ? { ...existing, ...entry } : entry);
+  }
+  if (removedEntryIds?.length) {
+    for (const entryId of removedEntryIds) {
+      nextById.delete(entryId);
+    }
+  }
+  const transcript = details.transcript
+    .filter((entry) => nextById.has(entry.id))
+    .map((entry) => nextById.get(entry.id) ?? entry);
+  for (const entry of entries) {
+    if (!details.transcript.some((item) => item.id === entry.id) && nextById.has(entry.id)) {
+      transcript.push(nextById.get(entry.id)!);
+    }
+  }
+  return {
+    ...details,
+    transcript,
+    transcriptCount: transcript.length,
+  };
 }
 
 function upsertDaemon(current: DaemonDescriptor[], daemon: DaemonDescriptor) {

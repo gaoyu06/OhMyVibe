@@ -144,6 +144,17 @@ export type DaemonEvent =
       entry: TranscriptEntry;
     }
   | {
+      type: "session-entry-updated";
+      sessionId: string;
+      entry: TranscriptEntry;
+    }
+  | {
+      type: "session-entries-updated";
+      sessionId: string;
+      entries: TranscriptEntry[];
+      removedEntryIds?: string[];
+    }
+  | {
       type: "session-reset";
       sessionId: string;
       transcript: TranscriptEntry[];
