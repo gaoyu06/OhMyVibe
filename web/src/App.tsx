@@ -145,7 +145,6 @@ function App() {
   const [overviewLayouts, setOverviewLayouts] = useState<OverviewLayoutStore>(() => loadOverviewLayouts());
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [activeSession, setActiveSession] = useState<SessionDetails | null>(null);
-  const [sessionDetailsById, setSessionDetailsById] = useState<Record<string, SessionDetails>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [historyLoading, setHistoryLoading] = useState(false);
   const [sessionLoading, setSessionLoading] = useState(false);
@@ -184,10 +183,15 @@ function App() {
   const stickToBottomRef = useRef(true);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
+  const activeDaemonIdRef = useRef<string | null>(null);
+  const activeSessionIdRef = useRef<string | null>(null);
   const latestSubscriptionRef = useRef<{ daemonId: string | null; sessionId: string | null }>({
     daemonId: null,
     sessionId: null,
   });
+  const queuedActiveSessionEventsRef = useRef<DaemonEvent[]>([]);
+  const queuedActiveSessionFlushRef = useRef<number | null>(null);
+  const loadSessionRequestIdRef = useRef(0);
   const overviewDragRef = useRef<{
     sessionId: string;
     key: string;
@@ -199,6 +203,34 @@ function App() {
     scrollTop: number;
   } | null>(null);
   const subscribedSessionId = viewMode === "chat" ? activeSessionId : null;
+
+  const flushQueuedActiveSessionEvents = () => {
+    const queuedEvents = queuedActiveSessionEventsRef.current;
+    queuedActiveSessionEventsRef.current = [];
+    if (queuedActiveSessionFlushRef.current !== null) {
+      window.clearTimeout(queuedActiveSessionFlushRef.current);
+      queuedActiveSessionFlushRef.current = null;
+    }
+    if (!queuedEvents.length) {
+      return;
+    }
+    setActiveSession((current) => applyQueuedActiveSessionEvents(current, queuedEvents));
+  };
+
+  const queueActiveSessionEvent = (event: DaemonEvent) => {
+    if (!("sessionId" in event) || event.sessionId !== activeSessionIdRef.current) {
+      return;
+    }
+
+    queuedActiveSessionEventsRef.current.push(event);
+    if (queuedActiveSessionFlushRef.current !== null) {
+      return;
+    }
+
+    queuedActiveSessionFlushRef.current = window.setTimeout(() => {
+      flushQueuedActiveSessionEvents();
+    }, 32);
+  };
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
@@ -281,16 +313,6 @@ function App() {
         for (const event of incomingEvents) {
           if (event.type === "session-created" || event.type === "session-updated") {
             setSessions((current) => upsertSessionSummary(current, event.session));
-            setSessionDetailsById((current) => {
-              const existing = current[event.session.id];
-              if (!existing) {
-                return current;
-              }
-              return {
-                ...current,
-                [event.session.id]: { ...existing, ...event.session },
-              };
-            });
             setActiveSession((current) =>
               current && current.id === event.session.id ? { ...current, ...event.session } : current,
             );
@@ -299,96 +321,28 @@ function App() {
 
           if (event.type === "session-deleted") {
             setSessions((current) => current.filter((session) => session.id !== event.sessionId));
-            setSessionDetailsById((current) => {
-              const next = { ...current };
-              delete next[event.sessionId];
-              return next;
-            });
             setActiveSession((current) => (current?.id === event.sessionId ? null : current));
             setActiveSessionId((current) => (current === event.sessionId ? null : current));
             continue;
           }
 
           if (event.type === "session-entry") {
-            setSessionDetailsById((current) => {
-              const existing = current[event.sessionId];
-              if (!existing) {
-                return current;
-              }
-              return {
-                ...current,
-                [event.sessionId]: appendTranscriptEntry(existing, event.entry),
-              };
-            });
-            setActiveSession((current) => {
-              if (!current || current.id !== event.sessionId) {
-                return current;
-              }
-              return appendTranscriptEntry(current, event.entry);
-            });
+            queueActiveSessionEvent(event);
             continue;
           }
 
           if (event.type === "session-entry-updated") {
-            setSessionDetailsById((current) => {
-              const existing = current[event.sessionId];
-              if (!existing) {
-                return current;
-              }
-              return {
-                ...current,
-                [event.sessionId]: updateTranscriptEntry(existing, event.entry),
-              };
-            });
-            setActiveSession((current) => {
-              if (!current || current.id !== event.sessionId) {
-                return current;
-              }
-              return updateTranscriptEntry(current, event.entry);
-            });
+            queueActiveSessionEvent(event);
             continue;
           }
 
           if (event.type === "session-entries-updated") {
-            setSessionDetailsById((current) => {
-              const existing = current[event.sessionId];
-              if (!existing) {
-                return current;
-              }
-              return {
-                ...current,
-                [event.sessionId]: updateTranscriptEntries(existing, event.entries, event.removedEntryIds),
-              };
-            });
-            setActiveSession((current) => {
-              if (!current || current.id !== event.sessionId) {
-                return current;
-              }
-              return updateTranscriptEntries(current, event.entries, event.removedEntryIds);
-            });
+            queueActiveSessionEvent(event);
             continue;
           }
 
           if (event.type === "session-reset") {
-            setSessionDetailsById((current) => {
-              const existing = current[event.sessionId];
-              if (!existing) {
-                return current;
-              }
-              return {
-                ...current,
-                [event.sessionId]: {
-                  ...existing,
-                  transcript: event.transcript,
-                  transcriptCount: event.transcript.length,
-                },
-              };
-            });
-            setActiveSession((current) =>
-              current && current.id === event.sessionId
-                ? { ...current, transcript: event.transcript, transcriptCount: event.transcript.length }
-                : current,
-            );
+            queueActiveSessionEvent(event);
           }
         }
       }
@@ -402,6 +356,27 @@ function App() {
       ws.close();
     };
   }, [controlUrl]);
+
+  useEffect(() => {
+    activeDaemonIdRef.current = activeDaemonId;
+  }, [activeDaemonId]);
+
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+    queuedActiveSessionEventsRef.current = [];
+    if (queuedActiveSessionFlushRef.current !== null) {
+      window.clearTimeout(queuedActiveSessionFlushRef.current);
+      queuedActiveSessionFlushRef.current = null;
+    }
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    return () => {
+      if (queuedActiveSessionFlushRef.current !== null) {
+        window.clearTimeout(queuedActiveSessionFlushRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const nextSubscription = {
@@ -418,7 +393,6 @@ function App() {
       setSessions([]);
       setActiveSession(null);
       setActiveSessionId(null);
-      setSessionDetailsById({});
       return;
     }
     void loadConfig(activeDaemonId);
@@ -439,16 +413,6 @@ function App() {
     setSendingMessage(false);
     stickToBottomRef.current = true;
     setShowScrollToBottom(false);
-  }, [activeSessionId]);
-
-  useEffect(() => {
-    setSessionDetailsById((current) => {
-      if (!activeSessionId) {
-        return {};
-      }
-      const activeDetails = current[activeSessionId];
-      return activeDetails ? { [activeSessionId]: activeDetails } : {};
-    });
   }, [activeSessionId]);
 
   useEffect(() => {
@@ -561,8 +525,7 @@ function App() {
   const overviewSessions = useMemo(
     () =>
       [...visibleSessions]
-        .filter((session) => session.status !== "closed")
-        .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)),
+        .filter((session) => session.status !== "closed"),
     [visibleSessions],
   );
   const overviewLayoutKey = activeDaemonId && activeWorkspace ? `${activeDaemonId}:${activeWorkspace.id}` : "";
@@ -667,6 +630,15 @@ function App() {
     }
   }, [activeDaemonId, activeSessionId, activeWorkspace, visibleSessions]);
 
+  useEffect(() => {
+    if (!activeSessionId) {
+      setActiveSession(null);
+      return;
+    }
+
+    setActiveSession((current) => (current?.id === activeSessionId ? current : null));
+  }, [activeSessionId]);
+
   useLayoutEffect(() => {
     const scrollElement = transcriptRef.current;
     const pending = prependPendingRef.current;
@@ -750,16 +722,21 @@ function App() {
   }
 
   async function loadSession(daemonId: string, sessionId: string) {
+    const requestId = loadSessionRequestIdRef.current + 1;
+    loadSessionRequestIdRef.current = requestId;
     setSessionLoading(true);
     try {
       const session = await api<SessionDetails>(`/api/daemons/${daemonId}/sessions/${sessionId}`);
-      setActiveSession(session);
-      setSessionDetailsById((current) => ({
-        ...current,
-        [session.id]: session,
-      }));
+      if (loadSessionRequestIdRef.current !== requestId) {
+        return;
+      }
+      if (activeDaemonIdRef.current === daemonId && activeSessionIdRef.current === sessionId) {
+        setActiveSession(session);
+      }
     } finally {
-      setSessionLoading(false);
+      if (loadSessionRequestIdRef.current === requestId) {
+        setSessionLoading(false);
+      }
     }
   }
 
@@ -833,7 +810,6 @@ function App() {
       });
       setActiveSessionId(session.id);
       setActiveSession(session);
-      setSessionDetailsById((current) => ({ ...current, [session.id]: session }));
       setSessions((current) => upsertSessionSummary(current, session));
       setWorkspaceState((current) =>
         addSessionToWorkspace(current, current.activeWorkspaceId, activeDaemonId, session.id),
@@ -867,7 +843,6 @@ function App() {
       setHistoryOpen(false);
       setActiveSessionId(session.id);
       setActiveSession(session);
-      setSessionDetailsById((current) => ({ ...current, [session.id]: session }));
       setSessions((current) => upsertSessionSummary(current, session));
       setWorkspaceState((current) =>
         addSessionToWorkspace(current, current.activeWorkspaceId, activeDaemonId, session.id),
@@ -1048,7 +1023,6 @@ function App() {
       },
     );
     setActiveSession(session);
-    setSessionDetailsById((current) => ({ ...current, [session.id]: session }));
     setSessions((current) => upsertSessionSummary(current, session));
   }
 
@@ -1084,7 +1058,6 @@ function App() {
         },
       );
       setActiveSession(session);
-      setSessionDetailsById((current) => ({ ...current, [session.id]: session }));
       setSessions((current) => upsertSessionSummary(current, session));
       setRenameSessionOpen(false);
     } finally {
@@ -1112,7 +1085,6 @@ function App() {
         },
       );
       setActiveSession(session);
-      setSessionDetailsById((current) => ({ ...current, [session.id]: session }));
       setSessions((current) => upsertSessionSummary(current, session));
     } finally {
       setApprovalActionId(null);
@@ -1472,7 +1444,7 @@ function App() {
                     <OverviewSessionCard
                       key={session.id}
                       session={session}
-                      details={sessionDetailsById[session.id]}
+                      details={activeSession?.id === session.id ? activeSession : undefined}
                       active={session.id === activeSessionId}
                       layout={currentOverviewLayout[session.id]}
                       onOpen={() => {
@@ -2990,11 +2962,22 @@ function getContextCompactionInfo(session: SessionDetails | null) {
 function upsertSessionSummary(current: SessionSummary[], session: SessionSummary) {
   const index = current.findIndex((item) => item.id === session.id);
   if (index === -1) {
-    return [session, ...current].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return insertSessionSummarySorted(current, session);
   }
+  const merged = { ...current[index], ...session };
+  const remaining = current.filter((item) => item.id !== session.id);
+  return insertSessionSummarySorted(remaining, merged);
+}
+
+function insertSessionSummarySorted(current: SessionSummary[], session: SessionSummary) {
   const next = [...current];
-  next[index] = { ...next[index], ...session };
-  return next.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const targetIndex = next.findIndex((item) => item.updatedAt.localeCompare(session.updatedAt) < 0);
+  if (targetIndex === -1) {
+    next.push(session);
+    return next;
+  }
+  next.splice(targetIndex, 0, session);
+  return next;
 }
 
 function appendTranscriptEntry(details: SessionDetails, entry: TranscriptEntry): SessionDetails {
@@ -3049,6 +3032,79 @@ function updateTranscriptEntries(
       transcript.push(nextById.get(entry.id)!);
     }
   }
+  return {
+    ...details,
+    transcript,
+    transcriptCount: transcript.length,
+  };
+}
+
+function applyQueuedActiveSessionEvents(
+  details: SessionDetails | null,
+  events: DaemonEvent[],
+): SessionDetails | null {
+  if (!details || !events.length) {
+    return details;
+  }
+
+  let transcript = details.transcript.slice();
+  let dirty = false;
+  let indexById = new Map(transcript.map((entry, index) => [entry.id, index]));
+
+  const upsertEntry = (entry: TranscriptEntry) => {
+    const index = indexById.get(entry.id);
+    if (typeof index === "number") {
+      transcript[index] = {
+        ...transcript[index],
+        ...entry,
+      };
+      dirty = true;
+      return;
+    }
+
+    transcript.push(entry);
+    indexById.set(entry.id, transcript.length - 1);
+    dirty = true;
+  };
+
+  for (const event of events) {
+    if (!("sessionId" in event) || event.sessionId !== details.id) {
+      continue;
+    }
+
+    switch (event.type) {
+      case "session-entry":
+        upsertEntry(event.entry);
+        break;
+      case "session-entry-updated":
+        upsertEntry(event.entry);
+        break;
+      case "session-entries-updated":
+        event.entries.forEach(upsertEntry);
+        if (event.removedEntryIds?.length) {
+          const removedIds = new Set(event.removedEntryIds);
+          const nextTranscript = transcript.filter((entry) => !removedIds.has(entry.id));
+          if (nextTranscript.length !== transcript.length) {
+            transcript = nextTranscript;
+            indexById = new Map(transcript.map((entry, index) => [entry.id, index]));
+            dirty = true;
+          }
+        }
+        break;
+      case "session-reset":
+        transcript = event.transcript.slice();
+        indexById = new Map(transcript.map((entry, index) => [entry.id, index]));
+        dirty = true;
+        break;
+      default:
+        break;
+    }
+  }
+
+  if (!dirty) {
+    return details;
+  }
+
   return {
     ...details,
     transcript,
