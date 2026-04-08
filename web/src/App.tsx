@@ -11,10 +11,12 @@ import {
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
+  Bot,
   AlertCircle,
   ArrowDown,
   ArrowRight,
   ArrowUp,
+  Bell,
   ChevronDown,
   ChevronUp,
   Circle,
@@ -32,6 +34,7 @@ import {
   Plus,
   Send,
   Server,
+  Settings2,
   Square,
   Sun,
   Trash2,
@@ -52,13 +55,18 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import type {
+  AgentDetails,
+  AgentSummary,
   CodexHistoryEntry,
   DaemonConfig,
   DaemonDescriptor,
   DaemonEvent,
   DirectoryBrowseResult,
+  GlobalSettings,
+  ProjectNotification,
   ProjectFileBrowseResult,
   ProjectFileReadResult,
+  ProjectSummary,
   SessionDetails,
   SessionPreviewEntry,
   SessionTranscriptPage,
@@ -68,7 +76,6 @@ import type {
 import { formatDateTime, formatDurationMs, formatTime, lastLines } from "@/lib/utils";
 
 const DEFAULT_CONTROL_URL = import.meta.env.VITE_CONTROL_SERVER_URL || window.location.origin;
-const WORKSPACE_STORAGE_KEY = "ohmyvibe-workspaces";
 const OVERVIEW_LAYOUT_STORAGE_KEY = "ohmyvibe-overview-layouts";
 const TOOL_LINE_LIMIT = 30;
 const TRANSCRIPT_INITIAL_COUNT = 80;
@@ -111,17 +118,6 @@ interface ChatTranscriptMetaCache extends ChatTranscriptMeta {
   rowCounts: number[];
 }
 
-interface WorkspaceDefinition {
-  id: string;
-  sessionKeys: string[];
-  activeSessionKey: string | null;
-}
-
-interface WorkspaceStore {
-  activeWorkspaceId: string;
-  workspaces: WorkspaceDefinition[];
-}
-
 type SessionPane = "chat" | "files";
 type OverviewCardLayout = { x: number; y: number; width: number; height: number };
 type OverviewLayoutStore = Record<string, Record<string, OverviewCardLayout>>;
@@ -145,14 +141,23 @@ function App() {
   const [activeDaemonId, setActiveDaemonId] = useState<string | null>(null);
   const [config, setConfig] = useState<DaemonConfig>({ models: [] });
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [agents, setAgents] = useState<AgentSummary[]>([]);
+  const [activeAgentId, setActiveAgentId] = useState<string | null>(null);
+  const [activeAgent, setActiveAgent] = useState<AgentDetails | null>(null);
+  const [projectNotifications, setProjectNotifications] = useState<ProjectNotification[]>([]);
+  const [settings, setSettings] = useState<GlobalSettings | null>(null);
   const [history, setHistory] = useState<CodexHistoryEntry[]>([]);
   const [historySearch, setHistorySearch] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
   const [newSessionOpen, setNewSessionOpen] = useState(false);
+  const [newProjectOpen, setNewProjectOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [directoryPickerOpen, setDirectoryPickerOpen] = useState(false);
   const [sessionPane, setSessionPane] = useState<SessionPane>("chat");
+  const [sidebarMode, setSidebarMode] = useState<"sessions" | "agents">("sessions");
   const [sessionsCollapsed, setSessionsCollapsed] = useState(false);
-  const [workspaceState, setWorkspaceState] = useState<WorkspaceStore>(() => loadWorkspaceState());
   const [overviewLayouts, setOverviewLayouts] = useState<OverviewLayoutStore>(() => loadOverviewLayouts());
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [activeSession, setActiveSession] = useState<SessionDetails | null>(null);
@@ -180,6 +185,9 @@ function App() {
   const [fileEditorValue, setFileEditorValue] = useState("");
   const [fileSelectionText, setFileSelectionText] = useState("");
   const [savingFile, setSavingFile] = useState(false);
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [projectName, setProjectName] = useState("");
+  const [projectGoal, setProjectGoal] = useState("");
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState("medium");
   const [sandbox, setSandbox] = useState<"read-only" | "workspace-write" | "danger-full-access">(
@@ -253,10 +261,6 @@ function App() {
     document.documentElement.classList.toggle("dark", theme === "dark");
     localStorage.setItem("ohmyvibe-theme", theme);
   }, [theme]);
-
-  useEffect(() => {
-    localStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(workspaceState));
-  }, [workspaceState]);
 
   useEffect(() => {
     localStorage.setItem(OVERVIEW_LAYOUT_STORAGE_KEY, JSON.stringify(overviewLayouts));
@@ -361,6 +365,50 @@ function App() {
 
           if (event.type === "session-reset") {
             queueActiveSessionEvent(event);
+            continue;
+          }
+
+          if (event.type === "session-git-updated") {
+            setSessions((current) =>
+              current.map((session) =>
+                session.id === event.sessionId ? { ...session, git: event.git } : session,
+              ),
+            );
+            setActiveSession((current) =>
+              current?.id === event.sessionId ? { ...current, git: event.git, gitDetails: current.gitDetails } : current,
+            );
+            continue;
+          }
+
+          if (event.type === "project-created" || event.type === "project-updated") {
+            setProjects((current) => upsertProjectSummary(current, event.project));
+            setActiveProjectId((current) => current ?? event.project.id);
+            continue;
+          }
+
+          if (event.type === "agent-created" || event.type === "agent-updated") {
+            setAgents((current) => upsertAgentSummary(current, event.agent));
+            setActiveAgent((current) =>
+              current?.id === event.agent.id ? { ...current, ...event.agent } : current,
+            );
+            continue;
+          }
+
+          if (event.type === "agent-log-entry") {
+            setActiveAgent((current) =>
+              current?.id === event.entry.agentId
+                ? {
+                    ...current,
+                    updatedAt: event.entry.createdAt,
+                    logs: [...current.logs, event.entry],
+                  }
+                : current,
+            );
+            continue;
+          }
+
+          if (event.type === "project-notification") {
+            setProjectNotifications((current) => upsertProjectNotification(current, event.notification));
           }
         }
       }
@@ -409,12 +457,21 @@ function App() {
     if (!activeDaemonId) {
       setConfig({ models: [] });
       setSessions([]);
+      setProjects([]);
+      setAgents([]);
+      setActiveProjectId(null);
+      setActiveAgentId(null);
+      setActiveAgent(null);
+      setProjectNotifications([]);
+      setSettings(null);
       setActiveSession(null);
       setActiveSessionId(null);
       return;
     }
     void loadConfig(activeDaemonId);
     void loadSessions(activeDaemonId);
+    void loadProjects(activeDaemonId);
+    void loadSettings(activeDaemonId);
   }, [activeDaemonId]);
 
   useEffect(() => {
@@ -423,6 +480,26 @@ function App() {
     }
     void loadSession(activeDaemonId, activeSessionId);
   }, [activeDaemonId, activeSessionId, viewMode]);
+
+  useEffect(() => {
+    if (!activeDaemonId || !activeProjectId) {
+      setAgents([]);
+      setActiveAgentId(null);
+      setActiveAgent(null);
+      setProjectNotifications([]);
+      return;
+    }
+    void loadAgents(activeDaemonId, activeProjectId);
+    void loadNotifications(activeDaemonId, activeProjectId);
+  }, [activeDaemonId, activeProjectId]);
+
+  useEffect(() => {
+    if (!activeDaemonId || !activeProjectId || !activeAgentId) {
+      setActiveAgent(null);
+      return;
+    }
+    void loadAgent(activeDaemonId, activeProjectId, activeAgentId);
+  }, [activeAgentId, activeDaemonId, activeProjectId]);
 
   useEffect(() => {
     loadOlderTranscriptRequestIdRef.current += 1;
@@ -537,23 +614,24 @@ function App() {
     sendingMessage,
   });
   const activeDaemon = daemons.find((item) => item.id === activeDaemonId) ?? null;
-  const activeWorkspace =
-    workspaceState.workspaces.find((workspace) => workspace.id === workspaceState.activeWorkspaceId) ??
-    workspaceState.workspaces[0];
+  const activeProject = projects.find((project) => project.id === activeProjectId) ?? null;
   const visibleSessions = useMemo(() => {
-    if (!activeDaemonId || !activeWorkspace) {
+    if (!activeDaemonId || !activeProjectId) {
       return [] as SessionSummary[];
     }
-    const sessionKeys = new Set(activeWorkspace.sessionKeys);
-    return sessions.filter((session) => sessionKeys.has(makeSessionKey(activeDaemonId, session.id)));
-  }, [activeDaemonId, activeWorkspace, sessions]);
+    return sessions.filter((session) => session.projectId === activeProjectId);
+  }, [activeDaemonId, activeProjectId, sessions]);
+  const visibleAgents = useMemo(
+    () => agents.filter((agent) => agent.projectId === activeProjectId),
+    [activeProjectId, agents],
+  );
   const overviewSessions = useMemo(
     () =>
       [...visibleSessions]
         .filter((session) => session.status !== "closed"),
     [visibleSessions],
   );
-  const overviewLayoutKey = activeDaemonId && activeWorkspace ? `${activeDaemonId}:${activeWorkspace.id}` : "";
+  const overviewLayoutKey = activeDaemonId && activeProject ? `${activeDaemonId}:${activeProject.id}` : "";
   const currentOverviewLayout = overviewLayoutKey ? overviewLayouts[overviewLayoutKey] ?? {} : {};
   const sortedHistory = useMemo(
     () =>
@@ -626,26 +704,12 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!activeDaemonId) {
-      return;
-    }
-    const sessionIds = sessions.map((session) => session.id);
-    setWorkspaceState((current) =>
-      syncWorkspaceStoreWithSessions(current, activeDaemonId, sessionIds),
-    );
-  }, [activeDaemonId, sessions]);
-
-  useEffect(() => {
-    if (!activeDaemonId || !activeWorkspace) {
+    if (!activeDaemonId || !activeProjectId) {
       setActiveSessionId(null);
       setActiveSession(null);
       return;
     }
-    const preferredSessionId = parseSessionId(activeWorkspace.activeSessionKey, activeDaemonId);
     const nextSessionId =
-      (preferredSessionId && visibleSessions.some((session) => session.id === preferredSessionId)
-        ? preferredSessionId
-        : null) ??
       (activeSessionId && visibleSessions.some((session) => session.id === activeSessionId)
         ? activeSessionId
         : null) ??
@@ -657,7 +721,29 @@ function App() {
     if (!nextSessionId) {
       setActiveSession(null);
     }
-  }, [activeDaemonId, activeSessionId, activeWorkspace, visibleSessions]);
+  }, [activeDaemonId, activeProjectId, activeSessionId, visibleSessions]);
+
+  useEffect(() => {
+    if (!activeProject) {
+      return;
+    }
+    setCwd(activeProject.defaultSessionCwd || activeProject.rootDir);
+    setProjectName(activeProject.name);
+    setProjectGoal(activeProject.goal);
+  }, [activeProject]);
+
+  useEffect(() => {
+    if (sidebarMode !== "agents") {
+      return;
+    }
+    const nextAgentId =
+      (activeAgentId && visibleAgents.some((agent) => agent.id === activeAgentId) ? activeAgentId : null) ??
+      visibleAgents[0]?.id ??
+      null;
+    if (nextAgentId !== activeAgentId) {
+      setActiveAgentId(nextAgentId);
+    }
+  }, [activeAgentId, sidebarMode, visibleAgents]);
 
   useEffect(() => {
     if (!activeSessionId) {
@@ -748,6 +834,42 @@ function App() {
   async function loadSessions(daemonId: string) {
     const nextSessions = await api<SessionSummary[]>(`/api/daemons/${daemonId}/sessions`);
     setSessions(nextSessions.map(normalizeSessionSummary));
+  }
+
+  async function loadProjects(daemonId: string) {
+    const nextProjects = await api<ProjectSummary[]>(`/api/daemons/${daemonId}/projects`);
+    setProjects(nextProjects);
+    setActiveProjectId((current) => {
+      if (current && nextProjects.some((project) => project.id === current)) {
+        return current;
+      }
+      return nextProjects[0]?.id ?? null;
+    });
+  }
+
+  async function loadAgents(daemonId: string, projectId: string) {
+    const nextAgents = await api<AgentSummary[]>(`/api/daemons/${daemonId}/projects/${projectId}/agents`);
+    setAgents((current) => mergeAgentSummaries(current, nextAgents, projectId));
+  }
+
+  async function loadAgent(daemonId: string, projectId: string, agentId: string) {
+    const nextAgent = await api<AgentDetails>(
+      `/api/daemons/${daemonId}/projects/${projectId}/agents/${agentId}`,
+    );
+    setActiveAgent(nextAgent);
+    setAgents((current) => upsertAgentSummary(current, nextAgent));
+  }
+
+  async function loadNotifications(daemonId: string, projectId: string) {
+    const nextNotifications = await api<ProjectNotification[]>(
+      `/api/daemons/${daemonId}/projects/${projectId}/notifications`,
+    );
+    setProjectNotifications(nextNotifications);
+  }
+
+  async function loadSettings(daemonId: string) {
+    const nextSettings = await api<GlobalSettings>(`/api/daemons/${daemonId}/settings`);
+    setSettings(nextSettings);
   }
 
   async function loadSession(daemonId: string, sessionId: string) {
@@ -859,13 +981,13 @@ function App() {
   }
 
   async function handleCreateSession() {
-    if (!activeDaemonId) {
+    if (!activeDaemonId || !activeProjectId) {
       return;
     }
     setCreatingSession(true);
     try {
       const session = normalizeSessionDetails(
-        await api<SessionDetails>(`/api/daemons/${activeDaemonId}/sessions`, {
+        await api<SessionDetails>(`/api/daemons/${activeDaemonId}/projects/${activeProjectId}/sessions`, {
           method: "POST",
           body: JSON.stringify({
             cwd,
@@ -879,13 +1001,33 @@ function App() {
       setActiveSessionId(session.id);
       setActiveSession(session);
       setSessions((current) => upsertSessionSummary(current, session));
-      setWorkspaceState((current) =>
-        addSessionToWorkspace(current, current.activeWorkspaceId, activeDaemonId, session.id),
-      );
       setComposer("");
       setNewSessionOpen(false);
     } finally {
       setCreatingSession(false);
+    }
+  }
+
+  async function handleCreateProject() {
+    if (!activeDaemonId || !cwd.trim() || !projectName.trim()) {
+      return;
+    }
+    setCreatingProject(true);
+    try {
+      const project = await api<ProjectSummary>(`/api/daemons/${activeDaemonId}/projects`, {
+        method: "POST",
+        body: JSON.stringify({
+          name: projectName.trim(),
+          rootDir: cwd.trim(),
+          goal: projectGoal.trim(),
+          runPolicy: { mode: "until_blocked" },
+        }),
+      });
+      setProjects((current) => upsertProjectSummary(current, project));
+      setActiveProjectId(project.id);
+      setNewProjectOpen(false);
+    } finally {
+      setCreatingProject(false);
     }
   }
 
@@ -914,9 +1056,6 @@ function App() {
       setActiveSessionId(session.id);
       setActiveSession(session);
       setSessions((current) => upsertSessionSummary(current, session));
-      setWorkspaceState((current) =>
-        addSessionToWorkspace(current, current.activeWorkspaceId, activeDaemonId, session.id),
-      );
     } finally {
       setRestoringHistoryId(null);
     }
@@ -924,20 +1063,6 @@ function App() {
 
   function handleSelectSession(sessionId: string) {
     setActiveSessionId(sessionId);
-    if (!activeDaemonId) {
-      return;
-    }
-    setWorkspaceState((current) =>
-      setWorkspaceActiveSession(current, current.activeWorkspaceId, activeDaemonId, sessionId),
-    );
-  }
-
-  function handleCreateWorkspace() {
-    setWorkspaceState((current) => createWorkspace(current));
-  }
-
-  function handleDeleteWorkspace() {
-    setWorkspaceState((current) => deleteActiveWorkspace(current));
   }
 
   async function handleOpenDirectoryPicker() {
@@ -1070,6 +1195,65 @@ function App() {
       return;
     }
     await sendMessageText(composer);
+  }
+
+  async function handleRunProject() {
+    if (!activeDaemonId || !activeProjectId) {
+      return;
+    }
+    const project = await api<ProjectSummary>(
+      `/api/daemons/${activeDaemonId}/projects/${activeProjectId}/run`,
+      { method: "POST" },
+    );
+    setProjects((current) => upsertProjectSummary(current, project));
+  }
+
+  async function handlePauseProject() {
+    if (!activeDaemonId || !activeProjectId) {
+      return;
+    }
+    const project = await api<ProjectSummary>(
+      `/api/daemons/${activeDaemonId}/projects/${activeProjectId}/pause`,
+      { method: "POST" },
+    );
+    setProjects((current) => upsertProjectSummary(current, project));
+  }
+
+  async function handleSendAgentMessage(text: string) {
+    if (!activeDaemonId || !activeProjectId || !activeAgentId || !text.trim()) {
+      return;
+    }
+    const agent = await api<AgentDetails>(
+      `/api/daemons/${activeDaemonId}/projects/${activeProjectId}/agents/${activeAgentId}/messages`,
+      {
+        method: "POST",
+        body: JSON.stringify({ text: text.trim() }),
+      },
+    );
+    setActiveAgent(agent);
+    setAgents((current) => upsertAgentSummary(current, agent));
+  }
+
+  async function handleSaveSettings(nextSettings: GlobalSettings) {
+    if (!activeDaemonId) {
+      return;
+    }
+    const providerSettings = await api<GlobalSettings>(
+      `/api/daemons/${activeDaemonId}/settings/provider`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(nextSettings.provider),
+      },
+    );
+    const finalSettings = await api<GlobalSettings>(
+      `/api/daemons/${activeDaemonId}/settings/notifications`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(nextSettings.notifications),
+      },
+    );
+    setSettings(finalSettings ?? providerSettings);
+    setSettingsOpen(false);
   }
 
   async function handleSessionConfigChange(next: {
@@ -1225,48 +1409,58 @@ function App() {
               </SelectContent>
             </Select>
           </div>
-          <div className="min-w-0 max-w-[42vw] shrink md:max-w-none">
+          <div className="min-w-0 max-w-[52vw] shrink md:max-w-none">
             <div className="flex items-center gap-1 overflow-x-auto rounded-md border border-border bg-muted/30 px-1 py-1">
-              {workspaceState.workspaces.map((workspace, index) => (
+              {projects.map((project) => (
                 <Button
-                  key={workspace.id}
+                  key={project.id}
                   type="button"
                   variant="ghost"
                   size="sm"
                   className={[
-                    "h-7 min-w-7 px-2 text-xs",
-                    workspace.id === workspaceState.activeWorkspaceId
-                      ? "bg-card text-foreground shadow-sm"
-                      : "text-muted-foreground",
+                    "h-7 max-w-[240px] px-2 text-xs",
+                    project.id === activeProjectId ? "bg-card text-foreground shadow-sm" : "text-muted-foreground",
                   ].join(" ")}
-                  onClick={() =>
-                    setWorkspaceState((current) => ({
-                      ...current,
-                      activeWorkspaceId: workspace.id,
-                    }))
-                  }
+                  onClick={() => {
+                    setActiveProjectId(project.id);
+                    setActiveAgentId(null);
+                  }}
                 >
-                  {index + 1}
+                  <span className="truncate">{project.name}</span>
                 </Button>
               ))}
-              <Button type="button" variant="ghost" size="icon" className="h-7 w-7" onClick={handleCreateWorkspace}>
+              <Button type="button" variant="ghost" size="icon" className="h-7 w-7" onClick={() => setNewProjectOpen(true)}>
                 <Plus className="h-3.5 w-3.5" />
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7"
-                onClick={handleDeleteWorkspace}
-                disabled={workspaceState.workspaces.length <= 1}
-              >
-                <Trash2 className="h-3.5 w-3.5" />
               </Button>
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-2">
             <StatusBadge connectionState={connectionState} />
             <div className="flex shrink-0 items-center gap-1">
+              <Dialog open={newProjectOpen} onOpenChange={setNewProjectOpen}>
+                <DialogContent className="max-w-[560px] md:w-full">
+                  <DialogHeader>
+                    <DialogTitle>New Project</DialogTitle>
+                    <DialogDescription>Persistent project root and goal</DialogDescription>
+                  </DialogHeader>
+                  <div className="grid gap-3 p-4">
+                    <Input value={projectName} onChange={(event) => setProjectName(event.target.value)} placeholder="Project name" />
+                    <Textarea value={projectGoal} onChange={(event) => setProjectGoal(event.target.value)} placeholder="Project goal" className="min-h-[88px]" />
+                    <div className="flex items-center gap-2">
+                      <Input value={cwd} onChange={(event) => setCwd(event.target.value)} placeholder="Project root directory" />
+                      <Button type="button" variant="outline" size="icon" className="shrink-0" onClick={() => void handleOpenDirectoryPicker()} disabled={!activeDaemonId}>
+                        <FolderOpen className="h-4 w-4" />
+                      </Button>
+                    </div>
+                    <div className="flex justify-end">
+                      <Button size="sm" disabled={!activeDaemonId || !projectName.trim() || !cwd.trim() || creatingProject} onClick={() => void handleCreateProject()}>
+                        {creatingProject ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : null}
+                        Create Project
+                      </Button>
+                    </div>
+                  </div>
+                </DialogContent>
+              </Dialog>
               <Dialog
                 open={historyOpen}
                 onOpenChange={(open) => {
@@ -1336,7 +1530,7 @@ function App() {
               </Dialog>
               <Dialog open={newSessionOpen} onOpenChange={setNewSessionOpen}>
                 <DialogTrigger asChild>
-                  <Button size="sm" className="h-8 px-2 sm:px-2.5" disabled={!activeDaemonId}>
+                  <Button size="sm" className="h-8 px-2 sm:px-2.5" disabled={!activeDaemonId || !activeProjectId}>
                     <Play className="h-3.5 w-3.5" />
                     <span className="hidden sm:inline">New</span>
                   </Button>
@@ -1367,7 +1561,7 @@ function App() {
                     <div className="flex justify-end">
                       <Button
                         size="sm"
-                        disabled={!activeDaemonId || !cwd.trim() || creatingSession}
+                        disabled={!activeDaemonId || !activeProjectId || !cwd.trim() || creatingSession}
                         onClick={() => void handleCreateSession()}
                       >
                         {creatingSession ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : null}
@@ -1375,6 +1569,24 @@ function App() {
                       </Button>
                     </div>
                   </div>
+                </DialogContent>
+              </Dialog>
+              <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
+                <DialogTrigger asChild>
+                  <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0" disabled={!activeDaemonId}>
+                    <Settings2 className="h-4 w-4" />
+                  </Button>
+                </DialogTrigger>
+                <DialogContent className="max-w-[640px] md:w-full">
+                  <DialogHeader>
+                    <DialogTitle>Settings</DialogTitle>
+                    <DialogDescription>Global provider and notification config</DialogDescription>
+                  </DialogHeader>
+                  {settings ? (
+                    <SettingsEditor settings={settings} onSave={(next) => void handleSaveSettings(next)} />
+                  ) : (
+                    <div className="p-4 text-sm text-muted-foreground">Loading settings</div>
+                  )}
                 </DialogContent>
               </Dialog>
               <Dialog
@@ -1505,9 +1717,11 @@ function App() {
                   </div>
                 </div>
                 <div className="truncate text-xs text-muted-foreground">
-                  {activeDaemon
-                    ? `${overviewSessions.length} active sessions · ${activeDaemon.cwd}`
-                    : "select daemon"}
+                  {activeProject
+                    ? `${overviewSessions.length} active sessions · ${activeProject.rootDir}`
+                    : activeDaemon
+                      ? `0 active sessions · ${activeDaemon.cwd}`
+                      : "select daemon"}
                 </div>
               </div>
             </div>
@@ -1592,49 +1806,101 @@ function App() {
                     className={`h-4 w-4 transition-transform ${sessionsCollapsed ? "" : "rotate-180"}`}
                   />
                 </Button>
-                {!sessionsCollapsed ? <span className="truncate">Sessions</span> : null}
-                {!sessionsCollapsed ? <Badge variant="outline">{visibleSessions.length}</Badge> : null}
+                {!sessionsCollapsed ? (
+                  <div className="flex min-w-0 flex-1 items-center gap-1">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className={sidebarMode === "sessions" ? "h-7 bg-card px-2 text-[11px] shadow-sm" : "h-7 px-2 text-[11px]"}
+                      onClick={() => setSidebarMode("sessions")}
+                    >
+                      Sessions
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className={sidebarMode === "agents" ? "h-7 bg-card px-2 text-[11px] shadow-sm" : "h-7 px-2 text-[11px]"}
+                      onClick={() => setSidebarMode("agents")}
+                    >
+                      Agents
+                    </Button>
+                  </div>
+                ) : null}
+                {!sessionsCollapsed ? (
+                  <Badge variant="outline">{sidebarMode === "sessions" ? visibleSessions.length : visibleAgents.length}</Badge>
+                ) : null}
               </div>
               {!sessionsCollapsed ? (
                 <ScrollArea className="min-w-0">
                   <div className="min-w-0 space-y-1.5 p-2">
-                    {visibleSessions.map((session) => (
-                      <button
-                        key={session.id}
-                        type="button"
-                        onClick={() => handleSelectSession(session.id)}
-                        className={[
-                          "ui-session-item grid min-w-0 w-full gap-1 overflow-hidden rounded-xl border px-2.5 py-2 text-left text-xs backdrop-blur-sm",
-                          getSessionListCardClassName(session, activeSessionId === session.id),
-                        ].join(" ")}
-                      >
-                        <div className={`ui-session-status-bar ${getSessionStatusAccentClassName(session)}`} />
-                        <div className="flex min-w-0 items-start justify-between gap-2">
-                          <div className="min-w-0 flex-1 line-clamp-2 text-[13px] font-medium leading-5">
-                            {session.title}
-                          </div>
-                          <Button
+                    {sidebarMode === "sessions"
+                      ? visibleSessions.map((session) => (
+                          <button
+                            key={session.id}
                             type="button"
-                            variant="ghost"
-                            size="icon"
-                            className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive"
-                            aria-label="Delete session"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              void handleDeleteSession(session.id);
-                            }}
+                            onClick={() => handleSelectSession(session.id)}
+                            className={[
+                              "ui-session-item grid min-w-0 w-full gap-1 overflow-hidden rounded-xl border px-2.5 py-2 text-left text-xs backdrop-blur-sm",
+                              getSessionListCardClassName(session, activeSessionId === session.id),
+                            ].join(" ")}
                           >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </Button>
-                        </div>
-                        <div className="flex min-w-0 items-center gap-2 text-[11px] text-muted-foreground">
-                          <span className={`h-2 w-2 shrink-0 rounded-full ${getSessionStatusDotClassName(session)}`} />
-                          <span className="shrink-0">{formatSessionStatusLabel(session.status)}</span>
-                          <span className="truncate">{formatDateTime(session.updatedAt)}</span>
-                        </div>
-                        <div className="truncate text-[11px] text-muted-foreground">{session.cwd}</div>
-                      </button>
-                    ))}
+                            <div className={`ui-session-status-bar ${getSessionStatusAccentClassName(session)}`} />
+                            <div className="flex min-w-0 items-start justify-between gap-2">
+                              <div className="min-w-0 flex-1 line-clamp-2 text-[13px] font-medium leading-5">
+                                {session.title}
+                              </div>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon"
+                                className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive"
+                                aria-label="Delete session"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  void handleDeleteSession(session.id);
+                                }}
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                            <div className="flex min-w-0 items-center gap-2 text-[11px] text-muted-foreground">
+                              <span className={`h-2 w-2 shrink-0 rounded-full ${getSessionStatusDotClassName(session)}`} />
+                              <span className="shrink-0">{formatSessionStatusLabel(session.status)}</span>
+                              <span className="truncate">{formatDateTime(session.updatedAt)}</span>
+                            </div>
+                            <div className="truncate text-[11px] text-muted-foreground">
+                              {session.git?.branch ? `${session.git.branch} · ` : ""}{session.cwd}
+                            </div>
+                          </button>
+                        ))
+                      : visibleAgents.map((agent) => (
+                          <button
+                            key={agent.id}
+                            type="button"
+                            onClick={() => {
+                              setActiveAgentId(agent.id);
+                              setActiveSessionId(null);
+                            }}
+                            className={[
+                              "grid min-w-0 w-full gap-1 overflow-hidden rounded-xl border px-2.5 py-2 text-left text-xs",
+                              activeAgentId === agent.id ? "border-border bg-card shadow-sm" : "border-border/70 bg-card/45 hover:bg-accent/30",
+                            ].join(" ")}
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="min-w-0">
+                                <div className="truncate text-[13px] font-medium">{agent.name}</div>
+                                <div className="mt-1 flex items-center gap-2 text-[11px] text-muted-foreground">
+                                  <span className="uppercase tracking-[0.14em]">{agent.role}</span>
+                                  <span>{agent.status}</span>
+                                </div>
+                              </div>
+                              <Bot className="h-4 w-4 shrink-0 text-muted-foreground" />
+                            </div>
+                            {agent.boundSessionId ? (
+                              <div className="truncate text-[11px] text-muted-foreground">Session {agent.boundSessionId}</div>
+                            ) : null}
+                          </button>
+                        ))}
                   </div>
                 </ScrollArea>
               ) : null}
@@ -1654,33 +1920,59 @@ function App() {
                       <PanelLeftOpen className="h-4 w-4" />
                     </Button>
                   ) : null}
-                  <div className="flex items-center gap-1 rounded-md border border-border bg-muted/30 p-1">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className={sessionPane === "chat" ? "h-7 bg-card px-2 text-xs shadow-sm" : "h-7 px-2 text-xs"}
-                      onClick={() => setSessionPane("chat")}
-                      disabled={!activeSessionId}
-                    >
-                      <MessageSquareText className="h-3.5 w-3.5" />
-                      Chat
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className={sessionPane === "files" ? "h-7 bg-card px-2 text-xs shadow-sm" : "h-7 px-2 text-xs"}
-                      onClick={() => void handleOpenFilesPane()}
-                      disabled={!activeSessionId}
-                    >
-                      <FolderOpen className="h-3.5 w-3.5" />
-                      Files
-                    </Button>
-                  </div>
-                  <div className="truncate text-sm font-medium">
-                    {activeSession?.title || activeDaemon?.name || "No Session"}
+                  {sidebarMode === "sessions" ? (
+                    <div className="flex items-center gap-1 rounded-md border border-border bg-muted/30 p-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className={sessionPane === "chat" ? "h-7 bg-card px-2 text-xs shadow-sm" : "h-7 px-2 text-xs"}
+                        onClick={() => setSessionPane("chat")}
+                        disabled={!activeSessionId}
+                      >
+                        <MessageSquareText className="h-3.5 w-3.5" />
+                        Chat
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className={sessionPane === "files" ? "h-7 bg-card px-2 text-xs shadow-sm" : "h-7 px-2 text-xs"}
+                        onClick={() => void handleOpenFilesPane()}
+                        disabled={!activeSessionId}
+                      >
+                        <FolderOpen className="h-3.5 w-3.5" />
+                        Files
+                      </Button>
+                    </div>
+                  ) : null}
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium">
+                      {sidebarMode === "agents" ? activeAgent?.name || activeProject?.name || "No Agent" : activeSession?.title || activeProject?.name || activeDaemon?.name || "No Session"}
+                    </div>
+                    <div className="truncate text-[11px] text-muted-foreground">
+                      {sidebarMode === "agents"
+                        ? activeAgent
+                          ? `${activeAgent.role} · ${activeAgent.status}`
+                          : activeProject?.goal || "Select agent"
+                        : activeSession?.git?.branch
+                          ? `${activeSession.git.branch} · ${activeSession.cwd}`
+                          : activeSession?.cwd || activeProject?.rootDir || ""}
+                    </div>
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
+                  {activeProject ? (
+                    activeProject.status === "running" ? (
+                      <Button variant="outline" size="sm" className="h-8 px-2" onClick={() => void handlePauseProject()}>
+                        <Square className="h-3.5 w-3.5" />
+                        Pause Project
+                      </Button>
+                    ) : (
+                      <Button size="sm" className="h-8 px-2" onClick={() => void handleRunProject()}>
+                        <Play className="h-3.5 w-3.5" />
+                        Run Project
+                      </Button>
+                    )
+                  ) : null}
                   <Dialog open={renameSessionOpen} onOpenChange={setRenameSessionOpen}>
                     <DialogTrigger asChild>
                       <Button
@@ -1688,7 +1980,7 @@ function App() {
                         size="icon"
                         className="h-8 w-8"
                         aria-label="Rename session"
-                        disabled={!activeSessionId}
+                        disabled={!activeSessionId || sidebarMode !== "sessions"}
                       >
                         <Edit3 className="h-4 w-4" />
                       </Button>
@@ -1726,7 +2018,13 @@ function App() {
                 </div>
               </div>
 
-              {sessionPane === "files" ? (
+              {sidebarMode === "agents" ? (
+                <AgentPane
+                  agent={activeAgent}
+                  notifications={projectNotifications.filter((item) => item.projectId === activeProjectId)}
+                  onSendMessage={(text) => void handleSendAgentMessage(text)}
+                />
+              ) : sessionPane === "files" ? (
                 <>
                   <Suspense
                     fallback={
@@ -1938,6 +2236,149 @@ function App() {
             </main>
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function AgentPane({
+  agent,
+  notifications,
+  onSendMessage,
+}: {
+  agent: AgentDetails | null;
+  notifications: ProjectNotification[];
+  onSendMessage: (text: string) => void;
+}) {
+  const [composer, setComposer] = useState("");
+
+  if (!agent) {
+    return (
+      <div className="flex min-h-0 items-center justify-center bg-muted/10 p-4 text-sm text-muted-foreground">
+        Select an agent
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="grid min-h-0 grid-cols-1 gap-0 lg:grid-cols-[minmax(0,1fr)_320px]">
+        <ScrollArea className="min-h-0 border-r border-border bg-muted/10">
+          <div className="space-y-3 p-4">
+            <div className="rounded-xl border border-border bg-card p-3">
+              <div className="text-xs uppercase tracking-[0.18em] text-muted-foreground">{agent.role}</div>
+              <div className="mt-1 text-sm font-medium">{agent.name}</div>
+              <div className="mt-2 text-xs text-muted-foreground">
+                {agent.provider || "provider"} · {agent.model || "default model"} · {agent.status}
+              </div>
+              {agent.boundSessionId ? (
+                <div className="mt-1 text-xs text-muted-foreground">Bound session: {agent.boundSessionId}</div>
+              ) : null}
+              {agent.memory.summary ? (
+                <div className="mt-3 rounded-lg border border-border/80 bg-muted/30 p-3 text-xs leading-5 text-muted-foreground whitespace-pre-wrap">
+                  {agent.memory.summary}
+                </div>
+              ) : null}
+            </div>
+            {agent.logs.map((entry) => (
+              <div key={entry.id} className="rounded-xl border border-border bg-card p-3">
+                <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                  <div className="flex items-center gap-2">
+                    <Badge variant="outline">{entry.kind}</Badge>
+                    <span>{entry.direction}</span>
+                  </div>
+                  <span>{formatDateTime(entry.createdAt)}</span>
+                </div>
+                <div className="mt-2 whitespace-pre-wrap break-words text-sm leading-6">{entry.text}</div>
+              </div>
+            ))}
+          </div>
+        </ScrollArea>
+        <ScrollArea className="min-h-0 bg-background">
+          <div className="space-y-3 p-4">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <Bell className="h-4 w-4" />
+              Notifications
+            </div>
+            {notifications.length ? (
+              notifications.map((item) => (
+                <div key={item.id} className="rounded-xl border border-border bg-card p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-sm font-medium">{item.subject}</div>
+                    <Badge variant={item.severity === "critical" ? "destructive" : item.severity === "warning" ? "warning" : "outline"}>
+                      {item.channel}
+                    </Badge>
+                  </div>
+                  <div className="mt-2 whitespace-pre-wrap break-words text-xs leading-5 text-muted-foreground">{item.body}</div>
+                </div>
+              ))
+            ) : (
+              <div className="rounded-xl border border-dashed border-border p-3 text-sm text-muted-foreground">
+                No notifications
+              </div>
+            )}
+          </div>
+        </ScrollArea>
+      </div>
+      <div className="grid gap-2 border-t border-border p-3">
+        <Textarea
+          value={composer}
+          onChange={(event) => setComposer(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              onSendMessage(composer);
+              setComposer("");
+            }
+          }}
+          placeholder="Message agent"
+          className="min-h-[96px] max-h-[128px]"
+        />
+        <div className="flex justify-end">
+          <Button size="sm" disabled={!composer.trim()} onClick={() => {
+            onSendMessage(composer);
+            setComposer("");
+          }}>
+            <Send className="h-3.5 w-3.5" />
+            Send
+          </Button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function SettingsEditor({
+  settings,
+  onSave,
+}: {
+  settings: GlobalSettings;
+  onSave: (settings: GlobalSettings) => void;
+}) {
+  const [draft, setDraft] = useState(settings);
+
+  useEffect(() => {
+    setDraft(settings);
+  }, [settings]);
+
+  return (
+    <div className="grid gap-4 p-4">
+      <div className="grid gap-2">
+        <div className="text-sm font-medium">Provider</div>
+        <Input value={draft.provider.baseUrl} onChange={(event) => setDraft((current) => ({ ...current, provider: { ...current.provider, baseUrl: event.target.value } }))} placeholder="Base URL" />
+        <Input value={draft.provider.apiKey} onChange={(event) => setDraft((current) => ({ ...current, provider: { ...current.provider, apiKey: event.target.value } }))} placeholder="API key" />
+        <Input value={draft.provider.model} onChange={(event) => setDraft((current) => ({ ...current, provider: { ...current.provider, model: event.target.value } }))} placeholder="Model" />
+      </div>
+      <div className="grid gap-2">
+        <div className="text-sm font-medium">SMTP</div>
+        <Input value={draft.notifications.smtpHost} onChange={(event) => setDraft((current) => ({ ...current, notifications: { ...current.notifications, smtpHost: event.target.value } }))} placeholder="SMTP host" />
+        <Input value={String(draft.notifications.smtpPort)} onChange={(event) => setDraft((current) => ({ ...current, notifications: { ...current.notifications, smtpPort: Number(event.target.value) || 0 } }))} placeholder="SMTP port" />
+        <Input value={draft.notifications.smtpUser} onChange={(event) => setDraft((current) => ({ ...current, notifications: { ...current.notifications, smtpUser: event.target.value } }))} placeholder="SMTP user" />
+        <Input value={draft.notifications.smtpPass} onChange={(event) => setDraft((current) => ({ ...current, notifications: { ...current.notifications, smtpPass: event.target.value } }))} placeholder="SMTP password" />
+        <Input value={draft.notifications.smtpFrom} onChange={(event) => setDraft((current) => ({ ...current, notifications: { ...current.notifications, smtpFrom: event.target.value } }))} placeholder="SMTP from" />
+      </div>
+      <div className="flex justify-end">
+        <Button size="sm" onClick={() => onSave(draft)}>Save Settings</Button>
       </div>
     </div>
   );
@@ -3138,6 +3579,48 @@ function normalizeSessionDetails(session: SessionDetails): SessionDetails {
   };
 }
 
+function upsertProjectSummary(current: ProjectSummary[], project: ProjectSummary): ProjectSummary[] {
+  const index = current.findIndex((item) => item.id === project.id);
+  if (index === -1) {
+    return [...current, project].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+  const next = [...current];
+  next[index] = { ...next[index], ...project };
+  return next.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+function upsertAgentSummary(current: AgentSummary[], agent: AgentSummary): AgentSummary[] {
+  const index = current.findIndex((item) => item.id === agent.id);
+  if (index === -1) {
+    return [...current, agent];
+  }
+  const next = [...current];
+  next[index] = { ...next[index], ...agent };
+  return next;
+}
+
+function mergeAgentSummaries(
+  current: AgentSummary[],
+  incoming: AgentSummary[],
+  projectId: string,
+): AgentSummary[] {
+  const retained = current.filter((item) => item.projectId !== projectId);
+  return [...retained, ...incoming];
+}
+
+function upsertProjectNotification(
+  current: ProjectNotification[],
+  notification: ProjectNotification,
+): ProjectNotification[] {
+  const index = current.findIndex((item) => item.id === notification.id);
+  if (index === -1) {
+    return [notification, ...current];
+  }
+  const next = [...current];
+  next[index] = { ...next[index], ...notification };
+  return next;
+}
+
 function insertSessionSummarySorted(current: SessionSummary[], session: SessionSummary) {
   const next = [...current];
   const targetIndex = next.findIndex((item) => item.updatedAt.localeCompare(session.updatedAt) < 0);
@@ -3383,196 +3866,6 @@ function formatHistoryDayLabel(value: string) {
     day: "2-digit",
     weekday: "short",
   });
-}
-
-function loadWorkspaceState(): WorkspaceStore {
-  try {
-    const raw = localStorage.getItem(WORKSPACE_STORAGE_KEY);
-    if (!raw) {
-      return createDefaultWorkspaceStore();
-    }
-    const parsed = JSON.parse(raw) as Partial<WorkspaceStore>;
-    const workspaces = Array.isArray(parsed.workspaces)
-      ? parsed.workspaces
-          .map((workspace) => ({
-            id: typeof workspace?.id === "string" ? workspace.id : createWorkspaceId(),
-            sessionKeys: Array.isArray(workspace?.sessionKeys)
-              ? workspace.sessionKeys.filter((item): item is string => typeof item === "string")
-              : [],
-            activeSessionKey: typeof workspace?.activeSessionKey === "string" ? workspace.activeSessionKey : null,
-          }))
-          .filter((workspace) => workspace.id)
-      : [];
-    if (!workspaces.length) {
-      return createDefaultWorkspaceStore();
-    }
-    const activeWorkspaceId =
-      typeof parsed.activeWorkspaceId === "string" &&
-      workspaces.some((workspace) => workspace.id === parsed.activeWorkspaceId)
-        ? parsed.activeWorkspaceId
-        : workspaces[0].id;
-    return { activeWorkspaceId, workspaces };
-  } catch {
-    return createDefaultWorkspaceStore();
-  }
-}
-
-function createDefaultWorkspaceStore(): WorkspaceStore {
-  const workspaces = Array.from({ length: 3 }, () => ({
-    id: createWorkspaceId(),
-    sessionKeys: [],
-    activeSessionKey: null,
-  }));
-  return {
-    activeWorkspaceId: workspaces[0].id,
-    workspaces,
-  };
-}
-
-function createWorkspaceId() {
-  return `ws-${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function makeSessionKey(daemonId: string, sessionId: string) {
-  return `${daemonId}::${sessionId}`;
-}
-
-function parseSessionId(sessionKey: string | null | undefined, daemonId: string) {
-  if (!sessionKey) {
-    return null;
-  }
-  const prefix = `${daemonId}::`;
-  return sessionKey.startsWith(prefix) ? sessionKey.slice(prefix.length) : null;
-}
-
-function syncWorkspaceStoreWithSessions(
-  state: WorkspaceStore,
-  daemonId: string,
-  sessionIds: string[],
-) {
-  const validKeys = new Set(sessionIds.map((sessionId) => makeSessionKey(daemonId, sessionId)));
-  const assignedKeys = new Set<string>();
-  const activeWorkspaceId =
-    state.workspaces.some((workspace) => workspace.id === state.activeWorkspaceId)
-      ? state.activeWorkspaceId
-      : state.workspaces[0]?.id ?? createWorkspaceId();
-
-  const workspaces = state.workspaces.length ? state.workspaces : createDefaultWorkspaceStore().workspaces;
-  const nextWorkspaces = workspaces.map((workspace) => {
-    const sessionKeys = workspace.sessionKeys.filter((key) => {
-      if (!key.startsWith(`${daemonId}::`)) {
-        assignedKeys.add(key);
-        return true;
-      }
-      if (validKeys.has(key)) {
-        assignedKeys.add(key);
-        return true;
-      }
-      return false;
-    });
-    const activeSessionKey =
-      workspace.activeSessionKey && sessionKeys.includes(workspace.activeSessionKey)
-        ? workspace.activeSessionKey
-        : null;
-    return { ...workspace, sessionKeys, activeSessionKey };
-  });
-
-  const unassignedKeys = [...validKeys].filter((key) => !assignedKeys.has(key));
-  if (unassignedKeys.length) {
-    const targetWorkspace =
-      nextWorkspaces.find((workspace) => workspace.id === activeWorkspaceId) ?? nextWorkspaces[0];
-    if (targetWorkspace) {
-      targetWorkspace.sessionKeys = [...targetWorkspace.sessionKeys, ...unassignedKeys];
-      if (!targetWorkspace.activeSessionKey) {
-        targetWorkspace.activeSessionKey = unassignedKeys[0] ?? null;
-      }
-    }
-  }
-
-  return {
-    activeWorkspaceId,
-    workspaces: nextWorkspaces,
-  };
-}
-
-function addSessionToWorkspace(
-  state: WorkspaceStore,
-  workspaceId: string,
-  daemonId: string,
-  sessionId: string,
-) {
-  const sessionKey = makeSessionKey(daemonId, sessionId);
-  return {
-    ...state,
-    activeWorkspaceId: workspaceId,
-    workspaces: state.workspaces.map((workspace) => {
-      const nextKeys = workspace.sessionKeys.filter((key) => key !== sessionKey);
-      if (workspace.id !== workspaceId) {
-        return {
-          ...workspace,
-          sessionKeys: nextKeys,
-          activeSessionKey: workspace.activeSessionKey === sessionKey ? null : workspace.activeSessionKey,
-        };
-      }
-      return {
-        ...workspace,
-        sessionKeys: [...nextKeys, sessionKey],
-        activeSessionKey: sessionKey,
-      };
-    }),
-  };
-}
-
-function setWorkspaceActiveSession(
-  state: WorkspaceStore,
-  workspaceId: string,
-  daemonId: string,
-  sessionId: string,
-) {
-  const sessionKey = makeSessionKey(daemonId, sessionId);
-  return {
-    ...state,
-    workspaces: state.workspaces.map((workspace) =>
-      workspace.id === workspaceId
-        ? {
-            ...workspace,
-            sessionKeys: workspace.sessionKeys.includes(sessionKey)
-              ? workspace.sessionKeys
-              : [...workspace.sessionKeys, sessionKey],
-            activeSessionKey: sessionKey,
-          }
-        : workspace,
-    ),
-  };
-}
-
-function createWorkspace(state: WorkspaceStore) {
-  const workspace = {
-    id: createWorkspaceId(),
-    sessionKeys: [],
-    activeSessionKey: null,
-  };
-  return {
-    activeWorkspaceId: workspace.id,
-    workspaces: [...state.workspaces, workspace],
-  };
-}
-
-function deleteActiveWorkspace(state: WorkspaceStore) {
-  if (state.workspaces.length <= 1) {
-    return state;
-  }
-  const index = state.workspaces.findIndex((workspace) => workspace.id === state.activeWorkspaceId);
-  if (index === -1) {
-    return state;
-  }
-  const nextWorkspaces = state.workspaces.filter((workspace) => workspace.id !== state.activeWorkspaceId);
-  const nextActive =
-    nextWorkspaces[Math.max(0, index - 1)]?.id ?? nextWorkspaces[0]?.id ?? state.activeWorkspaceId;
-  return {
-    activeWorkspaceId: nextActive,
-    workspaces: nextWorkspaces,
-  };
 }
 
 function normalizeBaseUrl(value: string) {

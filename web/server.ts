@@ -61,6 +61,151 @@ app.get("/api/daemons/:daemonId/config", async (req, res) => {
   }
 });
 
+app.get("/api/daemons/:daemonId/projects", async (req, res) => {
+  try {
+    res.json(await requestDaemon(req.params.daemonId, "listProjects"));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post("/api/daemons/:daemonId/projects", async (req, res) => {
+  try {
+    res.status(201).json(await requestDaemon(req.params.daemonId, "createProject", req.body ?? {}));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get("/api/daemons/:daemonId/projects/:projectId", async (req, res) => {
+  try {
+    const project = await requestDaemon(req.params.daemonId, "getProject", {
+      projectId: req.params.projectId,
+    });
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    res.json(project);
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.patch("/api/daemons/:daemonId/projects/:projectId", async (req, res) => {
+  try {
+    res.json(
+      await requestDaemon(req.params.daemonId, "updateProject", {
+        projectId: req.params.projectId,
+        ...(req.body ?? {}),
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post("/api/daemons/:daemonId/projects/:projectId/run", async (req, res) => {
+  try {
+    res.json(
+      await requestDaemon(req.params.daemonId, "runProject", {
+        projectId: req.params.projectId,
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post("/api/daemons/:daemonId/projects/:projectId/pause", async (req, res) => {
+  try {
+    res.json(
+      await requestDaemon(req.params.daemonId, "pauseProject", {
+        projectId: req.params.projectId,
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get("/api/daemons/:daemonId/projects/:projectId/agents", async (req, res) => {
+  try {
+    res.json(
+      await requestDaemon(req.params.daemonId, "listAgents", {
+        projectId: req.params.projectId,
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get("/api/daemons/:daemonId/projects/:projectId/agents/:agentId", async (req, res) => {
+  try {
+    const agent = await requestDaemon(req.params.daemonId, "getAgent", {
+      agentId: req.params.agentId,
+    });
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    res.json(agent);
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post("/api/daemons/:daemonId/projects/:projectId/agents/:agentId/messages", async (req, res) => {
+  try {
+    res.status(202).json(
+      await requestDaemon(req.params.daemonId, "sendAgentMessage", {
+        projectId: req.params.projectId,
+        agentId: req.params.agentId,
+        text: req.body?.text ?? "",
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get("/api/daemons/:daemonId/projects/:projectId/notifications", async (req, res) => {
+  try {
+    res.json(
+      await requestDaemon(req.params.daemonId, "listNotifications", {
+        projectId: req.params.projectId,
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get("/api/daemons/:daemonId/settings", async (req, res) => {
+  try {
+    res.json(await requestDaemon(req.params.daemonId, "getSettings"));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.patch("/api/daemons/:daemonId/settings/provider", async (req, res) => {
+  try {
+    res.json(await requestDaemon(req.params.daemonId, "updateProviderConfig", req.body ?? {}));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.patch("/api/daemons/:daemonId/settings/notifications", async (req, res) => {
+  try {
+    res.json(await requestDaemon(req.params.daemonId, "updateNotificationConfig", req.body ?? {}));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 app.get("/api/daemons/:daemonId/sessions", async (req, res) => {
   try {
     res.json(await requestDaemon(req.params.daemonId, "listSessions"));
@@ -177,6 +322,19 @@ app.put("/api/daemons/:daemonId/sessions/:sessionId/file", async (req, res) => {
 app.post("/api/daemons/:daemonId/sessions", async (req, res) => {
   try {
     res.status(201).json(await requestDaemon(req.params.daemonId, "createSession", req.body ?? {}));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post("/api/daemons/:daemonId/projects/:projectId/sessions", async (req, res) => {
+  try {
+    res.status(201).json(
+      await requestDaemon(req.params.daemonId, "createProjectSession", {
+        projectId: req.params.projectId,
+        ...(req.body ?? {}),
+      }),
+    );
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
   }
@@ -515,6 +673,13 @@ function partitionDaemonEvents(events: DaemonEvent[]) {
       case "session-created":
       case "session-updated":
       case "session-deleted":
+      case "project-created":
+      case "project-updated":
+      case "agent-created":
+      case "agent-updated":
+      case "agent-log-entry":
+      case "project-notification":
+      case "session-git-updated":
         sharedEvents.push(event);
         break;
       case "session-entry":
@@ -570,6 +735,13 @@ function shouldSendDaemonEvent(
     case "session-created":
     case "session-updated":
     case "session-deleted":
+    case "project-created":
+    case "project-updated":
+    case "agent-created":
+    case "agent-updated":
+    case "agent-log-entry":
+    case "project-notification":
+    case "session-git-updated":
       return true;
     case "session-entry":
     case "session-entry-updated":

@@ -55,8 +55,46 @@ export interface DaemonConfig {
   defaultModel?: string;
 }
 
+export type ProjectStatus = "idle" | "running" | "paused" | "blocked" | "completed" | "failed";
+
+export type AgentRole = "steward" | "foreman" | "sentinel";
+
+export type AgentStatus = "idle" | "running" | "waiting" | "blocked" | "paused" | "failed";
+
+export type AgentLogKind =
+  | "thought"
+  | "action"
+  | "observation"
+  | "decision"
+  | "escalation"
+  | "user_message"
+  | "agent_message"
+  | "system";
+
+export interface SessionGitCommitSummary {
+  hash: string;
+  subject: string;
+  committedAt?: string;
+}
+
+export interface SessionGitSummary {
+  isRepo: boolean;
+  branch?: string;
+  modifiedFileCount: number;
+  stagedFileCount: number;
+  untrackedFileCount: number;
+  head?: SessionGitCommitSummary;
+}
+
+export interface SessionGitDetails extends SessionGitSummary {
+  modifiedFiles: string[];
+  stagedFiles: string[];
+  untrackedFiles: string[];
+}
+
 export interface SessionSummary {
   id: string;
+  projectId?: string;
   title: string;
   cwd: string;
   createdAt: string;
@@ -73,17 +111,134 @@ export interface SessionSummary {
   lastError?: string;
   transcriptCount: number;
   previewEntries: SessionPreviewEntry[];
+  git?: SessionGitSummary;
 }
 
 export interface SessionDetails extends SessionSummary {
   transcript: TranscriptEntry[];
   hasMoreTranscriptBefore: boolean;
+  gitDetails?: SessionGitDetails;
 }
 
 export interface SessionTranscriptPage {
   sessionId: string;
   transcript: TranscriptEntry[];
   hasMoreTranscriptBefore: boolean;
+}
+
+export interface ProjectRunPolicy {
+  mode: "until_complete" | "until_time" | "until_blocked";
+  runUntil?: string;
+}
+
+export interface ProjectSummary {
+  id: string;
+  name: string;
+  rootDir: string;
+  goal: string;
+  status: ProjectStatus;
+  createdAt: string;
+  updatedAt: string;
+  defaultSessionCwd: string;
+  sessionIds: string[];
+  agentIds: string[];
+  runPolicy: ProjectRunPolicy;
+}
+
+export interface ProjectDetails extends ProjectSummary {
+  sessions: SessionSummary[];
+  agents: AgentSummary[];
+}
+
+export interface CreateProjectInput {
+  name: string;
+  rootDir: string;
+  goal?: string;
+  runPolicy?: ProjectRunPolicy;
+}
+
+export interface UpdateProjectInput {
+  name?: string;
+  goal?: string;
+  status?: ProjectStatus;
+  runPolicy?: ProjectRunPolicy;
+}
+
+export interface AgentMemoryState {
+  summary: string;
+  summaryUpdatedAt?: string;
+  windowEntryIds: string[];
+}
+
+export interface AgentSummary {
+  id: string;
+  projectId: string;
+  role: AgentRole;
+  name: string;
+  status: AgentStatus;
+  boundSessionId?: string;
+  createdAt: string;
+  updatedAt: string;
+  model?: string;
+  provider?: string;
+  lastError?: string;
+}
+
+export interface AgentLogEntry {
+  id: string;
+  agentId: string;
+  kind: AgentLogKind;
+  direction: "inbound" | "outbound" | "internal";
+  sourceAgentId?: string;
+  targetAgentId?: string;
+  text: string;
+  createdAt: string;
+  meta?: Record<string, unknown>;
+}
+
+export interface AgentDetails extends AgentSummary {
+  memory: AgentMemoryState;
+  logs: AgentLogEntry[];
+}
+
+export interface SendAgentMessageInput {
+  text: string;
+}
+
+export interface ProviderConfig {
+  provider: "openai";
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  temperature?: number;
+  maxOutputTokens?: number;
+}
+
+export interface NotificationConfig {
+  smtpHost: string;
+  smtpPort: number;
+  smtpUser: string;
+  smtpPass: string;
+  smtpFrom: string;
+  smtpSecure: boolean;
+}
+
+export interface GlobalSettings {
+  provider: ProviderConfig;
+  notifications: NotificationConfig;
+}
+
+export interface ProjectNotification {
+  id: string;
+  projectId: string;
+  severity: "info" | "warning" | "critical";
+  channel: "inbox" | "email";
+  subject: string;
+  body: string;
+  status: "pending" | "sent" | "failed" | "skipped";
+  scheduledAt?: string;
+  sentAt?: string;
+  createdAt: string;
 }
 
 export interface CodexHistoryEntry {
@@ -176,4 +331,33 @@ export type DaemonEvent =
       sessionId: string;
       transcript: TranscriptEntry[];
       hasMoreTranscriptBefore: boolean;
+    }
+  | {
+      type: "project-created";
+      project: ProjectSummary;
+    }
+  | {
+      type: "project-updated";
+      project: ProjectSummary;
+    }
+  | {
+      type: "agent-created";
+      agent: AgentSummary;
+    }
+  | {
+      type: "agent-updated";
+      agent: AgentSummary;
+    }
+  | {
+      type: "agent-log-entry";
+      entry: AgentLogEntry;
+    }
+  | {
+      type: "project-notification";
+      notification: ProjectNotification;
+    }
+  | {
+      type: "session-git-updated";
+      sessionId: string;
+      git: SessionGitSummary;
     };
