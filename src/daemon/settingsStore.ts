@@ -9,6 +9,7 @@ const DEFAULT_SETTINGS: GlobalSettings = {
     baseUrl: "https://api.openai.com/v1",
     apiKey: "",
     model: "gpt-5.3-codex",
+    apiFormat: "responses",
     temperature: 0.2,
     maxOutputTokens: 4000,
   },

@@ -42,6 +42,8 @@ export function AppMainPane(props: {
   onRenameSession: () => void;
   notifications: ProjectNotification[];
   onSendAgentMessage: (text: string) => void;
+  onClearAgentLogs: () => void;
+  clearingAgentLogs: boolean;
   projectFiles: ProjectFileBrowseResult | null;
   projectFilesLoading: boolean;
   selectedFile: ProjectFileReadResult | null;
@@ -201,7 +203,13 @@ export function AppMainPane(props: {
       </div>
 
       {props.sidebarMode === "agents" ? (
-        <AgentPane agent={props.activeAgent} notifications={props.notifications} onSendMessage={props.onSendAgentMessage} />
+        <AgentPane
+          agent={props.activeAgent}
+          notifications={props.notifications}
+          onSendMessage={props.onSendAgentMessage}
+          onClearLogs={props.onClearAgentLogs}
+          clearingLogs={props.clearingAgentLogs}
+        />
       ) : props.sessionPane === "files" ? (
         <>
           <Suspense

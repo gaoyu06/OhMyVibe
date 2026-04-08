@@ -29,6 +29,7 @@ export class JsonRpcProcess extends EventEmitter<{
   private nextId = 1;
   private stdoutBuffer = "";
   private stderrBuffer = "";
+  private finished = false;
 
   constructor(command: string, args: string[], cwd: string) {
     super();
@@ -42,15 +43,17 @@ export class JsonRpcProcess extends EventEmitter<{
     this.child.stderr.setEncoding("utf8");
     this.child.stdout.on("data", (chunk: string) => this.onStdout(chunk));
     this.child.stderr.on("data", (chunk: string) => this.onStderr(chunk));
+    this.child.stdin.on("error", (error) => this.handleFailure(error));
+    this.child.stdout.on("error", (error) => this.handleFailure(error));
+    this.child.stderr.on("error", (error) => this.handleFailure(error));
     this.child.on("error", (error) => {
-      for (const pending of this.pending.values()) {
-        pending.reject(error);
-      }
-      this.pending.clear();
-      this.emit("stderr", error.message);
-      this.emit("exit", { code: null, signal: null });
+      this.handleFailure(error, { code: null, signal: null });
     });
     this.child.on("exit", (code, signal) => {
+      if (this.finished) {
+        return;
+      }
+      this.finished = true;
       this.flushStderr();
       const error = new Error(`JSON-RPC process exited (code=${code}, signal=${signal})`);
       for (const pending of this.pending.values()) {
@@ -176,5 +179,22 @@ export class JsonRpcProcess extends EventEmitter<{
     if (remaining) {
       this.emit("stderr", remaining);
     }
+  }
+
+  private handleFailure(
+    error: Error,
+    exit: { code: number | null; signal: NodeJS.Signals | null } = { code: null, signal: null },
+  ): void {
+    if (this.finished) {
+      return;
+    }
+    this.finished = true;
+    for (const pending of this.pending.values()) {
+      pending.reject(error);
+    }
+    this.pending.clear();
+    this.flushStderr();
+    this.emit("stderr", error.message);
+    this.emit("exit", exit);
   }
 }

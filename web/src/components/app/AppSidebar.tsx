@@ -1,4 +1,10 @@
-import { Bot, PanelLeftOpen, Trash2 } from "lucide-react";
+import { PanelLeftOpen, Trash2 } from "lucide-react";
+import {
+  getAgentRoleBadgeClassName,
+  getAgentRoleCardClassName,
+  getAgentRoleEmoji,
+  getAgentRoleLabel,
+} from "@/components/app/agentUi";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -124,20 +130,25 @@ export function AppSidebar({
                     onClick={() => onSelectAgent(agent.id)}
                     className={[
                       "grid min-w-0 w-full gap-1 overflow-hidden rounded-xl border px-2.5 py-2 text-left text-xs",
-                      activeAgentId === agent.id
-                        ? "border-border bg-card shadow-sm"
-                        : "border-border/70 bg-card/45 hover:bg-accent/30",
+                      getAgentRoleCardClassName(agent.role, activeAgentId === agent.id),
                     ].join(" ")}
                   >
                     <div className="flex items-center justify-between gap-2">
                       <div className="min-w-0">
-                        <div className="truncate text-[13px] font-medium">{agent.name}</div>
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span className="shrink-0 text-sm leading-none">{getAgentRoleEmoji(agent.role)}</span>
+                          <div className="truncate text-[13px] font-medium">{agent.name}</div>
+                        </div>
                         <div className="mt-1 flex items-center gap-2 text-[11px] text-muted-foreground">
-                          <span className="uppercase tracking-[0.14em]">{agent.role}</span>
+                          <span
+                            className={`rounded-full border px-1.5 py-0.5 uppercase tracking-[0.14em] ${getAgentRoleBadgeClassName(agent.role)}`}
+                          >
+                            {getAgentRoleLabel(agent.role)}
+                          </span>
                           <span>{agent.status}</span>
                         </div>
                       </div>
-                      <Bot className="h-4 w-4 shrink-0 text-muted-foreground" />
+                      <span className="shrink-0 text-base leading-none">{getAgentRoleEmoji(agent.role)}</span>
                     </div>
                     {agent.boundSessionId ? (
                       <div className="truncate text-[11px] text-muted-foreground">Session {agent.boundSessionId}</div>

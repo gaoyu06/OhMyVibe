@@ -264,6 +264,11 @@ export class ManagementBridge {
           String(params.agentId),
           String(params.text ?? ""),
         );
+      case "clearAgentLogs":
+        return this.projectManager.clearAgentLogs(
+          String(params.projectId),
+          String(params.agentId),
+        );
       case "runProject":
         return this.projectManager.runProject(String(params.projectId));
       case "pauseProject":

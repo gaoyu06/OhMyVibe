@@ -3,19 +3,43 @@ import { AppHeader } from "@/components/app/AppHeader";
 import { type ConnectionState, useDaemonConnection } from "@/components/app/useDaemonConnection";
 import { AppMainPane } from "@/components/app/AppMainPane";
 import { AppSidebar } from "@/components/app/AppSidebar";
+import { useDirectoryBrowser } from "@/components/app/useDirectoryBrowser";
 import { useHistoryRestore } from "@/components/app/useHistoryRestore";
 import { OverviewPane } from "@/components/app/OverviewPane";
 import { type PendingAssistantState, useChatTranscript } from "@/components/app/useChatTranscript";
 import { useOverviewLayouts } from "@/components/app/useOverviewLayouts";
 import { useSessionFiles } from "@/components/app/useSessionFiles";
-import { fetchControlApi } from "@/lib/controlApi";
+import {
+  clearProjectAgentLogs,
+  createProject,
+  createProjectSession,
+  deleteSession,
+  getDaemonConfig,
+  getDaemonSettings,
+  getProjectAgent,
+  getSessionDetails,
+  getSessionTranscriptPage,
+  interruptSession,
+  listDaemonProjects,
+  listDaemonSessions,
+  listProjectAgents,
+  listProjectNotifications,
+  patchNotificationSettings,
+  patchProviderSettings,
+  patchSessionConfig,
+  pauseProject,
+  postAgentMessage,
+  postSessionMessage,
+  renameSession,
+  respondSessionApproval,
+  runProject,
+} from "@/lib/daemonApi";
 import type {
   AgentDetails,
   AgentSummary,
   DaemonConfig,
   DaemonDescriptor,
   DaemonEvent,
-  DirectoryBrowseResult,
   GlobalSettings,
   ProjectNotification,
   ProjectSummary,
@@ -47,10 +71,10 @@ function App() {
   const [activeAgent, setActiveAgent] = useState<AgentDetails | null>(null);
   const [projectNotifications, setProjectNotifications] = useState<ProjectNotification[]>([]);
   const [settings, setSettings] = useState<GlobalSettings | null>(null);
+  const [clearingAgentLogs, setClearingAgentLogs] = useState(false);
   const [newSessionOpen, setNewSessionOpen] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [directoryPickerOpen, setDirectoryPickerOpen] = useState(false);
   const [sidebarMode, setSidebarMode] = useState<"sessions" | "agents">("sessions");
   const [sessionsCollapsed, setSessionsCollapsed] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -67,9 +91,6 @@ function App() {
   const [pendingAssistant, setPendingAssistant] = useState<PendingAssistantState | null>(null);
   const [composer, setComposer] = useState("");
   const [cwd, setCwd] = useState("C:\\");
-  const [directoryBrowser, setDirectoryBrowser] = useState<DirectoryBrowseResult | null>(null);
-  const [directoryBrowserLoading, setDirectoryBrowserLoading] = useState(false);
-  const [directoryBrowserPath, setDirectoryBrowserPath] = useState("");
   const [creatingProject, setCreatingProject] = useState(false);
   const [projectName, setProjectName] = useState("");
   const [projectGoal, setProjectGoal] = useState("");
@@ -281,6 +302,20 @@ function App() {
     },
   });
   const {
+    directoryPickerOpen,
+    setDirectoryPickerOpen,
+    directoryBrowserPath,
+    setDirectoryBrowserPath,
+    directoryBrowser,
+    directoryBrowserLoading,
+    openDirectoryPicker,
+    browseDirectory,
+  } = useDirectoryBrowser({
+    controlUrl,
+    activeDaemonId,
+    cwd,
+  });
+  const {
     historySearch,
     setHistorySearch,
     historyOpen,
@@ -463,12 +498,8 @@ function App() {
     }
   }
 
-  async function api<T>(path: string, options?: RequestInit) {
-    return fetchControlApi<T>(controlUrl, path, options);
-  }
-
   async function loadConfig(daemonId: string) {
-    const nextConfig = await api<DaemonConfig>(`/api/daemons/${daemonId}/config`);
+    const nextConfig = await getDaemonConfig(controlUrl, daemonId);
     setConfig(nextConfig);
     const nextModel = nextConfig.defaultModel || nextConfig.models[0]?.model || "";
     if (nextModel) {
@@ -479,12 +510,12 @@ function App() {
   }
 
   async function loadSessions(daemonId: string) {
-    const nextSessions = await api<SessionSummary[]>(`/api/daemons/${daemonId}/sessions`);
+    const nextSessions = await listDaemonSessions(controlUrl, daemonId);
     setSessions(nextSessions.map(normalizeSessionSummary));
   }
 
   async function loadProjects(daemonId: string) {
-    const nextProjects = await api<ProjectSummary[]>(`/api/daemons/${daemonId}/projects`);
+    const nextProjects = await listDaemonProjects(controlUrl, daemonId);
     setProjects(nextProjects);
     setActiveProjectId((current) => {
       if (current && nextProjects.some((project) => project.id === current)) {
@@ -495,27 +526,23 @@ function App() {
   }
 
   async function loadAgents(daemonId: string, projectId: string) {
-    const nextAgents = await api<AgentSummary[]>(`/api/daemons/${daemonId}/projects/${projectId}/agents`);
+    const nextAgents = await listProjectAgents(controlUrl, daemonId, projectId);
     setAgents((current) => mergeAgentSummaries(current, nextAgents, projectId));
   }
 
   async function loadAgent(daemonId: string, projectId: string, agentId: string) {
-    const nextAgent = await api<AgentDetails>(
-      `/api/daemons/${daemonId}/projects/${projectId}/agents/${agentId}`,
-    );
+    const nextAgent = await getProjectAgent(controlUrl, daemonId, projectId, agentId);
     setActiveAgent(nextAgent);
     setAgents((current) => upsertAgentSummary(current, nextAgent));
   }
 
   async function loadNotifications(daemonId: string, projectId: string) {
-    const nextNotifications = await api<ProjectNotification[]>(
-      `/api/daemons/${daemonId}/projects/${projectId}/notifications`,
-    );
+    const nextNotifications = await listProjectNotifications(controlUrl, daemonId, projectId);
     setProjectNotifications(nextNotifications);
   }
 
   async function loadSettings(daemonId: string) {
-    const nextSettings = await api<GlobalSettings>(`/api/daemons/${daemonId}/settings`);
+    const nextSettings = await getDaemonSettings(controlUrl, daemonId);
     setSettings(nextSettings);
   }
 
@@ -524,11 +551,7 @@ function App() {
     loadSessionRequestIdRef.current = requestId;
     setSessionLoading(true);
     try {
-      const session = normalizeSessionDetails(
-        await api<SessionDetails>(
-          `/api/daemons/${daemonId}/sessions/${sessionId}?limit=${TRANSCRIPT_INITIAL_COUNT}`,
-        ),
-      );
+      const session = normalizeSessionDetails(await getSessionDetails(controlUrl, daemonId, sessionId, TRANSCRIPT_INITIAL_COUNT));
       if (loadSessionRequestIdRef.current !== requestId) {
         return;
       }
@@ -556,8 +579,12 @@ function App() {
     loadOlderTranscriptRequestIdRef.current = requestId;
     setLoadingOlderTranscript(true);
     try {
-      const page = await api<SessionTranscriptPage>(
-        `/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/transcript?beforeEntryId=${encodeURIComponent(beforeEntryId)}&limit=${TRANSCRIPT_CHUNK_SIZE}`,
+      const page = await getSessionTranscriptPage(
+        controlUrl,
+        activeDaemonId,
+        activeSessionId,
+        beforeEntryId,
+        TRANSCRIPT_CHUNK_SIZE,
       );
       if (
         loadOlderTranscriptRequestIdRef.current !== requestId ||
@@ -575,19 +602,6 @@ function App() {
     }
   }
 
-  async function loadDirectories(daemonId: string, nextPath?: string) {
-    setDirectoryBrowserLoading(true);
-    try {
-      const query = nextPath ? `?path=${encodeURIComponent(nextPath)}` : "";
-      const result = await api<DirectoryBrowseResult>(`/api/daemons/${daemonId}/directories${query}`);
-      setDirectoryBrowser(result);
-      setDirectoryBrowserPath(result.currentPath);
-      return result;
-    } finally {
-      setDirectoryBrowserLoading(false);
-    }
-  }
-
   async function handleCreateSession() {
     if (!activeDaemonId || !activeProjectId) {
       return;
@@ -595,15 +609,12 @@ function App() {
     setCreatingSession(true);
     try {
       const session = normalizeSessionDetails(
-        await api<SessionDetails>(`/api/daemons/${activeDaemonId}/projects/${activeProjectId}/sessions`, {
-          method: "POST",
-          body: JSON.stringify({
-            cwd,
-            model,
-            reasoningEffort: effort,
-            sandbox,
-            approvalPolicy,
-          }),
+        await createProjectSession(controlUrl, activeDaemonId, activeProjectId, {
+          cwd,
+          model,
+          reasoningEffort: effort,
+          sandbox,
+          approvalPolicy,
         }),
       );
       setActiveSessionId(session.id);
@@ -622,14 +633,11 @@ function App() {
     }
     setCreatingProject(true);
     try {
-      const project = await api<ProjectSummary>(`/api/daemons/${activeDaemonId}/projects`, {
-        method: "POST",
-        body: JSON.stringify({
-          name: projectName.trim(),
-          rootDir: cwd.trim(),
-          goal: projectGoal.trim(),
-          runPolicy: { mode: "until_blocked" },
-        }),
+      const project = await createProject(controlUrl, activeDaemonId, {
+        name: projectName.trim(),
+        rootDir: cwd.trim(),
+        goal: projectGoal.trim(),
+        runPolicy: { mode: "until_blocked" },
       });
       setProjects((current) => upsertProjectSummary(current, project));
       setActiveProjectId(project.id);
@@ -641,21 +649,6 @@ function App() {
 
   function handleSelectSession(sessionId: string) {
     setActiveSessionId(sessionId);
-  }
-
-  async function handleOpenDirectoryPicker() {
-    if (!activeDaemonId) {
-      return;
-    }
-    setDirectoryPickerOpen(true);
-    await loadDirectories(activeDaemonId, cwd);
-  }
-
-  async function handleBrowseDirectory(pathValue?: string) {
-    if (!activeDaemonId) {
-      return;
-    }
-    await loadDirectories(activeDaemonId, pathValue ?? directoryBrowserPath);
   }
 
   async function sendMessageText(text: string) {
@@ -694,10 +687,7 @@ function App() {
       setComposer("");
     }
     try {
-      await api(`/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/messages`, {
-        method: "POST",
-        body: JSON.stringify({ text: trimmed }),
-      });
+      await postSessionMessage(controlUrl, activeDaemonId, activeSessionId, trimmed);
       if (!optimisticAssistant) {
         setSendingMessage(false);
       }
@@ -722,10 +712,7 @@ function App() {
     if (!activeDaemonId || !activeProjectId) {
       return;
     }
-    const project = await api<ProjectSummary>(
-      `/api/daemons/${activeDaemonId}/projects/${activeProjectId}/run`,
-      { method: "POST" },
-    );
+    const project = await runProject(controlUrl, activeDaemonId, activeProjectId);
     setProjects((current) => upsertProjectSummary(current, project));
   }
 
@@ -733,10 +720,7 @@ function App() {
     if (!activeDaemonId || !activeProjectId) {
       return;
     }
-    const project = await api<ProjectSummary>(
-      `/api/daemons/${activeDaemonId}/projects/${activeProjectId}/pause`,
-      { method: "POST" },
-    );
+    const project = await pauseProject(controlUrl, activeDaemonId, activeProjectId);
     setProjects((current) => upsertProjectSummary(current, project));
   }
 
@@ -744,35 +728,31 @@ function App() {
     if (!activeDaemonId || !activeProjectId || !activeAgentId || !text.trim()) {
       return;
     }
-    const agent = await api<AgentDetails>(
-      `/api/daemons/${activeDaemonId}/projects/${activeProjectId}/agents/${activeAgentId}/messages`,
-      {
-        method: "POST",
-        body: JSON.stringify({ text: text.trim() }),
-      },
-    );
+    const agent = await postAgentMessage(controlUrl, activeDaemonId, activeProjectId, activeAgentId, text.trim());
     setActiveAgent(agent);
     setAgents((current) => upsertAgentSummary(current, agent));
+  }
+
+  async function handleClearAgentLogs() {
+    if (!activeDaemonId || !activeProjectId || !activeAgentId) {
+      return;
+    }
+    setClearingAgentLogs(true);
+    try {
+      const agent = await clearProjectAgentLogs(controlUrl, activeDaemonId, activeProjectId, activeAgentId);
+      setActiveAgent(agent);
+      setAgents((current) => upsertAgentSummary(current, agent));
+    } finally {
+      setClearingAgentLogs(false);
+    }
   }
 
   async function handleSaveSettings(nextSettings: GlobalSettings) {
     if (!activeDaemonId) {
       return;
     }
-    const providerSettings = await api<GlobalSettings>(
-      `/api/daemons/${activeDaemonId}/settings/provider`,
-      {
-        method: "PATCH",
-        body: JSON.stringify(nextSettings.provider),
-      },
-    );
-    const finalSettings = await api<GlobalSettings>(
-      `/api/daemons/${activeDaemonId}/settings/notifications`,
-      {
-        method: "PATCH",
-        body: JSON.stringify(nextSettings.notifications),
-      },
-    );
+    const providerSettings = await patchProviderSettings(controlUrl, activeDaemonId, nextSettings.provider);
+    const finalSettings = await patchNotificationSettings(controlUrl, activeDaemonId, nextSettings.notifications);
     setSettings(finalSettings ?? providerSettings);
     setSettingsOpen(false);
   }
@@ -786,15 +766,7 @@ function App() {
     if (!activeDaemonId || !activeSessionId) {
       return;
     }
-    const session = normalizeSessionDetails(
-      await api<SessionDetails>(
-        `/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/config`,
-        {
-          method: "PATCH",
-          body: JSON.stringify(next),
-        },
-      ),
-    );
+    const session = normalizeSessionDetails(await patchSessionConfig(controlUrl, activeDaemonId, activeSessionId, next));
     setActiveSession((current) => mergeSessionDetails(current, session));
     setSessions((current) => upsertSessionSummary(current, session));
   }
@@ -803,18 +775,14 @@ function App() {
     if (!activeDaemonId || !activeSessionId) {
       return;
     }
-    await api(`/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/interrupt`, {
-      method: "POST",
-    });
+    await interruptSession(controlUrl, activeDaemonId, activeSessionId);
   }
 
   async function handleDeleteSession(sessionId: string) {
     if (!activeDaemonId) {
       return;
     }
-    await api(`/api/daemons/${activeDaemonId}/sessions/${sessionId}`, {
-      method: "DELETE",
-    });
+    await deleteSession(controlUrl, activeDaemonId, sessionId);
   }
 
   async function handleRenameSession() {
@@ -824,13 +792,7 @@ function App() {
     setRenamingSession(true);
     try {
       const session = normalizeSessionDetails(
-        await api<SessionDetails>(
-          `/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/title`,
-          {
-            method: "PATCH",
-            body: JSON.stringify({ title: renameTitle.trim() }),
-          },
-        ),
+        await renameSession(controlUrl, activeDaemonId, activeSessionId, renameTitle.trim()),
       );
       setActiveSession((current) => mergeSessionDetails(current, session));
       setSessions((current) => upsertSessionSummary(current, session));
@@ -853,13 +815,7 @@ function App() {
     setApprovalActionId(entry.id);
     try {
       const session = normalizeSessionDetails(
-        await api<SessionDetails>(
-          `/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/approvals/${encodeURIComponent(approvalRequestId)}`,
-          {
-            method: "POST",
-            body: JSON.stringify({ decision }),
-          },
-        ),
+        await respondSessionApproval(controlUrl, activeDaemonId, activeSessionId, approvalRequestId, decision),
       );
       setActiveSession((current) => mergeSessionDetails(current, session));
       setSessions((current) => upsertSessionSummary(current, session));
@@ -893,7 +849,7 @@ function App() {
           activeDaemonAvailable={Boolean(activeDaemonId)}
           creatingProject={creatingProject}
           onCreateProject={() => void handleCreateProject()}
-          onOpenDirectoryPicker={() => void handleOpenDirectoryPicker()}
+          onOpenDirectoryPicker={() => void openDirectoryPicker()}
           historyOpen={historyOpen}
           setHistoryOpen={(open) => {
             void setHistoryOpen(open);
@@ -919,7 +875,7 @@ function App() {
           setDirectoryBrowserPath={setDirectoryBrowserPath}
           directoryBrowser={directoryBrowser}
           directoryBrowserLoading={directoryBrowserLoading}
-          onBrowseDirectory={(pathValue) => void handleBrowseDirectory(pathValue)}
+          onBrowseDirectory={(pathValue) => void browseDirectory(pathValue)}
           theme={theme}
           setTheme={setTheme}
         />
@@ -999,6 +955,8 @@ function App() {
               onRenameSession={() => void handleRenameSession()}
               notifications={projectNotifications.filter((item) => item.projectId === activeProjectId)}
               onSendAgentMessage={(text) => void handleSendAgentMessage(text)}
+              onClearAgentLogs={() => void handleClearAgentLogs()}
+              clearingAgentLogs={clearingAgentLogs}
               projectFiles={projectFiles}
               projectFilesLoading={projectFilesLoading}
               selectedFile={selectedFile}

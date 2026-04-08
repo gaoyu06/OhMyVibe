@@ -210,6 +210,7 @@ export interface ProviderConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  apiFormat: "responses" | "chat_completions";
   temperature?: number;
   maxOutputTokens?: number;
 }

@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
-import { Bell, Send } from "lucide-react";
+import { Bell, Send, Trash2 } from "lucide-react";
+import {
+  getAgentRoleBadgeClassName,
+  getAgentRoleEmoji,
+  getAgentRoleLabel,
+  getAgentRolePanelClassName,
+} from "@/components/app/agentUi";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -11,10 +17,14 @@ export function AgentPane({
   agent,
   notifications,
   onSendMessage,
+  onClearLogs,
+  clearingLogs,
 }: {
   agent: AgentDetails | null;
   notifications: ProjectNotification[];
   onSendMessage: (text: string) => void;
+  onClearLogs: () => void;
+  clearingLogs: boolean;
 }) {
   const [composer, setComposer] = useState("");
 
@@ -31,11 +41,33 @@ export function AgentPane({
       <div className="grid min-h-0 grid-cols-1 gap-0 lg:grid-cols-[minmax(0,1fr)_320px]">
         <ScrollArea className="min-h-0 border-r border-border bg-muted/10">
           <div className="space-y-3 p-4">
-            <div className="rounded-xl border border-border bg-card p-3">
-              <div className="text-xs uppercase tracking-[0.18em] text-muted-foreground">{agent.role}</div>
-              <div className="mt-1 text-sm font-medium">{agent.name}</div>
-              <div className="mt-2 text-xs text-muted-foreground">
-                {agent.provider || "provider"} · {agent.model || "default model"} · {agent.status}
+            <div className={`rounded-xl border p-3 ${getAgentRolePanelClassName(agent.role)}`}>
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="text-lg leading-none">{getAgentRoleEmoji(agent.role)}</span>
+                    <span
+                      className={`rounded-full border px-2 py-0.5 text-[11px] uppercase tracking-[0.14em] ${getAgentRoleBadgeClassName(agent.role)}`}
+                    >
+                      {getAgentRoleLabel(agent.role)}
+                    </span>
+                  </div>
+                  <div className="mt-2 text-sm font-medium">{agent.name}</div>
+                  <div className="mt-2 text-xs text-muted-foreground">
+                    {agent.provider || "provider"} · {agent.model || "default model"} · {agent.status}
+                  </div>
+                </div>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-8 shrink-0"
+                  disabled={clearingLogs || (!agent.logs.length && !agent.memory.summary)}
+                  onClick={onClearLogs}
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Clear Logs
+                </Button>
               </div>
               {agent.boundSessionId ? (
                 <div className="mt-1 text-xs text-muted-foreground">Bound session: {agent.boundSessionId}</div>
@@ -46,18 +78,24 @@ export function AgentPane({
                 </div>
               ) : null}
             </div>
-            {agent.logs.map((entry) => (
-              <div key={entry.id} className="rounded-xl border border-border bg-card p-3">
-                <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
-                  <div className="flex items-center gap-2">
-                    <Badge variant="outline">{entry.kind}</Badge>
-                    <span>{entry.direction}</span>
+            {agent.logs.length ? (
+              agent.logs.map((entry) => (
+                <div key={entry.id} className="rounded-xl border border-border bg-card p-3">
+                  <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                    <div className="flex items-center gap-2">
+                      <Badge variant="outline">{entry.kind}</Badge>
+                      <span>{entry.direction}</span>
+                    </div>
+                    <span>{formatDateTime(entry.createdAt)}</span>
                   </div>
-                  <span>{formatDateTime(entry.createdAt)}</span>
+                  <div className="mt-2 whitespace-pre-wrap break-words text-sm leading-6">{entry.text}</div>
                 </div>
-                <div className="mt-2 whitespace-pre-wrap break-words text-sm leading-6">{entry.text}</div>
+              ))
+            ) : (
+              <div className="rounded-xl border border-dashed border-border p-5 text-sm text-muted-foreground">
+                No agent logs
               </div>
-            ))}
+            )}
           </div>
         </ScrollArea>
         <ScrollArea className="min-h-0 bg-background">
@@ -145,6 +183,23 @@ export function SettingsEditor({
     <div className="grid gap-4 p-4">
       <div className="grid gap-2">
         <div className="text-sm font-medium">Provider</div>
+        <select
+          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
+          value={draft.provider.apiFormat}
+          onChange={(event) =>
+            setDraft((current) => ({
+              ...current,
+              provider: {
+                ...current.provider,
+                apiFormat:
+                  event.target.value === "chat_completions" ? "chat_completions" : "responses",
+              },
+            }))
+          }
+        >
+          <option value="responses">Responses API</option>
+          <option value="chat_completions">Chat Completions API</option>
+        </select>
         <input
           className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
           value={draft.provider.baseUrl}

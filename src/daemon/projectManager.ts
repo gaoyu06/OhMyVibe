@@ -43,6 +43,11 @@ const GIT_CACHE_TTL_MS = 15_000;
 const AGENT_CONTEXT_WINDOW_TOKENS = 400_000;
 const AGENT_CONTEXT_WINDOW_CHARS = AGENT_CONTEXT_WINDOW_TOKENS * 4;
 const AGENT_RECENT_LOG_LIMIT = 80;
+const AGENT_RETRY_LIMIT = 3;
+const AGENT_RETRY_BASE_DELAY_MS = 1_500;
+const AGENT_PROMPT_TRANSCRIPT_PREVIEW_LIMIT = 6;
+const AGENT_PROMPT_LOG_PREVIEW_LIMIT = 6;
+const AGENT_PROMPT_TEXT_LIMIT = 600;
 
 interface GitCacheEntry {
   summary?: SessionGitSummary;
@@ -62,6 +67,8 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
   private readonly gitCache = new Map<string, GitCacheEntry>();
   private readonly agentQueue = new Set<string>();
   private readonly runningAgents = new Set<string>();
+  private readonly agentRetryCounts = new Map<string, number>();
+  private readonly agentRetryTimers = new Map<string, NodeJS.Timeout>();
 
   constructor(sessionManager: SessionManager) {
     super();
@@ -289,6 +296,25 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
     return structuredClone(agent);
   }
 
+  clearAgentLogs(projectId: string, agentId: string): AgentDetails {
+    const project = this.getProjectSummaryOrThrow(projectId);
+    const agent = this.getAgentOrThrow(agentId);
+    if (agent.projectId !== project.id) {
+      throw new Error(`Agent ${agentId} does not belong to project ${projectId}`);
+    }
+
+    agent.logs = [];
+    agent.memory.summary = "";
+    agent.memory.summaryUpdatedAt = undefined;
+    agent.memory.windowEntryIds = [];
+    agent.updatedAt = new Date().toISOString();
+    agent.lastError = undefined;
+    this.clearAgentRetryState(agent.id);
+    this.schedulePersist();
+    this.emit("event", { type: "agent-updated", agent: this.toAgentSummary(agent) });
+    return structuredClone(agent);
+  }
+
   async sendAgentMessage(projectId: string, agentId: string, text: string): Promise<AgentDetails> {
     const project = this.getProjectSummaryOrThrow(projectId);
     const agent = this.getAgentOrThrow(agentId);
@@ -302,12 +328,18 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
       text,
       meta: { projectId },
     });
+    this.clearAgentRetryState(agent.id);
     this.enqueueAgent(agent.id);
     return structuredClone(agent);
   }
 
   async runProject(projectId: string): Promise<ProjectDetails> {
     const project = this.getProjectSummaryOrThrow(projectId);
+    for (const agent of this.state.agents) {
+      if (agent.projectId === projectId) {
+        this.clearAgentRetryState(agent.id);
+      }
+    }
     project.status = "running";
     project.updatedAt = new Date().toISOString();
     this.schedulePersist();
@@ -337,6 +369,7 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
       if (agent.projectId !== projectId) {
         continue;
       }
+      this.clearAgentRetryState(agent.id);
       agent.status = "paused";
       agent.updatedAt = new Date().toISOString();
       this.emit("event", { type: "agent-updated", agent: this.toAgentSummary(agent) });
@@ -355,6 +388,7 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
       baseUrl: input.baseUrl.trim(),
       apiKey: input.apiKey,
       model: input.model.trim(),
+      apiFormat: input.apiFormat === "chat_completions" ? "chat_completions" : "responses",
       temperature: input.temperature,
       maxOutputTokens: input.maxOutputTokens,
     };
@@ -576,6 +610,7 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
     try {
       const client = new OpenAiAgentClient(this.settings.provider);
       const decision = await client.decide(agent, this.buildAgentPrompt(agent, project));
+      this.clearAgentRetryState(agent.id);
       if (decision.thought) {
         this.appendAgentLog(agent, {
           kind: "thought",
@@ -588,14 +623,7 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
       agent.updatedAt = new Date().toISOString();
       this.emit("event", { type: "agent-updated", agent: this.toAgentSummary(agent) });
     } catch (error) {
-      agent.status = "failed";
-      agent.lastError = error instanceof Error ? error.message : String(error);
-      agent.updatedAt = new Date().toISOString();
-      this.appendAgentLog(agent, {
-        kind: "system",
-        direction: "internal",
-        text: `Agent run failed: ${agent.lastError}`,
-      });
+      await this.handleAgentRunFailure(agent, project, error);
     }
   }
 
@@ -607,18 +635,15 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
     const siblingAgents = this.listAgents(project.id);
     const recentLogs = agent.logs
       .slice(-AGENT_RECENT_LOG_LIMIT)
-      .map((entry) => `${entry.createdAt} [${entry.kind}/${entry.direction}] ${entry.text}`)
+      .map((entry) => `${entry.createdAt} [${entry.kind}/${entry.direction}] ${this.truncateForAgentPrompt(entry.text)}`)
       .join("\n");
+    const sessionSnapshots = this.buildSessionSnapshots(project.id);
+    const siblingAgentActivity = this.buildSiblingAgentActivity(project.id, agent.id);
 
     return [
       {
         role: "system",
-        content: [
-          `You are ${agent.role} for project "${project.name}".`,
-          "Follow ReAct. Return strict JSON with keys thought, action, actionInput, stopReason, userFacingText.",
-          "Available actions: noop, create_session, send_session_instruction, message_agent, notify_user, mark_project_complete.",
-          "Keep working until blocked, complete, or user guidance is required.",
-        ].join("\n"),
+        content: this.buildAgentSystemPrompt(agent, project),
       },
       {
         role: "user",
@@ -628,7 +653,9 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
             agent: this.toAgentSummary(agent),
             memorySummary: agent.memory.summary,
             sessions: projectSessions,
+            sessionSnapshots,
             agents: siblingAgents,
+            siblingAgentActivity,
             recentLogs,
           },
           null,
@@ -694,9 +721,11 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
             ? decision.actionInput.sessionId
             : agent.boundSessionId;
         const instruction =
-          typeof decision.actionInput?.text === "string" ? decision.actionInput.text.trim() : "";
+          typeof decision.actionInput?.instruction === "string"
+            ? decision.actionInput.instruction.trim()
+            : "";
         if (!sessionId || !instruction) {
-          throw new Error("send_session_instruction requires sessionId/text");
+          throw new Error("send_session_instruction requires sessionId/instruction");
         }
         await this.sendMessage(sessionId, instruction);
         this.appendAgentLog(agent, {
@@ -827,6 +856,198 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
 
   private findProjectAgent(projectId: string, role: AgentRole): AgentDetails | undefined {
     return this.state.agents.find((agent) => agent.projectId === projectId && agent.role === role);
+  }
+
+  private buildAgentSystemPrompt(agent: AgentDetails, project: ProjectSummary): string {
+    const commonLines = [
+      `You are ${agent.role} for project "${project.name}".`,
+      "Follow ReAct using the provided native tools.",
+      "Think briefly, then call exactly one tool for the next action.",
+      "Never return plain JSON instead of a native tool call.",
+      "Base decisions on concrete evidence from the repository, session activity, or agent activity.",
+      "If evidence is insufficient, gather it first before planning or delegating.",
+      "Available tools/actions: noop, create_session, send_session_instruction, message_agent, notify_user, mark_project_complete.",
+    ];
+
+    if (agent.role === "steward") {
+      commonLines.push(
+        "You manage the whole project across multiple sessions.",
+        "Before assigning work or writing a plan, ensure the current codebase has been inspected in a session.",
+        "If no session has inspected the repository or the existing evidence is stale, use create_session or send_session_instruction to inspect the repository first.",
+        "Only after repository inspection should you break work down and assign or sequence tasks.",
+        "You may create new sessions when that improves parallel progress or isolates work."
+      );
+    } else if (agent.role === "foreman") {
+      commonLines.push(
+        "You supervise one execution session and drive it to the next concrete step.",
+        "Before requesting implementation or planning, first make sure the bound session has inspected the repository and identified relevant files.",
+        "Once the repository has been inspected, ask for a concrete plan, then drive execution step by step.",
+        "If blocked, message Steward or notify the user with the specific blocker."
+      );
+    } else {
+      commonLines.push(
+        "You evaluate whether information is worth reporting to the user and how urgent it is.",
+        "Do not manufacture urgency. Report only when the evidence justifies it."
+      );
+    }
+
+    commonLines.push("Keep working until blocked, complete, or user guidance is required.");
+    return commonLines.join("\n");
+  }
+
+  private buildSessionSnapshots(projectId: string) {
+    return this.listSessions()
+      .filter((session) => session.projectId === projectId)
+      .map((session) => {
+        const details = this.sessionManager.get(session.id, {
+          limit: AGENT_PROMPT_TRANSCRIPT_PREVIEW_LIMIT,
+        });
+        const boundAgents = this.state.agents
+          .filter((agent) => agent.projectId === projectId && agent.boundSessionId === session.id)
+          .map((agent) => ({
+            id: agent.id,
+            role: agent.role,
+            name: agent.name,
+            status: agent.status,
+            lastError: agent.lastError,
+          }));
+
+        return {
+          id: session.id,
+          title: session.title,
+          cwd: session.cwd,
+          status: session.status,
+          updatedAt: session.updatedAt,
+          transcriptCount: session.transcriptCount,
+          previewEntries: session.previewEntries,
+          git: session.git,
+          lastError: session.lastError,
+          boundAgents,
+          recentTranscript: (details?.transcript ?? []).slice(-AGENT_PROMPT_TRANSCRIPT_PREVIEW_LIMIT).map((entry) => ({
+            id: entry.id,
+            kind: entry.kind,
+            status: entry.status,
+            createdAt: entry.createdAt,
+            text: this.truncateForAgentPrompt(entry.text),
+          })),
+        };
+      });
+  }
+
+  private buildSiblingAgentActivity(projectId: string, activeAgentId: string) {
+    return this.state.agents
+      .filter((agent) => agent.projectId === projectId && agent.id !== activeAgentId)
+      .map((agent) => ({
+        id: agent.id,
+        role: agent.role,
+        name: agent.name,
+        status: agent.status,
+        boundSessionId: agent.boundSessionId,
+        lastError: agent.lastError,
+        recentLogs: agent.logs.slice(-AGENT_PROMPT_LOG_PREVIEW_LIMIT).map((entry) => ({
+          id: entry.id,
+          kind: entry.kind,
+          direction: entry.direction,
+          createdAt: entry.createdAt,
+          text: this.truncateForAgentPrompt(entry.text),
+        })),
+      }));
+  }
+
+  private truncateForAgentPrompt(text: string): string {
+    const trimmed = text.replace(/\s+/g, " ").trim();
+    if (trimmed.length <= AGENT_PROMPT_TEXT_LIMIT) {
+      return trimmed;
+    }
+    return `${trimmed.slice(0, AGENT_PROMPT_TEXT_LIMIT)}...`;
+  }
+
+  private async handleAgentRunFailure(
+    agent: AgentDetails,
+    project: ProjectSummary,
+    error: unknown,
+  ): Promise<void> {
+    const failureMessage = error instanceof Error ? error.message : String(error);
+    const nextAttempt = (this.agentRetryCounts.get(agent.id) ?? 0) + 1;
+    this.agentRetryCounts.set(agent.id, nextAttempt);
+
+    agent.status = "failed";
+    agent.lastError = failureMessage;
+    agent.updatedAt = new Date().toISOString();
+
+    if (nextAttempt < AGENT_RETRY_LIMIT) {
+      this.appendAgentLog(agent, {
+        kind: "system",
+        direction: "internal",
+        text: `Agent run failed (${nextAttempt}/${AGENT_RETRY_LIMIT}): ${failureMessage}. Retrying automatically.`,
+      });
+      this.scheduleAgentRetry(agent.id, nextAttempt);
+      return;
+    }
+
+    this.appendAgentLog(agent, {
+      kind: "system",
+      direction: "internal",
+      text: `Agent run failed (${nextAttempt}/${AGENT_RETRY_LIMIT}): ${failureMessage}. Project automation has been blocked.`,
+    });
+    this.clearAgentRetryState(agent.id);
+    this.blockProjectAfterAgentFailure(project, agent, failureMessage);
+  }
+
+  private scheduleAgentRetry(agentId: string, attempt: number): void {
+    const existingTimer = this.agentRetryTimers.get(agentId);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+
+    const timer = setTimeout(() => {
+      this.agentRetryTimers.delete(agentId);
+      this.enqueueAgent(agentId);
+    }, Math.min(AGENT_RETRY_BASE_DELAY_MS * attempt, 5_000));
+
+    this.agentRetryTimers.set(agentId, timer);
+  }
+
+  private clearAgentRetryState(agentId: string): void {
+    this.agentRetryCounts.delete(agentId);
+    const timer = this.agentRetryTimers.get(agentId);
+    if (timer) {
+      clearTimeout(timer);
+      this.agentRetryTimers.delete(agentId);
+    }
+  }
+
+  private blockProjectAfterAgentFailure(project: ProjectSummary, agent: AgentDetails, error: string): void {
+    if (project.status !== "blocked") {
+      project.status = "blocked";
+      project.updatedAt = new Date().toISOString();
+      this.schedulePersist();
+      this.emit("event", { type: "project-updated", project: { ...project } });
+    }
+
+    for (const sibling of this.state.agents) {
+      if (sibling.projectId !== project.id || sibling.id === agent.id) {
+        continue;
+      }
+      if (sibling.status === "running" || sibling.status === "waiting") {
+        sibling.status = "idle";
+        sibling.updatedAt = new Date().toISOString();
+        sibling.lastError = undefined;
+        this.emit("event", { type: "agent-updated", agent: this.toAgentSummary(sibling) });
+      }
+      this.clearAgentRetryState(sibling.id);
+    }
+
+    void this.createNotification({
+      id: randomUUID(),
+      projectId: project.id,
+      severity: "critical",
+      channel: "inbox",
+      subject: `${project.name} blocked`,
+      body: `Agent ${agent.name} failed ${AGENT_RETRY_LIMIT} times and project automation was blocked.\n\nLast error: ${error}`,
+      status: "pending",
+      createdAt: new Date().toISOString(),
+    });
   }
 
   private enrichSessionSummary(session: SessionSummary): SessionSummary {

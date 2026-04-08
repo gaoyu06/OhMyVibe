@@ -170,6 +170,19 @@ app.post("/api/daemons/:daemonId/projects/:projectId/agents/:agentId/messages", 
   }
 });
 
+app.delete("/api/daemons/:daemonId/projects/:projectId/agents/:agentId/logs", async (req, res) => {
+  try {
+    res.json(
+      await requestDaemon(req.params.daemonId, "clearAgentLogs", {
+        projectId: req.params.projectId,
+        agentId: req.params.agentId,
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 app.get("/api/daemons/:daemonId/projects/:projectId/notifications", async (req, res) => {
   try {
     res.json(
