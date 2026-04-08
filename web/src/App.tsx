@@ -100,6 +100,16 @@ interface ChatTranscriptRow {
   reasoning?: TranscriptEntry;
 }
 
+interface ChatTranscriptMeta {
+  rowCount: number;
+  lastRow?: ChatTranscriptRow;
+}
+
+interface ChatTranscriptMetaCache extends ChatTranscriptMeta {
+  transcript: TranscriptEntry[];
+  rowCounts: number[];
+}
+
 interface WorkspaceDefinition {
   id: string;
   sessionKeys: string[];
@@ -185,6 +195,11 @@ function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const activeDaemonIdRef = useRef<string | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
+  const chatTranscriptMetaCacheRef = useRef<ChatTranscriptMetaCache>({
+    transcript: [],
+    rowCounts: [],
+    rowCount: 0,
+  });
   const latestSubscriptionRef = useRef<{ daemonId: string | null; sessionId: string | null }>({
     daemonId: null,
     sessionId: null,
@@ -413,6 +428,11 @@ function App() {
     setSendingMessage(false);
     stickToBottomRef.current = true;
     setShowScrollToBottom(false);
+    chatTranscriptMetaCacheRef.current = {
+      transcript: [],
+      rowCounts: [],
+      rowCount: 0,
+    };
   }, [activeSessionId]);
 
   useEffect(() => {
@@ -489,13 +509,17 @@ function App() {
       ...(hasServerResponse ? [] : [pendingAssistant.entry]),
     ];
   }, [activeSessionId, pendingAssistant, transcript]);
-  const chatTranscript = useMemo(() => buildChatTranscriptRows(displayTranscript), [displayTranscript]);
-  const transcriptStart = Math.max(0, chatTranscript.length - loadedTranscriptCount);
+  const chatTranscriptMeta = useMemo(() => {
+    const nextCache = analyzeChatTranscript(displayTranscript, chatTranscriptMetaCacheRef.current);
+    chatTranscriptMetaCacheRef.current = nextCache;
+    return nextCache;
+  }, [displayTranscript]);
+  const visibleTranscriptCount = Math.min(loadedTranscriptCount, chatTranscriptMeta.rowCount);
   const visibleTranscript = useMemo(
-    () => chatTranscript.slice(transcriptStart),
-    [chatTranscript, transcriptStart],
+    () => buildVisibleChatTranscriptRows(displayTranscript, visibleTranscriptCount),
+    [displayTranscript, visibleTranscriptCount],
   );
-  const hasOlderTranscript = transcriptStart > 0;
+  const hasOlderTranscript = chatTranscriptMeta.rowCount > visibleTranscriptCount;
   const rowVirtualizer = useVirtualizer({
     count: visibleTranscript.length,
     getScrollElement: () => transcriptRef.current,
@@ -554,9 +578,9 @@ function App() {
     if (!lastEntry) {
       return "";
     }
-    const lastRow = chatTranscript[chatTranscript.length - 1];
+    const lastRow = chatTranscriptMeta.lastRow;
     return `${lastEntry.id}:${lastEntry.text.length}:${lastEntry.status ?? ""}:${lastRow?.reasoning?.text.length ?? 0}`;
-  }, [chatTranscript, displayTranscript]);
+  }, [chatTranscriptMeta.lastRow, displayTranscript]);
 
   useEffect(() => {
     if (!overviewLayoutKey) {
@@ -1753,7 +1777,7 @@ function App() {
                         })}
                       </div>
                     )}
-                    {showScrollToBottom && chatTranscript.length ? (
+                    {showScrollToBottom && chatTranscriptMeta.rowCount ? (
                       <div className="ui-fab-reveal pointer-events-none sticky bottom-3 z-20 flex justify-end px-3">
                         <Button
                           type="button"
@@ -2184,41 +2208,131 @@ function getAttachedReasoningText(reasoning?: TranscriptEntry, expanded: boolean
   return firstLine?.trim() ?? text;
 }
 
-function buildChatTranscriptRows(transcript: TranscriptEntry[]): ChatTranscriptRow[] {
-  const rows: ChatTranscriptRow[] = [];
+function createReasoningHostRow(reasoning: TranscriptEntry): ChatTranscriptRow {
+  return {
+    id: `reasoning-host:${reasoning.id}`,
+    entry: {
+      id: `reasoning-host:${reasoning.id}`,
+      kind: "assistant",
+      text: "",
+      createdAt: reasoning.createdAt,
+      status: reasoning.status === "streaming" ? "streaming" : "completed",
+    },
+    reasoning,
+  };
+}
+
+function createChatTranscriptRow(
+  transcript: TranscriptEntry[],
+  index: number,
+): ChatTranscriptRow | undefined {
+  const entry = transcript[index];
+  if (!entry) {
+    return undefined;
+  }
+
+  if (entry.kind === "reasoning") {
+    const nextEntry = transcript[index + 1];
+    if (nextEntry?.kind === "assistant" || nextEntry?.kind === "reasoning") {
+      return undefined;
+    }
+    return createReasoningHostRow(entry);
+  }
+
+  if (entry.kind === "assistant") {
+    const previousEntry = transcript[index - 1];
+    const reasoning = previousEntry?.kind === "reasoning" ? previousEntry : undefined;
+    return {
+      id: entry.id,
+      entry,
+      reasoning,
+    };
+  }
+
+  return {
+    id: entry.id,
+    entry,
+  };
+}
+
+function findChatTranscriptRebuildStart(
+  transcript: TranscriptEntry[],
+  previousTranscript: TranscriptEntry[],
+): number {
+  const sharedLength = Math.min(transcript.length, previousTranscript.length);
+  let rebuildStart = 0;
+
+  while (rebuildStart < sharedLength && transcript[rebuildStart] === previousTranscript[rebuildStart]) {
+    rebuildStart += 1;
+  }
+
+  if (rebuildStart === transcript.length && rebuildStart === previousTranscript.length) {
+    return -1;
+  }
+
+  while (
+    rebuildStart > 0 &&
+    (transcript[rebuildStart - 1]?.kind === "reasoning" ||
+      previousTranscript[rebuildStart - 1]?.kind === "reasoning")
+  ) {
+    rebuildStart -= 1;
+  }
+
+  return rebuildStart;
+}
+
+function analyzeChatTranscript(
+  transcript: TranscriptEntry[],
+  previous?: ChatTranscriptMetaCache,
+): ChatTranscriptMetaCache {
+  const rebuildStart =
+    previous?.transcript?.length
+      ? findChatTranscriptRebuildStart(transcript, previous.transcript)
+      : 0;
+
+  if (rebuildStart === -1 && previous) {
+    return previous;
+  }
+
+  const rowCounts = rebuildStart > 0 && previous ? previous.rowCounts.slice(0, rebuildStart) : [];
+  let rowCount = rebuildStart > 0 && previous ? (previous.rowCounts[rebuildStart - 1] ?? 0) : 0;
+  let lastRow =
+    rebuildStart > 0
+      ? createChatTranscriptRow(transcript, rebuildStart - 1) ?? previous?.lastRow
+      : undefined;
   let pendingReasoning: TranscriptEntry | undefined;
+  let pendingReasoningIndex = -1;
 
   const flushReasoning = () => {
-    if (!pendingReasoning) {
+    if (!pendingReasoning || pendingReasoningIndex === -1) {
       return;
     }
-    rows.push({
-      id: `reasoning-host:${pendingReasoning.id}`,
-      entry: {
-        id: `reasoning-host:${pendingReasoning.id}`,
-        kind: "assistant",
-        text: "",
-        createdAt: pendingReasoning.createdAt,
-        status: pendingReasoning.status === "streaming" ? "streaming" : "completed",
-      },
-      reasoning: pendingReasoning,
-    });
+    rowCount += 1;
+    lastRow = createReasoningHostRow(pendingReasoning);
+    rowCounts[pendingReasoningIndex] = rowCount;
     pendingReasoning = undefined;
+    pendingReasoningIndex = -1;
   };
 
-  for (const entry of transcript) {
+  for (let index = rebuildStart; index < transcript.length; index += 1) {
+    const entry = transcript[index];
+    if (!entry) {
+      continue;
+    }
+
     if (entry.kind === "reasoning") {
       pendingReasoning = entry;
+      pendingReasoningIndex = index;
+      rowCounts[index] = rowCount;
       continue;
     }
 
     if (entry.kind === "assistant") {
-      rows.push({
-        id: entry.id,
-        entry,
-        reasoning: pendingReasoning,
-      });
+      rowCount += 1;
+      lastRow = createChatTranscriptRow(transcript, index);
       pendingReasoning = undefined;
+      pendingReasoningIndex = -1;
+      rowCounts[index] = rowCount;
       continue;
     }
 
@@ -2226,17 +2340,67 @@ function buildChatTranscriptRows(transcript: TranscriptEntry[]): ChatTranscriptR
       flushReasoning();
     }
 
-    rows.push({
-      id: entry.id,
-      entry,
-    });
+    rowCount += 1;
+    lastRow = createChatTranscriptRow(transcript, index);
+    rowCounts[index] = rowCount;
   }
 
   if (pendingReasoning) {
     flushReasoning();
   }
 
-  return rows;
+  return {
+    transcript,
+    rowCounts,
+    rowCount,
+    lastRow,
+  };
+}
+
+function buildVisibleChatTranscriptRows(
+  transcript: TranscriptEntry[],
+  visibleCount: number,
+): ChatTranscriptRow[] {
+  if (!visibleCount) {
+    return [];
+  }
+
+  const reversedRows: ChatTranscriptRow[] = [];
+
+  for (let index = transcript.length - 1; index >= 0 && reversedRows.length < visibleCount; index -= 1) {
+    const entry = transcript[index];
+    if (!entry) {
+      continue;
+    }
+
+    if (entry.kind === "reasoning") {
+      const row = createChatTranscriptRow(transcript, index);
+      if (!row) {
+        continue;
+      }
+      reversedRows.push(row);
+      continue;
+    }
+
+    if (entry.kind === "assistant") {
+      const row = createChatTranscriptRow(transcript, index);
+      if (!row) {
+        continue;
+      }
+      if (row.reasoning) {
+        index -= 1;
+      }
+      reversedRows.push(row);
+      continue;
+    }
+
+    reversedRows.push({
+      id: entry.id,
+      entry,
+    });
+  }
+
+  return reversedRows.reverse();
 }
 
 function renderEntryBody(entry: TranscriptEntry, body: string, expanded: boolean) {
@@ -3006,36 +3170,6 @@ function updateTranscriptEntry(details: SessionDetails, entry: TranscriptEntry):
     ...transcript[index],
     ...entry,
   };
-  return {
-    ...details,
-    transcript,
-    transcriptCount: transcript.length,
-  };
-}
-
-function updateTranscriptEntries(
-  details: SessionDetails,
-  entries: TranscriptEntry[],
-  removedEntryIds?: string[],
-): SessionDetails {
-  const nextById = new Map(details.transcript.map((entry) => [entry.id, entry]));
-  for (const entry of entries) {
-    const existing = nextById.get(entry.id);
-    nextById.set(entry.id, existing ? { ...existing, ...entry } : entry);
-  }
-  if (removedEntryIds?.length) {
-    for (const entryId of removedEntryIds) {
-      nextById.delete(entryId);
-    }
-  }
-  const transcript = details.transcript
-    .filter((entry) => nextById.has(entry.id))
-    .map((entry) => nextById.get(entry.id) ?? entry);
-  for (const entry of entries) {
-    if (!details.transcript.some((item) => item.id === entry.id) && nextById.has(entry.id)) {
-      transcript.push(nextById.get(entry.id)!);
-    }
-  }
   return {
     ...details,
     transcript,

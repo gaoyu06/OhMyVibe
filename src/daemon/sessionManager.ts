@@ -395,7 +395,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     if (typeof target === "string" && target) {
       this.deletedSessionIds.delete(target);
       this.dirtySessionIds.add(target);
-    } else if (target) {
+    } else if (target && typeof target !== "string") {
       this.deletedSessionIds.delete(target.id);
       this.dirtySessionIds.add(target.id);
     } else {
