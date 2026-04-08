@@ -146,7 +146,14 @@ export class ManagementBridge {
       case "listSessions":
         return this.sessionManager.list();
       case "getSession":
-        return this.sessionManager.get(String(params.sessionId));
+        return this.sessionManager.get(String(params.sessionId), {
+          limit: typeof params.limit === "number" ? params.limit : undefined,
+        });
+      case "getSessionTranscript":
+        return this.sessionManager.getTranscriptPage(String(params.sessionId), {
+          beforeEntryId: typeof params.beforeEntryId === "string" ? params.beforeEntryId : undefined,
+          limit: typeof params.limit === "number" ? params.limit : undefined,
+        });
       case "listHistory":
         return this.sessionManager.listHistory();
       case "browseDirectories":

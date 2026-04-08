@@ -74,12 +74,34 @@ export function startHttpServer(sessionManager: SessionManager, port: number): h
   });
 
   app.get("/api/sessions/:sessionId", (req, res) => {
-    const session = sessionManager.get(req.params.sessionId);
+    const limit =
+      typeof req.query.limit === "string" && Number.isFinite(Number(req.query.limit))
+        ? Number(req.query.limit)
+        : undefined;
+    const session = sessionManager.get(req.params.sessionId, { limit });
     if (!session) {
       res.status(404).json({ error: "Session not found" });
       return;
     }
     res.json(session);
+  });
+
+  app.get("/api/sessions/:sessionId/transcript", (req, res) => {
+    try {
+      const beforeEntryId = typeof req.query.beforeEntryId === "string" ? req.query.beforeEntryId : undefined;
+      const limit =
+        typeof req.query.limit === "string" && Number.isFinite(Number(req.query.limit))
+          ? Number(req.query.limit)
+          : undefined;
+      const page = sessionManager.getTranscriptPage(req.params.sessionId, { beforeEntryId, limit });
+      if (!page) {
+        res.status(404).json({ error: "Session not found" });
+        return;
+      }
+      res.json(page);
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
   });
 
   app.post("/api/sessions/:sessionId/messages", async (req, res) => {

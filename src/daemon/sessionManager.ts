@@ -16,6 +16,7 @@ import {
   RestoreSessionInput,
   SessionDetails,
   SessionPreviewEntry,
+  SessionTranscriptPage,
   SessionStatus,
   SessionSummary,
   TranscriptEntry,
@@ -24,6 +25,8 @@ import {
 import { CodexAppServerClient } from "./codexAppServerClient.js";
 import { ManagedSession, SessionRuntime } from "./sessionRuntime.js";
 import { SessionStore } from "./sessionStore.js";
+
+const DEFAULT_SESSION_TRANSCRIPT_PAGE_SIZE = 120;
 
 export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
   private readonly sessions = new Map<string, ManagedSession>();
@@ -48,15 +51,37 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
-  get(sessionId: string): SessionDetails | undefined {
+  get(
+    sessionId: string,
+    options?: {
+      limit?: number;
+    },
+  ): SessionDetails | undefined {
     const session = this.sessions.get(sessionId);
     if (!session) {
       return undefined;
     }
 
+    return this.toDetails(session, options);
+  }
+
+  getTranscriptPage(
+    sessionId: string,
+    options?: {
+      beforeEntryId?: string;
+      limit?: number;
+    },
+  ): SessionTranscriptPage | undefined {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return undefined;
+    }
+
+    const slice = this.sliceTranscript(session, options);
     return {
-      ...this.toSummary(session),
-      transcript: [...session.transcript],
+      sessionId,
+      transcript: slice.transcript,
+      hasMoreTranscriptBefore: slice.hasMoreTranscriptBefore,
     };
   }
 
@@ -224,6 +249,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
   async create(input: CreateSessionInput): Promise<SessionDetails> {
     const sessionId = randomUUID();
     const cwd = path.resolve(input.cwd);
+    await this.ensureDirectoryExists(cwd);
     const now = new Date().toISOString();
 
     const session: ManagedSession = {
@@ -263,6 +289,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     }
 
     const cwd = path.resolve(input.cwd ?? process.cwd());
+    await this.ensureDirectoryExists(cwd);
     const now = new Date().toISOString();
     const session: ManagedSession = {
       id: randomUUID(),
@@ -627,6 +654,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       touch: (target) => this.touch(target),
       toSummary: (target) => this.toSummary(target),
       getDetails: (sessionId) => this.getOrThrow(sessionId),
+      createSessionResetEvent: (target) => this.toSessionResetEvent(target),
       addEntry: (target, input) => this.addEntry(target, input),
       upsertEntry: (target, entry) => this.upsertEntry(target, entry),
       normalizeReasoningEffort: (value) => this.normalizeReasoningEffort(value),
@@ -661,6 +689,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       transcriptCount: session.transcript.length,
       previewEntries,
       transcript: [...session.transcript],
+      hasMoreTranscriptBefore: false,
     };
   }
 
@@ -695,6 +724,76 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     session.previewEntries = this.toPreviewEntries(session.transcript);
     session.previewDirty = false;
     return session.previewEntries;
+  }
+
+  private toDetails(
+    session: ManagedSession,
+    options?: {
+      limit?: number;
+    },
+  ): SessionDetails {
+    const slice = this.sliceTranscript(session, { limit: options?.limit });
+    return {
+      ...this.toSummary(session),
+      transcript: slice.transcript,
+      hasMoreTranscriptBefore: slice.hasMoreTranscriptBefore,
+    };
+  }
+
+  private toSessionResetEvent(session: ManagedSession): Extract<DaemonEvent, { type: "session-reset" }> {
+    const slice = this.sliceTranscript(session, { limit: DEFAULT_SESSION_TRANSCRIPT_PAGE_SIZE });
+    return {
+      type: "session-reset",
+      sessionId: session.id,
+      transcript: slice.transcript,
+      hasMoreTranscriptBefore: slice.hasMoreTranscriptBefore,
+    };
+  }
+
+  private sliceTranscript(
+    session: ManagedSession,
+    options?: {
+      beforeEntryId?: string;
+      limit?: number;
+    },
+  ): {
+    transcript: TranscriptEntry[];
+    hasMoreTranscriptBefore: boolean;
+  } {
+    const transcript = session.transcript;
+    if (!transcript.length) {
+      return {
+        transcript: [],
+        hasMoreTranscriptBefore: false,
+      };
+    }
+
+    const normalizedLimit = this.normalizeTranscriptLimit(options?.limit, transcript.length);
+    const endExclusive =
+      options?.beforeEntryId == null
+        ? transcript.length
+        : this.findTranscriptCursorIndex(transcript, options.beforeEntryId);
+    const startIndex = Math.max(0, endExclusive - normalizedLimit);
+
+    return {
+      transcript: transcript.slice(startIndex, endExclusive),
+      hasMoreTranscriptBefore: startIndex > 0,
+    };
+  }
+
+  private normalizeTranscriptLimit(limit: number | undefined, transcriptLength: number): number {
+    if (!Number.isFinite(limit) || typeof limit !== "number" || limit <= 0) {
+      return DEFAULT_SESSION_TRANSCRIPT_PAGE_SIZE;
+    }
+    return Math.min(Math.floor(limit), transcriptLength);
+  }
+
+  private findTranscriptCursorIndex(transcript: TranscriptEntry[], beforeEntryId: string): number {
+    const index = transcript.findIndex((entry) => entry.id === beforeEntryId);
+    if (index === -1) {
+      throw new Error(`Transcript cursor not found: ${beforeEntryId}`);
+    }
+    return index;
   }
 
   private toPreviewEntries(transcript: TranscriptEntry[]): SessionPreviewEntry[] {
@@ -806,8 +905,13 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     return session;
   }
 
-  private getOrThrow(sessionId: string): SessionDetails {
-    const session = this.get(sessionId);
+  private getOrThrow(
+    sessionId: string,
+    options?: {
+      limit?: number;
+    },
+  ): SessionDetails {
+    const session = this.get(sessionId, options);
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
     }
@@ -898,6 +1002,22 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       throw new Error(`Path is outside session workspace: ${targetPath}`);
     }
     return resolvedPath;
+  }
+
+  private async ensureDirectoryExists(targetPath: string): Promise<void> {
+    let stat;
+    try {
+      stat = await fs.stat(targetPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        throw new Error(`Working directory does not exist: ${targetPath}`);
+      }
+      throw error;
+    }
+
+    if (!stat.isDirectory()) {
+      throw new Error(`Working directory is not a directory: ${targetPath}`);
+    }
   }
 
   private getMimeType(extension: string): string | undefined {

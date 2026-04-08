@@ -79,6 +79,13 @@ export interface SessionSummary {
 
 export interface SessionDetails extends SessionSummary {
   transcript: TranscriptEntry[];
+  hasMoreTranscriptBefore: boolean;
+}
+
+export interface SessionTranscriptPage {
+  sessionId: string;
+  transcript: TranscriptEntry[];
+  hasMoreTranscriptBefore: boolean;
 }
 
 export interface CreateSessionInput {
@@ -202,4 +209,5 @@ export type DaemonEvent =
       type: "session-reset";
       sessionId: string;
       transcript: TranscriptEntry[];
+      hasMoreTranscriptBefore: boolean;
     };

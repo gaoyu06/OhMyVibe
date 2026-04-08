@@ -1,3 +1,4 @@
+import fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import {
@@ -61,6 +62,7 @@ interface SessionRuntimeCallbacks {
   touch: (session: ManagedSession) => void;
   toSummary: (session: ManagedSession) => SessionSummary;
   getDetails: (sessionId: string) => SessionDetails;
+  createSessionResetEvent: (session: ManagedSession) => Extract<DaemonEvent, { type: "session-reset" }>;
   addEntry: (
     session: ManagedSession,
     input: Omit<TranscriptEntry, "id" | "createdAt">,
@@ -177,6 +179,7 @@ export class SessionRuntime {
   }
 
   async startFreshThread(input: CreateSessionInput): Promise<void> {
+    await this.ensureSpawnDirectoryExists();
     const codex = new CodexAppServerClient({ cwd: this.session.cwd });
     this.session.codex = codex;
     this.attachCodexHooks(codex);
@@ -232,6 +235,7 @@ export class SessionRuntime {
         return;
       }
 
+      await this.ensureSpawnDirectoryExists();
       const codex = new CodexAppServerClient({ cwd: this.session.cwd });
       this.session.codex = codex;
       this.attachCodexHooks(codex);
@@ -264,11 +268,7 @@ export class SessionRuntime {
       this.session.configDirty = false;
       this.callbacks.touch(this.session);
       this.callbacks.persist();
-      this.callbacks.emitChange({
-        type: "session-reset",
-        sessionId: this.session.id,
-        transcript: [...this.session.transcript],
-      });
+      this.callbacks.emitChange(this.callbacks.createSessionResetEvent(this.session));
       this.callbacks.emitChange({ type: "session-updated", session: this.callbacks.toSummary(this.session) });
     })();
 
@@ -700,6 +700,22 @@ export class SessionRuntime {
         };
       default:
         return undefined;
+    }
+  }
+
+  private async ensureSpawnDirectoryExists(): Promise<void> {
+    let stat;
+    try {
+      stat = await fs.stat(this.session.cwd);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        throw new Error(`Working directory does not exist: ${this.session.cwd}`);
+      }
+      throw error;
+    }
+
+    if (!stat.isDirectory()) {
+      throw new Error(`Working directory is not a directory: ${this.session.cwd}`);
     }
   }
 

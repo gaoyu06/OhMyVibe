@@ -61,6 +61,7 @@ import type {
   ProjectFileReadResult,
   SessionDetails,
   SessionPreviewEntry,
+  SessionTranscriptPage,
   SessionSummary,
   TranscriptEntry,
 } from "@/lib/types";
@@ -165,10 +166,10 @@ function App() {
   const [renamingSession, setRenamingSession] = useState(false);
   const [approvalActionId, setApprovalActionId] = useState<string | null>(null);
   const [sendingMessage, setSendingMessage] = useState(false);
+  const [loadingOlderTranscript, setLoadingOlderTranscript] = useState(false);
   const [pendingAssistant, setPendingAssistant] = useState<PendingAssistantState | null>(null);
-  const [loadedTranscriptCount, setLoadedTranscriptCount] = useState(TRANSCRIPT_INITIAL_COUNT);
   const [composer, setComposer] = useState("");
-  const [cwd, setCwd] = useState("C:\\Code\\Projects\\OhMyVibe");
+  const [cwd, setCwd] = useState("C:\\");
   const [directoryBrowser, setDirectoryBrowser] = useState<DirectoryBrowseResult | null>(null);
   const [directoryBrowserLoading, setDirectoryBrowserLoading] = useState(false);
   const [directoryBrowserPath, setDirectoryBrowserPath] = useState("");
@@ -207,6 +208,7 @@ function App() {
   const queuedActiveSessionEventsRef = useRef<DaemonEvent[]>([]);
   const queuedActiveSessionFlushRef = useRef<number | null>(null);
   const loadSessionRequestIdRef = useRef(0);
+  const loadOlderTranscriptRequestIdRef = useRef(0);
   const overviewDragRef = useRef<{
     sessionId: string;
     key: string;
@@ -327,9 +329,10 @@ function App() {
       if (incomingEvents) {
         for (const event of incomingEvents) {
           if (event.type === "session-created" || event.type === "session-updated") {
-            setSessions((current) => upsertSessionSummary(current, event.session));
+            const session = normalizeSessionSummary(event.session);
+            setSessions((current) => upsertSessionSummary(current, session));
             setActiveSession((current) =>
-              current && current.id === event.session.id ? { ...current, ...event.session } : current,
+              current && current.id === session.id ? { ...current, ...session } : current,
             );
             continue;
           }
@@ -422,8 +425,9 @@ function App() {
   }, [activeDaemonId, activeSessionId, viewMode]);
 
   useEffect(() => {
-    setLoadedTranscriptCount(TRANSCRIPT_INITIAL_COUNT);
+    loadOlderTranscriptRequestIdRef.current += 1;
     prependPendingRef.current = null;
+    setLoadingOlderTranscript(false);
     setPendingAssistant(null);
     setSendingMessage(false);
     stickToBottomRef.current = true;
@@ -514,12 +518,11 @@ function App() {
     chatTranscriptMetaCacheRef.current = nextCache;
     return nextCache;
   }, [displayTranscript]);
-  const visibleTranscriptCount = Math.min(loadedTranscriptCount, chatTranscriptMeta.rowCount);
   const visibleTranscript = useMemo(
-    () => buildVisibleChatTranscriptRows(displayTranscript, visibleTranscriptCount),
-    [displayTranscript, visibleTranscriptCount],
+    () => buildVisibleChatTranscriptRows(displayTranscript, chatTranscriptMeta.rowCount),
+    [chatTranscriptMeta.rowCount, displayTranscript],
   );
-  const hasOlderTranscript = chatTranscriptMeta.rowCount > visibleTranscriptCount;
+  const hasOlderTranscript = activeSession?.hasMoreTranscriptBefore ?? false;
   const rowVirtualizer = useVirtualizer({
     count: visibleTranscript.length,
     getScrollElement: () => transcriptRef.current,
@@ -746,7 +749,7 @@ function App() {
 
   async function loadSessions(daemonId: string) {
     const nextSessions = await api<SessionSummary[]>(`/api/daemons/${daemonId}/sessions`);
-    setSessions(nextSessions);
+    setSessions(nextSessions.map(normalizeSessionSummary));
   }
 
   async function loadSession(daemonId: string, sessionId: string) {
@@ -754,7 +757,11 @@ function App() {
     loadSessionRequestIdRef.current = requestId;
     setSessionLoading(true);
     try {
-      const session = await api<SessionDetails>(`/api/daemons/${daemonId}/sessions/${sessionId}`);
+      const session = normalizeSessionDetails(
+        await api<SessionDetails>(
+          `/api/daemons/${daemonId}/sessions/${sessionId}?limit=${TRANSCRIPT_INITIAL_COUNT}`,
+        ),
+      );
       if (loadSessionRequestIdRef.current !== requestId) {
         return;
       }
@@ -764,6 +771,39 @@ function App() {
     } finally {
       if (loadSessionRequestIdRef.current === requestId) {
         setSessionLoading(false);
+      }
+    }
+  }
+
+  async function loadOlderTranscriptPage() {
+    if (!activeDaemonId || !activeSessionId || !activeSession?.transcript.length || loadingOlderTranscript) {
+      return;
+    }
+
+    const beforeEntryId = activeSession.transcript[0]?.id;
+    if (!beforeEntryId || !activeSession.hasMoreTranscriptBefore) {
+      return;
+    }
+
+    const requestId = loadOlderTranscriptRequestIdRef.current + 1;
+    loadOlderTranscriptRequestIdRef.current = requestId;
+    setLoadingOlderTranscript(true);
+    try {
+      const page = await api<SessionTranscriptPage>(
+        `/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/transcript?beforeEntryId=${encodeURIComponent(beforeEntryId)}&limit=${TRANSCRIPT_CHUNK_SIZE}`,
+      );
+      if (
+        loadOlderTranscriptRequestIdRef.current !== requestId ||
+        activeDaemonIdRef.current !== activeDaemonId ||
+        activeSessionIdRef.current !== activeSessionId
+      ) {
+        return;
+      }
+
+      setActiveSession((current) => prependTranscriptPage(current, page));
+    } finally {
+      if (loadOlderTranscriptRequestIdRef.current === requestId) {
+        setLoadingOlderTranscript(false);
       }
     }
   }
@@ -826,16 +866,18 @@ function App() {
     }
     setCreatingSession(true);
     try {
-      const session = await api<SessionDetails>(`/api/daemons/${activeDaemonId}/sessions`, {
-        method: "POST",
-        body: JSON.stringify({
-          cwd,
-          model,
-          reasoningEffort: effort,
-          sandbox,
-          approvalPolicy,
+      const session = normalizeSessionDetails(
+        await api<SessionDetails>(`/api/daemons/${activeDaemonId}/sessions`, {
+          method: "POST",
+          body: JSON.stringify({
+            cwd,
+            model,
+            reasoningEffort: effort,
+            sandbox,
+            approvalPolicy,
+          }),
         }),
-      });
+      );
       setActiveSessionId(session.id);
       setActiveSession(session);
       setSessions((current) => upsertSessionSummary(current, session));
@@ -855,18 +897,20 @@ function App() {
     }
     setRestoringHistoryId(item.id);
     try {
-      const session = await api<SessionDetails>(
-        `/api/daemons/${activeDaemonId}/history/${item.id}/restore`,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            cwd: item.cwd || cwd,
-            model,
-            reasoningEffort: effort,
-            sandbox,
-            approvalPolicy,
-          }),
-        },
+      const session = normalizeSessionDetails(
+        await api<SessionDetails>(
+          `/api/daemons/${activeDaemonId}/history/${item.id}/restore`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              cwd: item.cwd || cwd,
+              model,
+              reasoningEffort: effort,
+              sandbox,
+              approvalPolicy,
+            }),
+          },
+        ),
       );
       setHistoryOpen(false);
       setActiveSessionId(session.id);
@@ -1043,14 +1087,16 @@ function App() {
     if (!activeDaemonId || !activeSessionId) {
       return;
     }
-    const session = await api<SessionDetails>(
-      `/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/config`,
-      {
-        method: "PATCH",
-        body: JSON.stringify(next),
-      },
+    const session = normalizeSessionDetails(
+      await api<SessionDetails>(
+        `/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/config`,
+        {
+          method: "PATCH",
+          body: JSON.stringify(next),
+        },
+      ),
     );
-    setActiveSession(session);
+    setActiveSession((current) => mergeSessionDetails(current, session));
     setSessions((current) => upsertSessionSummary(current, session));
   }
 
@@ -1078,14 +1124,16 @@ function App() {
     }
     setRenamingSession(true);
     try {
-      const session = await api<SessionDetails>(
-        `/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/title`,
-        {
-          method: "PATCH",
-          body: JSON.stringify({ title: renameTitle.trim() }),
-        },
+      const session = normalizeSessionDetails(
+        await api<SessionDetails>(
+          `/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/title`,
+          {
+            method: "PATCH",
+            body: JSON.stringify({ title: renameTitle.trim() }),
+          },
+        ),
       );
-      setActiveSession(session);
+      setActiveSession((current) => mergeSessionDetails(current, session));
       setSessions((current) => upsertSessionSummary(current, session));
       setRenameSessionOpen(false);
     } finally {
@@ -1105,14 +1153,16 @@ function App() {
 
     setApprovalActionId(entry.id);
     try {
-      const session = await api<SessionDetails>(
-        `/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/approvals/${encodeURIComponent(approvalRequestId)}`,
-        {
-          method: "POST",
-          body: JSON.stringify({ decision }),
-        },
+      const session = normalizeSessionDetails(
+        await api<SessionDetails>(
+          `/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/approvals/${encodeURIComponent(approvalRequestId)}`,
+          {
+            method: "POST",
+            body: JSON.stringify({ decision }),
+          },
+        ),
       );
-      setActiveSession(session);
+      setActiveSession((current) => mergeSessionDetails(current, session));
       setSessions((current) => upsertSessionSummary(current, session));
     } finally {
       setApprovalActionId(null);
@@ -1125,16 +1175,14 @@ function App() {
     const isNearBottom = distanceToBottom <= 64;
     stickToBottomRef.current = isNearBottom;
     setShowScrollToBottom(!isNearBottom);
-    if (!hasOlderTranscript || prependPendingRef.current || element.scrollTop > 120) {
+    if (!hasOlderTranscript || loadingOlderTranscript || prependPendingRef.current || element.scrollTop > 120) {
       return;
     }
     prependPendingRef.current = {
       previousHeight: element.scrollHeight,
       previousTop: element.scrollTop,
     };
-    setLoadedTranscriptCount((current) =>
-      Math.min(transcript.length, current + TRANSCRIPT_CHUNK_SIZE),
-    );
+    void loadOlderTranscriptPage();
   }
 
   function scrollTranscriptToBottom() {
@@ -1519,7 +1567,7 @@ function App() {
           <div
             className={[
               "ui-layout-motion relative grid min-h-0 grid-cols-1",
-              sessionsCollapsed ? "md:grid-cols-[52px_minmax(0,1fr)]" : "md:grid-cols-[248px_minmax(0,1fr)]",
+              sessionsCollapsed ? "md:grid-cols-[52px_minmax(0,1fr)]" : "md:grid-cols-[272px_minmax(0,1fr)]",
             ].join(" ")}
           >
             {!sessionsCollapsed ? (
@@ -1532,7 +1580,7 @@ function App() {
             ) : null}
             <aside
               className={[
-                "ui-panel-motion absolute inset-y-0 left-0 z-30 grid min-h-0 w-[min(85vw,320px)] grid-rows-[40px_minmax(0,1fr)] bg-background shadow-2xl md:static md:z-auto md:w-auto md:bg-transparent md:shadow-none",
+                "ui-panel-motion absolute inset-y-0 left-0 z-30 grid min-h-0 w-[min(85vw,320px)] grid-rows-[40px_minmax(0,1fr)] bg-background shadow-2xl md:static md:z-auto md:w-[272px] md:bg-transparent md:shadow-none",
                 sessionsCollapsed
                   ? "pointer-events-none -translate-x-full overflow-hidden border-r-0 opacity-0 md:pointer-events-auto md:w-[52px] md:translate-x-0 md:border-r md:opacity-100"
                   : "border-r border-border opacity-100",
@@ -1554,21 +1602,23 @@ function App() {
                 {!sessionsCollapsed ? <Badge variant="outline">{visibleSessions.length}</Badge> : null}
               </div>
               {!sessionsCollapsed ? (
-                <ScrollArea>
-                  <div className="space-y-1.5 p-2">
+                <ScrollArea className="min-w-0">
+                  <div className="min-w-0 space-y-1.5 p-2">
                     {visibleSessions.map((session) => (
                       <button
                         key={session.id}
                         type="button"
                         onClick={() => handleSelectSession(session.id)}
                         className={[
-                          "ui-session-item grid w-full gap-1 overflow-hidden rounded-xl border px-2.5 py-2 text-left text-xs backdrop-blur-sm",
+                          "ui-session-item grid min-w-0 w-full gap-1 overflow-hidden rounded-xl border px-2.5 py-2 text-left text-xs backdrop-blur-sm",
                           getSessionListCardClassName(session, activeSessionId === session.id),
                         ].join(" ")}
                       >
                         <div className={`ui-session-status-bar ${getSessionStatusAccentClassName(session)}`} />
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="line-clamp-2 text-[13px] font-medium leading-5">{session.title}</div>
+                        <div className="flex min-w-0 items-start justify-between gap-2">
+                          <div className="min-w-0 flex-1 line-clamp-2 text-[13px] font-medium leading-5">
+                            {session.title}
+                          </div>
                           <Button
                             type="button"
                             variant="ghost"
@@ -1583,10 +1633,10 @@ function App() {
                             <Trash2 className="h-3.5 w-3.5" />
                           </Button>
                         </div>
-                        <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
-                          <span className={`h-2 w-2 rounded-full ${getSessionStatusDotClassName(session)}`} />
-                          <span>{formatSessionStatusLabel(session.status)}</span>
-                          <span>{formatDateTime(session.updatedAt)}</span>
+                        <div className="flex min-w-0 items-center gap-2 text-[11px] text-muted-foreground">
+                          <span className={`h-2 w-2 shrink-0 rounded-full ${getSessionStatusDotClassName(session)}`} />
+                          <span className="shrink-0">{formatSessionStatusLabel(session.status)}</span>
+                          <span className="truncate">{formatDateTime(session.updatedAt)}</span>
                         </div>
                         <div className="truncate text-[11px] text-muted-foreground">{session.cwd}</div>
                       </button>
@@ -1596,7 +1646,7 @@ function App() {
               ) : null}
             </aside>
 
-            <main className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto]">
+            <main className="grid min-h-0 min-w-0 grid-rows-[auto_minmax(0,1fr)_auto]">
               <div className="flex items-center justify-between gap-3 border-b border-border px-3 py-2 overflow-hidden">
                 <div className="flex min-w-0 flex-1 items-center gap-2">
                   {sessionsCollapsed ? (
@@ -1740,7 +1790,7 @@ function App() {
                         {hasOlderTranscript ? (
                           <div className="sticky top-0 z-10 mb-2 flex justify-center">
                             <div className="rounded-full border border-border bg-background/90 px-3 py-1 text-[11px] text-muted-foreground backdrop-blur">
-                              Scroll top to load older messages
+                              {loadingOlderTranscript ? "Loading older messages" : "Scroll top to load older messages"}
                             </div>
                           </div>
                         ) : null}
@@ -2006,7 +2056,10 @@ function OverviewSessionCard({
   onDragStart: (event: ReactPointerEvent<HTMLButtonElement>) => void;
 }) {
   const activity = getSessionOverviewActivity(session, details);
-  const previewEntries = session.previewEntries.length ? session.previewEntries : getOverviewPreviewEntries(details);
+  const sessionPreviewEntries = Array.isArray(session.previewEntries) ? session.previewEntries : [];
+  const previewEntries = sessionPreviewEntries.length
+    ? sessionPreviewEntries
+    : getOverviewPreviewEntries(details);
   const live = session.status === "running" || session.status === "starting";
   const liveBackgroundClassName = live ? getOverviewCardLiveClassName(session) : "";
 
@@ -3135,13 +3188,29 @@ function getContextCompactionInfo(session: SessionDetails | null) {
 }
 
 function upsertSessionSummary(current: SessionSummary[], session: SessionSummary) {
-  const index = current.findIndex((item) => item.id === session.id);
+  const normalizedSession = normalizeSessionSummary(session);
+  const index = current.findIndex((item) => item.id === normalizedSession.id);
   if (index === -1) {
-    return insertSessionSummarySorted(current, session);
+    return insertSessionSummarySorted(current, normalizedSession);
   }
-  const merged = { ...current[index], ...session };
-  const remaining = current.filter((item) => item.id !== session.id);
+  const merged = normalizeSessionSummary({ ...current[index], ...normalizedSession });
+  const remaining = current.filter((item) => item.id !== normalizedSession.id);
   return insertSessionSummarySorted(remaining, merged);
+}
+
+function normalizeSessionSummary(session: SessionSummary): SessionSummary {
+  return {
+    ...session,
+    previewEntries: Array.isArray(session.previewEntries) ? session.previewEntries : [],
+  };
+}
+
+function normalizeSessionDetails(session: SessionDetails): SessionDetails {
+  return {
+    ...normalizeSessionSummary(session),
+    transcript: Array.isArray(session.transcript) ? session.transcript : [],
+    hasMoreTranscriptBefore: Boolean(session.hasMoreTranscriptBefore),
+  };
 }
 
 function insertSessionSummarySorted(current: SessionSummary[], session: SessionSummary) {
@@ -3163,7 +3232,7 @@ function appendTranscriptEntry(details: SessionDetails, entry: TranscriptEntry):
   return {
     ...details,
     transcript,
-    transcriptCount: transcript.length,
+    transcriptCount: Math.max(details.transcriptCount, details.transcript.length) + 1,
   };
 }
 
@@ -3180,7 +3249,72 @@ function updateTranscriptEntry(details: SessionDetails, entry: TranscriptEntry):
   return {
     ...details,
     transcript,
-    transcriptCount: transcript.length,
+    transcriptCount: details.transcriptCount,
+  };
+}
+
+function prependTranscriptPage(
+  details: SessionDetails | null,
+  page: SessionTranscriptPage,
+): SessionDetails | null {
+  if (!details || details.id !== page.sessionId) {
+    return details;
+  }
+
+  if (!page.transcript.length) {
+    return {
+      ...details,
+      hasMoreTranscriptBefore: page.hasMoreTranscriptBefore,
+    };
+  }
+
+  const incomingById = new Map(page.transcript.map((entry) => [entry.id, entry]));
+  const nextLoadedTranscript = details.transcript.map((entry) => {
+    const incoming = incomingById.get(entry.id);
+    return incoming ? { ...entry, ...incoming } : entry;
+  });
+  const existingIds = new Set(nextLoadedTranscript.map((entry) => entry.id));
+  const olderEntries = page.transcript.filter((entry) => !existingIds.has(entry.id));
+  if (!olderEntries.length) {
+    return {
+      ...details,
+      transcript: nextLoadedTranscript,
+      hasMoreTranscriptBefore: page.hasMoreTranscriptBefore,
+    };
+  }
+
+  const transcript = [...olderEntries, ...nextLoadedTranscript];
+  return {
+    ...details,
+    transcript,
+    hasMoreTranscriptBefore: page.hasMoreTranscriptBefore,
+  };
+}
+
+function mergeSessionDetails(current: SessionDetails | null, incoming: SessionDetails): SessionDetails {
+  if (!current || current.id !== incoming.id) {
+    return incoming;
+  }
+
+  const incomingById = new Map(incoming.transcript.map((entry) => [entry.id, entry]));
+  const transcript = current.transcript.map((entry) => {
+    const nextEntry = incomingById.get(entry.id);
+    return nextEntry ? { ...entry, ...nextEntry } : entry;
+  });
+  const existingIds = new Set(transcript.map((entry) => entry.id));
+  for (const entry of incoming.transcript) {
+    if (!existingIds.has(entry.id)) {
+      transcript.push(entry);
+    }
+  }
+  const hasMoreTranscriptBefore =
+    transcript.length >= incoming.transcriptCount ? false : current.hasMoreTranscriptBefore;
+
+  return {
+    ...current,
+    ...incoming,
+    transcript,
+    hasMoreTranscriptBefore,
   };
 }
 
@@ -3193,6 +3327,8 @@ function applyQueuedActiveSessionEvents(
   }
 
   let transcript = details.transcript.slice();
+  let transcriptCount = details.transcriptCount;
+  let hasMoreTranscriptBefore = details.hasMoreTranscriptBefore;
   let dirty = false;
   let indexById = new Map(transcript.map((entry, index) => [entry.id, index]));
 
@@ -3209,6 +3345,7 @@ function applyQueuedActiveSessionEvents(
 
     transcript.push(entry);
     indexById.set(entry.id, transcript.length - 1);
+    transcriptCount += 1;
     dirty = true;
   };
 
@@ -3230,6 +3367,7 @@ function applyQueuedActiveSessionEvents(
           const removedIds = new Set(event.removedEntryIds);
           const nextTranscript = transcript.filter((entry) => !removedIds.has(entry.id));
           if (nextTranscript.length !== transcript.length) {
+            transcriptCount = Math.max(0, transcriptCount - (transcript.length - nextTranscript.length));
             transcript = nextTranscript;
             indexById = new Map(transcript.map((entry, index) => [entry.id, index]));
             dirty = true;
@@ -3238,6 +3376,10 @@ function applyQueuedActiveSessionEvents(
         break;
       case "session-reset":
         transcript = event.transcript.slice();
+        transcriptCount = event.hasMoreTranscriptBefore
+          ? Math.max(transcriptCount, event.transcript.length)
+          : event.transcript.length;
+        hasMoreTranscriptBefore = event.hasMoreTranscriptBefore;
         indexById = new Map(transcript.map((entry, index) => [entry.id, index]));
         dirty = true;
         break;
@@ -3253,7 +3395,8 @@ function applyQueuedActiveSessionEvents(
   return {
     ...details,
     transcript,
-    transcriptCount: transcript.length,
+    transcriptCount,
+    hasMoreTranscriptBefore,
   };
 }
 
