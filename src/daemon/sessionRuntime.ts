@@ -5,6 +5,7 @@ import {
   DaemonEvent,
   RestoreSessionInput,
   SessionDetails,
+  SessionPreviewEntry,
   SessionStatus,
   SessionSummary,
   TranscriptEntry,
@@ -28,6 +29,8 @@ export interface ManagedSession {
   codexSource?: string;
   lastError?: string;
   transcript: TranscriptEntry[];
+  previewEntries: SessionPreviewEntry[];
+  previewDirty?: boolean;
   codex?: CodexAppServerClient;
   liveMessages: Map<string, TranscriptEntry>;
   liveReasoning: Map<string, TranscriptEntry>;
@@ -54,6 +57,7 @@ export interface ManagedSession {
 interface SessionRuntimeCallbacks {
   persist: () => void;
   emitChange: (event: DaemonEvent) => void;
+  markPreviewDirty: (session: ManagedSession) => void;
   touch: (session: ManagedSession) => void;
   toSummary: (session: ManagedSession) => SessionSummary;
   getDetails: (sessionId: string) => SessionDetails;
@@ -130,6 +134,7 @@ export class SessionRuntime {
         resolvedAt: new Date().toISOString(),
         decision,
       };
+      this.callbacks.markPreviewDirty(this.session);
     }
 
     this.callbacks.touch(this.session);
@@ -252,6 +257,7 @@ export class SessionRuntime {
       this.session.title = response.thread?.name || response.thread?.preview || this.session.title;
       this.session.status = this.mapThreadStatus(response.thread?.status);
       this.session.transcript = this.threadToTranscript(response.thread);
+      this.callbacks.markPreviewDirty(this.session);
       this.session.liveMessages.clear();
       this.session.liveReasoning.clear();
       this.session.pendingApprovals.clear();
@@ -417,6 +423,7 @@ export class SessionRuntime {
           const entry = this.ensureAssistantEntry(item.id);
           entry.status = "streaming";
           this.trackTurnEntry(entry);
+          this.callbacks.markPreviewDirty(this.session);
         }
         this.callbacks.touch(this.session);
         this.callbacks.persist();
@@ -431,6 +438,7 @@ export class SessionRuntime {
           entry.text += delta;
           entry.status = "streaming";
           this.markTurnOutput(entry);
+          this.callbacks.markPreviewDirty(this.session);
           this.callbacks.touch(this.session);
           this.callbacks.persist();
           this.callbacks.emitChange({
@@ -450,6 +458,7 @@ export class SessionRuntime {
           entry.text += delta;
           entry.status = "streaming";
           this.markTurnOutput(entry);
+          this.callbacks.markPreviewDirty(this.session);
           this.callbacks.touch(this.session);
           this.callbacks.persist();
           this.callbacks.emitChange({
@@ -492,6 +501,7 @@ export class SessionRuntime {
         this.session.liveMessages.clear();
         this.session.liveReasoning.clear();
         this.session.currentTurnMetrics = undefined;
+        this.callbacks.markPreviewDirty(this.session);
         this.callbacks.touch(this.session);
         this.callbacks.persist();
         if (updatedEntries.length || removedEntryIds.length) {
@@ -853,6 +863,7 @@ export class SessionRuntime {
       };
       this.session.liveMessages.set(itemId, entry);
       this.session.transcript.push(entry);
+      this.callbacks.markPreviewDirty(this.session);
       this.trackTurnEntry(entry);
       this.callbacks.persist();
       this.callbacks.emitChange({ type: "session-entry", sessionId: this.session.id, entry });
@@ -872,6 +883,7 @@ export class SessionRuntime {
       };
       this.session.liveReasoning.set(itemId, entry);
       this.session.transcript.push(entry);
+      this.callbacks.markPreviewDirty(this.session);
       this.trackTurnEntry(entry);
       this.callbacks.persist();
       this.callbacks.emitChange({ type: "session-entry", sessionId: this.session.id, entry });

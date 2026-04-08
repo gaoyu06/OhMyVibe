@@ -239,6 +239,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       sandbox: input.sandbox ?? "workspace-write",
       approvalPolicy: input.approvalPolicy ?? "never",
       transcript: [],
+      previewEntries: [],
       liveMessages: new Map(),
       liveReasoning: new Map(),
       pendingApprovals: new Map(),
@@ -277,6 +278,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       approvalPolicy: input.approvalPolicy ?? "never",
       codexThreadId: input.threadId,
       transcript: [],
+      previewEntries: [],
       liveMessages: new Map(),
       liveReasoning: new Map(),
       pendingApprovals: new Map(),
@@ -378,6 +380,8 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
         codexSource: persisted.codexSource,
         lastError: persisted.lastError,
         transcript: Array.isArray(persisted.transcript) ? persisted.transcript : [],
+        previewEntries: Array.isArray(persisted.previewEntries) ? persisted.previewEntries : [],
+        previewDirty: !Array.isArray(persisted.previewEntries),
         liveMessages: new Map(),
         liveReasoning: new Map(),
         pendingApprovals: new Map(),
@@ -521,6 +525,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       ...input,
     };
     session.transcript.push(entry);
+    this.markPreviewDirty(session);
     this.touch(session);
     this.persist(session);
     this.emitChange({ type: "session-entry", sessionId: session.id, entry });
@@ -566,6 +571,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       };
     }
 
+    this.markPreviewDirty(session);
     this.touch(session);
     this.persist(session);
     this.emitChange(event);
@@ -574,6 +580,10 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
 
   private touch(session: ManagedSession): void {
     session.updatedAt = new Date().toISOString();
+  }
+
+  private markPreviewDirty(session: ManagedSession): void {
+    session.previewDirty = true;
   }
 
   private emitChange(event: DaemonEvent): void {
@@ -613,6 +623,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     const runtime = new SessionRuntime(session, {
       persist: () => this.persist(session),
       emitChange: (event) => this.emitChange(event),
+      markPreviewDirty: (target) => this.markPreviewDirty(target),
       touch: (target) => this.touch(target),
       toSummary: (target) => this.toSummary(target),
       getDetails: (sessionId) => this.getOrThrow(sessionId),
@@ -630,6 +641,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
   }
 
   private serializeSessionForStore(session: ManagedSession): SessionDetails {
+    const previewEntries = this.getPreviewEntries(session);
     return {
       id: session.id,
       title: session.title,
@@ -647,12 +659,13 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       codexSource: session.codexSource,
       lastError: session.lastError,
       transcriptCount: session.transcript.length,
-      previewEntries: [],
+      previewEntries,
       transcript: [...session.transcript],
     };
   }
 
   private toSummary(session: ManagedSession): SessionSummary {
+    const previewEntries = this.getPreviewEntries(session);
     return {
       id: session.id,
       title: session.title,
@@ -670,8 +683,18 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       codexSource: session.codexSource,
       lastError: session.lastError,
       transcriptCount: session.transcript.length,
-      previewEntries: this.toPreviewEntries(session.transcript),
+      previewEntries,
     };
+  }
+
+  private getPreviewEntries(session: ManagedSession): SessionPreviewEntry[] {
+    if (!session.previewDirty) {
+      return session.previewEntries;
+    }
+
+    session.previewEntries = this.toPreviewEntries(session.transcript);
+    session.previewDirty = false;
+    return session.previewEntries;
   }
 
   private toPreviewEntries(transcript: TranscriptEntry[]): SessionPreviewEntry[] {
