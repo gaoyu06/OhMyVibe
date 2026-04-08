@@ -1,0 +1,250 @@
+import { useEffect, useState } from "react";
+import { Bell, Send } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Textarea } from "@/components/ui/textarea";
+import type { AgentDetails, ProjectNotification } from "@/lib/types";
+import { formatDateTime } from "@/lib/utils";
+
+export function AgentPane({
+  agent,
+  notifications,
+  onSendMessage,
+}: {
+  agent: AgentDetails | null;
+  notifications: ProjectNotification[];
+  onSendMessage: (text: string) => void;
+}) {
+  const [composer, setComposer] = useState("");
+
+  if (!agent) {
+    return (
+      <div className="flex min-h-0 items-center justify-center bg-muted/10 p-4 text-sm text-muted-foreground">
+        Select an agent
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="grid min-h-0 grid-cols-1 gap-0 lg:grid-cols-[minmax(0,1fr)_320px]">
+        <ScrollArea className="min-h-0 border-r border-border bg-muted/10">
+          <div className="space-y-3 p-4">
+            <div className="rounded-xl border border-border bg-card p-3">
+              <div className="text-xs uppercase tracking-[0.18em] text-muted-foreground">{agent.role}</div>
+              <div className="mt-1 text-sm font-medium">{agent.name}</div>
+              <div className="mt-2 text-xs text-muted-foreground">
+                {agent.provider || "provider"} · {agent.model || "default model"} · {agent.status}
+              </div>
+              {agent.boundSessionId ? (
+                <div className="mt-1 text-xs text-muted-foreground">Bound session: {agent.boundSessionId}</div>
+              ) : null}
+              {agent.memory.summary ? (
+                <div className="mt-3 rounded-lg border border-border/80 bg-muted/30 p-3 text-xs leading-5 text-muted-foreground whitespace-pre-wrap">
+                  {agent.memory.summary}
+                </div>
+              ) : null}
+            </div>
+            {agent.logs.map((entry) => (
+              <div key={entry.id} className="rounded-xl border border-border bg-card p-3">
+                <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                  <div className="flex items-center gap-2">
+                    <Badge variant="outline">{entry.kind}</Badge>
+                    <span>{entry.direction}</span>
+                  </div>
+                  <span>{formatDateTime(entry.createdAt)}</span>
+                </div>
+                <div className="mt-2 whitespace-pre-wrap break-words text-sm leading-6">{entry.text}</div>
+              </div>
+            ))}
+          </div>
+        </ScrollArea>
+        <ScrollArea className="min-h-0 bg-background">
+          <div className="space-y-3 p-4">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <Bell className="h-4 w-4" />
+              Notifications
+            </div>
+            {notifications.length ? (
+              notifications.map((item) => (
+                <div key={item.id} className="rounded-xl border border-border bg-card p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-sm font-medium">{item.subject}</div>
+                    <Badge
+                      variant={
+                        item.severity === "critical"
+                          ? "destructive"
+                          : item.severity === "warning"
+                            ? "warning"
+                            : "outline"
+                      }
+                    >
+                      {item.channel}
+                    </Badge>
+                  </div>
+                  <div className="mt-2 whitespace-pre-wrap break-words text-xs leading-5 text-muted-foreground">
+                    {item.body}
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="rounded-xl border border-dashed border-border p-3 text-sm text-muted-foreground">
+                No notifications
+              </div>
+            )}
+          </div>
+        </ScrollArea>
+      </div>
+      <div className="grid gap-2 border-t border-border p-3">
+        <Textarea
+          value={composer}
+          onChange={(event) => setComposer(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              onSendMessage(composer);
+              setComposer("");
+            }
+          }}
+          placeholder="Message agent"
+          className="min-h-[96px] max-h-[128px]"
+        />
+        <div className="flex justify-end">
+          <Button
+            size="sm"
+            disabled={!composer.trim()}
+            onClick={() => {
+              onSendMessage(composer);
+              setComposer("");
+            }}
+          >
+            <Send className="h-3.5 w-3.5" />
+            Send
+          </Button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+export function SettingsEditor({
+  settings,
+  onSave,
+}: {
+  settings: import("@/lib/types").GlobalSettings;
+  onSave: (settings: import("@/lib/types").GlobalSettings) => void;
+}) {
+  const [draft, setDraft] = useState(settings);
+
+  useEffect(() => {
+    setDraft(settings);
+  }, [settings]);
+
+  return (
+    <div className="grid gap-4 p-4">
+      <div className="grid gap-2">
+        <div className="text-sm font-medium">Provider</div>
+        <input
+          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
+          value={draft.provider.baseUrl}
+          onChange={(event) =>
+            setDraft((current) => ({
+              ...current,
+              provider: { ...current.provider, baseUrl: event.target.value },
+            }))
+          }
+          placeholder="Base URL"
+        />
+        <input
+          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
+          value={draft.provider.apiKey}
+          onChange={(event) =>
+            setDraft((current) => ({
+              ...current,
+              provider: { ...current.provider, apiKey: event.target.value },
+            }))
+          }
+          placeholder="API key"
+        />
+        <input
+          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
+          value={draft.provider.model}
+          onChange={(event) =>
+            setDraft((current) => ({
+              ...current,
+              provider: { ...current.provider, model: event.target.value },
+            }))
+          }
+          placeholder="Model"
+        />
+      </div>
+      <div className="grid gap-2">
+        <div className="text-sm font-medium">SMTP</div>
+        <input
+          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
+          value={draft.notifications.smtpHost}
+          onChange={(event) =>
+            setDraft((current) => ({
+              ...current,
+              notifications: { ...current.notifications, smtpHost: event.target.value },
+            }))
+          }
+          placeholder="SMTP host"
+        />
+        <input
+          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
+          value={String(draft.notifications.smtpPort)}
+          onChange={(event) =>
+            setDraft((current) => ({
+              ...current,
+              notifications: {
+                ...current.notifications,
+                smtpPort: Number(event.target.value) || 0,
+              },
+            }))
+          }
+          placeholder="SMTP port"
+        />
+        <input
+          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
+          value={draft.notifications.smtpUser}
+          onChange={(event) =>
+            setDraft((current) => ({
+              ...current,
+              notifications: { ...current.notifications, smtpUser: event.target.value },
+            }))
+          }
+          placeholder="SMTP user"
+        />
+        <input
+          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
+          value={draft.notifications.smtpPass}
+          onChange={(event) =>
+            setDraft((current) => ({
+              ...current,
+              notifications: { ...current.notifications, smtpPass: event.target.value },
+            }))
+          }
+          placeholder="SMTP password"
+        />
+        <input
+          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
+          value={draft.notifications.smtpFrom}
+          onChange={(event) =>
+            setDraft((current) => ({
+              ...current,
+              notifications: { ...current.notifications, smtpFrom: event.target.value },
+            }))
+          }
+          placeholder="SMTP from"
+        />
+      </div>
+      <div className="flex justify-end">
+        <Button size="sm" onClick={() => onSave(draft)}>
+          Save Settings
+        </Button>
+      </div>
+    </div>
+  );
+}
