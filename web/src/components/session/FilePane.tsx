@@ -1,8 +1,10 @@
+import { Suspense, lazy } from "react";
 import { FileCode2, FileImage, FileText, Folder, LoaderCircle, Save } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Textarea } from "@/components/ui/textarea";
-import type { ProjectFileBrowseResult, ProjectFileReadResult, SessionDetails } from "@/lib/types";
+import type { ProjectFileBrowseResult, ProjectFileReadResult } from "@/lib/types";
+
+const CodeEditor = lazy(() => import("./ProjectCodeEditor"));
 
 export default function FilePane({
   projectFiles,
@@ -11,11 +13,13 @@ export default function FilePane({
   selectedFileLoading,
   fileEditorValue,
   savingFile,
+  theme,
   onBrowseProjectPath,
   onOpenProjectFile,
   onQuoteFileSelection,
   onSaveProjectFile,
   onFileEditorValueChange,
+  onFileSelectionChange,
 }: {
   projectFiles: ProjectFileBrowseResult | null;
   projectFilesLoading: boolean;
@@ -23,13 +27,13 @@ export default function FilePane({
   selectedFileLoading: boolean;
   fileEditorValue: string;
   savingFile: boolean;
-  activeSession: SessionDetails | null;
-  cwd: string;
+  theme: "light" | "dark";
   onBrowseProjectPath: (value?: string) => void;
   onOpenProjectFile: (filePath: string) => void;
   onQuoteFileSelection: () => void;
   onSaveProjectFile: () => void;
   onFileEditorValueChange: (value: string) => void;
+  onFileSelectionChange: (value: string) => void;
 }) {
   return (
     <div className="grid min-h-0 grid-cols-1 bg-muted/10 md:grid-cols-[280px_minmax(0,1fr)]">
@@ -127,12 +131,22 @@ export default function FilePane({
               Binary preview is not supported
             </div>
           ) : selectedFile?.kind === "text" ? (
-            <Textarea
-              id="project-file-editor"
-              value={fileEditorValue}
-              onChange={(event) => onFileEditorValueChange(event.target.value)}
-              className="h-full min-h-full w-full resize-none rounded-none border-0 bg-transparent px-4 py-3 font-mono text-[12px] leading-6 shadow-none focus-visible:ring-0"
-            />
+            <Suspense
+              fallback={
+                <div className="flex h-full items-center justify-center px-4 py-4 text-sm text-muted-foreground">
+                  <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+                  Loading editor
+                </div>
+              }
+            >
+              <CodeEditor
+                path={selectedFile.path}
+                value={fileEditorValue}
+                theme={theme}
+                onChange={onFileEditorValueChange}
+                onSelectionChange={onFileSelectionChange}
+              />
+            </Suspense>
           ) : (
             <div className="flex h-full items-center justify-center p-4 text-sm text-muted-foreground">
               Select a file to preview

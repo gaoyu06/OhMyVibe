@@ -1,8 +1,19 @@
-import { Suspense, lazy, type UIEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  Suspense,
+  lazy,
+  type PointerEvent as ReactPointerEvent,
+  type UIEvent,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   AlertCircle,
   ArrowDown,
+  ArrowRight,
   ArrowUp,
   ChevronDown,
   ChevronUp,
@@ -10,6 +21,7 @@ import {
   Edit3,
   Folder,
   FolderOpen,
+  GripHorizontal,
   History,
   LayoutGrid,
   LoaderCircle,
@@ -55,9 +67,13 @@ import { formatDateTime, formatDurationMs, formatTime, lastLines } from "@/lib/u
 
 const DEFAULT_CONTROL_URL = import.meta.env.VITE_CONTROL_SERVER_URL || window.location.origin;
 const WORKSPACE_STORAGE_KEY = "ohmyvibe-workspaces";
+const OVERVIEW_LAYOUT_STORAGE_KEY = "ohmyvibe-overview-layouts";
 const TOOL_LINE_LIMIT = 30;
 const TRANSCRIPT_INITIAL_COUNT = 80;
 const TRANSCRIPT_CHUNK_SIZE = 60;
+const OVERVIEW_CARD_WIDTH = 336;
+const OVERVIEW_CARD_HEIGHT = 280;
+const OVERVIEW_CARD_GAP = 20;
 const MarkdownBodyLazy = lazy(() => import("./components/chat/MarkdownBody"));
 const DiffViewerLazy = lazy(() => import("./components/chat/DiffViewer"));
 const FilePaneLazy = lazy(() => import("./components/session/FilePane"));
@@ -95,6 +111,8 @@ interface WorkspaceStore {
 }
 
 type SessionPane = "chat" | "files";
+type OverviewCardLayout = { x: number; y: number; width: number; height: number };
+type OverviewLayoutStore = Record<string, Record<string, OverviewCardLayout>>;
 
 const SANDBOX_OPTIONS = [
   { value: "danger-full-access", label: "Full Access" },
@@ -123,6 +141,7 @@ function App() {
   const [sessionPane, setSessionPane] = useState<SessionPane>("chat");
   const [sessionsCollapsed, setSessionsCollapsed] = useState(false);
   const [workspaceState, setWorkspaceState] = useState<WorkspaceStore>(() => loadWorkspaceState());
+  const [overviewLayouts, setOverviewLayouts] = useState<OverviewLayoutStore>(() => loadOverviewLayouts());
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [activeSession, setActiveSession] = useState<SessionDetails | null>(null);
   const [sessionDetailsById, setSessionDetailsById] = useState<Record<string, SessionDetails>>({});
@@ -148,6 +167,7 @@ function App() {
   const [selectedFile, setSelectedFile] = useState<ProjectFileReadResult | null>(null);
   const [selectedFileLoading, setSelectedFileLoading] = useState(false);
   const [fileEditorValue, setFileEditorValue] = useState("");
+  const [fileSelectionText, setFileSelectionText] = useState("");
   const [savingFile, setSavingFile] = useState(false);
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState("medium");
@@ -158,9 +178,20 @@ function App() {
     "untrusted" | "on-failure" | "on-request" | "never"
   >("never");
   const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const overviewScrollRef = useRef<HTMLDivElement | null>(null);
   const prependPendingRef = useRef<{ previousHeight: number; previousTop: number } | null>(null);
   const stickToBottomRef = useRef(true);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const overviewDragRef = useRef<{
+    sessionId: string;
+    key: string;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+    scrollLeft: number;
+    scrollTop: number;
+  } | null>(null);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
@@ -170,6 +201,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(workspaceState));
   }, [workspaceState]);
+
+  useEffect(() => {
+    localStorage.setItem(OVERVIEW_LAYOUT_STORAGE_KEY, JSON.stringify(overviewLayouts));
+  }, [overviewLayouts]);
 
   useEffect(() => {
     let disposed = false;
@@ -384,6 +419,7 @@ function App() {
     setProjectFiles(null);
     setSelectedFile(null);
     setFileEditorValue("");
+    setFileSelectionText("");
     setSessionPane("chat");
   }, [activeSessionId]);
 
@@ -491,6 +527,8 @@ function App() {
         .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)),
     [visibleSessions],
   );
+  const overviewLayoutKey = activeDaemonId && activeWorkspace ? `${activeDaemonId}:${activeWorkspace.id}` : "";
+  const currentOverviewLayout = overviewLayoutKey ? overviewLayouts[overviewLayoutKey] ?? {} : {};
   const filteredHistory = useMemo(() => {
     const query = historySearch.trim().toLowerCase();
     const sorted = [...history].sort(
@@ -524,6 +562,48 @@ function App() {
       overviewSessions.map((session) => session.id),
     );
   }, [activeDaemonId, overviewSessions, viewMode]);
+
+  useEffect(() => {
+    if (!overviewLayoutKey) {
+      return;
+    }
+    setOverviewLayouts((current) =>
+      ensureOverviewLayoutStore(current, overviewLayoutKey, overviewSessions.map((session) => session.id)),
+    );
+  }, [overviewLayoutKey, overviewSessions]);
+
+  useEffect(() => {
+    const handlePointerMove = (event: PointerEvent) => {
+      const drag = overviewDragRef.current;
+      if (!drag) {
+        return;
+      }
+      const container = overviewScrollRef.current;
+      const scrollLeft = container?.scrollLeft ?? 0;
+      const scrollTop = container?.scrollTop ?? 0;
+      const nextX = Math.max(
+        12,
+        Math.round(drag.originX + (event.clientX - drag.startX) + (scrollLeft - drag.scrollLeft)),
+      );
+      const nextY = Math.max(
+        12,
+        Math.round(drag.originY + (event.clientY - drag.startY) + (scrollTop - drag.scrollTop)),
+      );
+      setOverviewLayouts((current) => updateOverviewLayoutPosition(current, drag.key, drag.sessionId, nextX, nextY));
+    };
+
+    const handlePointerUp = () => {
+      overviewDragRef.current = null;
+      document.body.style.userSelect = "";
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, []);
 
   useEffect(() => {
     if (!activeDaemonId) {
@@ -719,6 +799,7 @@ function App() {
       );
       setSelectedFile(result);
       setFileEditorValue(result.kind === "text" ? result.content : "");
+      setFileSelectionText("");
       return result;
     } finally {
       setSelectedFileLoading(false);
@@ -869,11 +950,7 @@ function App() {
     if (!selectedFile || selectedFile.kind !== "text") {
       return;
     }
-    const textarea = document.getElementById("project-file-editor") as HTMLTextAreaElement | null;
-    const start = textarea?.selectionStart ?? 0;
-    const end = textarea?.selectionEnd ?? 0;
-    const selectedText =
-      start !== end ? fileEditorValue.slice(start, end) : fileEditorValue;
+    const selectedText = fileSelectionText.trim() ? fileSelectionText : fileEditorValue;
     const extension = pathLikeExtension(selectedFile.path);
     const quoted = `\n\n[${selectedFile.path}]\n\`\`\`${extension}\n${selectedText.trim()}\n\`\`\`\n`;
     setComposer((current) => `${current}${quoted}`.trimStart());
@@ -1352,18 +1429,39 @@ function App() {
                 </div>
               </div>
             </div>
-            <div className="min-h-0 overflow-auto bg-muted/10 px-4 py-4">
+            <div ref={overviewScrollRef} className="min-h-0 overflow-auto bg-muted/10 px-4 py-4">
               {overviewSessions.length ? (
-                <div className="overview-columns">
+                <div
+                  className="overview-canvas relative"
+                  style={getOverviewCanvasStyle(currentOverviewLayout, overviewSessions)}
+                >
                   {overviewSessions.map((session) => (
                     <OverviewSessionCard
                       key={session.id}
                       session={session}
                       details={sessionDetailsById[session.id]}
                       active={session.id === activeSessionId}
+                      layout={currentOverviewLayout[session.id]}
                       onOpen={() => {
                         handleSelectSession(session.id);
                         setViewMode("chat");
+                      }}
+                      onDragStart={(event) => {
+                        if (!overviewLayoutKey) {
+                          return;
+                        }
+                        const layout = currentOverviewLayout[session.id] ?? getDefaultOverviewCardLayout(0);
+                        overviewDragRef.current = {
+                          sessionId: session.id,
+                          key: overviewLayoutKey,
+                          startX: event.clientX,
+                          startY: event.clientY,
+                          originX: layout.x,
+                          originY: layout.y,
+                          scrollLeft: overviewScrollRef.current?.scrollLeft ?? 0,
+                          scrollTop: overviewScrollRef.current?.scrollTop ?? 0,
+                        };
+                        document.body.style.userSelect = "none";
                       }}
                     />
                   ))}
@@ -1424,12 +1522,11 @@ function App() {
                         type="button"
                         onClick={() => handleSelectSession(session.id)}
                         className={[
-                          "ui-session-item grid w-full gap-1 rounded-md border px-2 py-1.5 text-left text-xs",
-                          activeSessionId === session.id
-                            ? "border-primary/40 bg-primary/10"
-                            : "border-border hover:bg-accent/60",
+                          "ui-session-item grid w-full gap-1 overflow-hidden rounded-xl border px-2.5 py-2 text-left text-xs",
+                          getSessionListCardClassName(session, activeSessionId === session.id),
                         ].join(" ")}
                       >
+                        <div className={`ui-session-status-bar ${getSessionStatusAccentClassName(session)}`} />
                         <div className="flex items-start justify-between gap-2">
                           <div className="line-clamp-2 text-[13px] font-medium leading-5">{session.title}</div>
                           <Button
@@ -1446,7 +1543,11 @@ function App() {
                             <Trash2 className="h-3.5 w-3.5" />
                           </Button>
                         </div>
-                        <div className="text-[11px] text-muted-foreground">{formatDateTime(session.updatedAt)}</div>
+                        <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                          <span className={`h-2 w-2 rounded-full ${getSessionStatusDotClassName(session)}`} />
+                          <span>{formatSessionStatusLabel(session.status)}</span>
+                          <span>{formatDateTime(session.updatedAt)}</span>
+                        </div>
                         <div className="truncate text-[11px] text-muted-foreground">{session.cwd}</div>
                       </button>
                     ))}
@@ -1558,13 +1659,13 @@ function App() {
                       selectedFileLoading={selectedFileLoading}
                       fileEditorValue={fileEditorValue}
                       savingFile={savingFile}
-                      activeSession={activeSession}
-                      cwd={cwd}
+                      theme={theme}
                       onBrowseProjectPath={(value?: string) => void handleBrowseProjectPath(value)}
                       onOpenProjectFile={(filePath: string) => void handleOpenProjectFile(filePath)}
                       onQuoteFileSelection={handleQuoteFileSelection}
                       onSaveProjectFile={() => void handleSaveProjectFile()}
                       onFileEditorValueChange={setFileEditorValue}
+                      onFileSelectionChange={setFileSelectionText}
                     />
                   </Suspense>
                   <div className="flex items-center justify-between gap-2 border-t border-border px-3 py-2">
@@ -1663,12 +1764,12 @@ function App() {
                       value={composer}
                       onChange={(event) => setComposer(event.target.value)}
                       onKeyDown={(event) => {
-                        if (event.key === "Enter" && !event.ctrlKey) {
+                        if (event.key === "Enter" && !event.shiftKey) {
                           event.preventDefault();
                           void handleSendMessage();
                         }
                       }}
-                      placeholder="Enter send · Ctrl+Enter newline"
+                      placeholder="Enter send · Shift+Enter newline"
                       className="min-h-[96px] max-h-[128px] md:max-h-[96px]"
                     />
                     <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -1827,41 +1928,83 @@ function OverviewSessionCard({
   session,
   details,
   active,
+  layout,
   onOpen,
+  onDragStart,
 }: {
   session: SessionSummary;
   details?: SessionDetails;
   active: boolean;
+  layout?: OverviewCardLayout;
   onOpen: () => void;
+  onDragStart: (event: ReactPointerEvent<HTMLButtonElement>) => void;
 }) {
   const activity = getSessionOverviewActivity(session, details);
   const previewEntries = getOverviewPreviewEntries(details);
+  const live = session.status === "running" || session.status === "starting";
 
   return (
-    <button
-      type="button"
+    <div
       className={[
-        "overview-card ui-overview-card grid max-h-[340px] w-full gap-2 overflow-hidden rounded-xl border bg-card px-3 py-3 text-left shadow-sm",
-        active ? "border-primary/40 bg-primary/5" : "border-border hover:bg-accent/40",
+        "overview-card ui-overview-card absolute grid gap-2 overflow-hidden rounded-[20px] border px-3 py-3 text-left shadow-sm",
+        getOverviewCardToneClassName(session, active),
       ].join(" ")}
-      onClick={onOpen}
+      style={{
+        width: layout?.width ?? OVERVIEW_CARD_WIDTH,
+        minHeight: layout?.height ?? OVERVIEW_CARD_HEIGHT,
+        left: layout?.x ?? 0,
+        top: layout?.y ?? 0,
+      }}
     >
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
+      <div className="pointer-events-none absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-white/55 to-transparent opacity-70" />
+      <div className={`pointer-events-none absolute inset-0 opacity-80 ${getOverviewCardAuraClassName(session)}`} />
+
+      <div className="relative flex items-start justify-between gap-3">
+        <button type="button" className="min-w-0 text-left" onClick={onOpen}>
           <div className="line-clamp-2 text-sm font-medium">{session.title}</div>
           <div className="mt-1 truncate text-[11px] text-muted-foreground">{session.cwd}</div>
+        </button>
+        <div className="flex items-center gap-1.5">
+          {activity ? <Badge variant={activity.variant}>{activity.label}</Badge> : null}
+          <button
+            type="button"
+            className="drag-handle flex h-7 w-7 items-center justify-center rounded-md border border-border/70 bg-background/60 text-muted-foreground"
+            onPointerDown={onDragStart}
+            aria-label="Drag overview card"
+          >
+            <GripHorizontal className="h-3.5 w-3.5" />
+          </button>
         </div>
-        {activity ? <Badge variant={activity.variant}>{activity.label}</Badge> : null}
       </div>
 
-      <div className="flex flex-wrap items-center gap-1 text-[10px] text-muted-foreground">
+      <div className="relative flex flex-wrap items-center gap-1 text-[10px] text-muted-foreground">
         <Badge variant={session.origin === "restored" ? "warning" : "outline"}>{session.origin}</Badge>
         <span>{session.model || "default"}</span>
         <span>{session.reasoningEffort || "medium"}</span>
         <span>{formatDateTime(session.updatedAt)}</span>
       </div>
 
-      <div className="grid min-h-0 gap-1 overflow-hidden">
+      <div className="relative grid grid-cols-[auto_1fr_auto] items-center gap-2 rounded-xl border border-white/8 bg-background/40 px-3 py-2">
+        <span className={`h-2.5 w-2.5 rounded-full ${getSessionStatusDotClassName(session)} ${live ? "animate-pulse" : ""}`} />
+        <div className="truncate text-[11px] text-muted-foreground">
+          {formatSessionStatusLabel(session.status)} · {details?.transcriptCount ?? session.transcriptCount} entries
+        </div>
+        <button
+          type="button"
+          className="flex h-7 min-w-7 items-center justify-center rounded-md border border-border/70 bg-background/70 px-2 text-[11px]"
+          onClick={onOpen}
+        >
+          <ArrowRight className="h-3.5 w-3.5" />
+        </button>
+      </div>
+
+      {live ? <div className="ui-overview-progress" /> : null}
+
+      <button
+        type="button"
+        className="relative grid min-h-0 max-h-[158px] gap-1 overflow-hidden rounded-xl border border-white/8 bg-background/35 p-2 text-left"
+        onClick={onOpen}
+      >
         {previewEntries.length ? (
           previewEntries.map((entry) => <OverviewEntryPreview key={entry.id} entry={entry} />)
         ) : (
@@ -1869,8 +2012,9 @@ function OverviewSessionCard({
             {details ? "No messages yet" : "Loading transcript"}
           </div>
         )}
-      </div>
-    </button>
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-black/25 to-transparent" />
+      </button>
+    </div>
   );
 }
 
@@ -1879,12 +2023,12 @@ function OverviewEntryPreview({ entry }: { entry: TranscriptEntry }) {
   const body = getOverviewEntryPreviewText(entry);
 
   return (
-    <div className="grid gap-0.5 text-left">
+    <div className="grid gap-0.5 border-l border-white/12 pl-2 text-left">
       <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
-        <span className="uppercase tracking-[0.16em]">{label}</span>
+        <span className="uppercase tracking-[0.16em] text-foreground/55">{label}</span>
         <span>{formatTime(entry.createdAt)}</span>
       </div>
-      <div className="line-clamp-6 whitespace-pre-wrap break-words text-[12px] leading-4.5 text-foreground/90">
+      <div className="line-clamp-3 whitespace-pre-wrap break-words text-[12px] leading-4.5 text-foreground/88">
         {body}
       </div>
     </div>
@@ -2508,6 +2652,202 @@ function getOverviewEntryPreviewText(entry: TranscriptEntry) {
     .replace(/\s+/g, " ")
     .trim();
   return collapsed || getOverviewEntryLabel(entry);
+}
+
+function formatSessionStatusLabel(status: SessionSummary["status"]) {
+  switch (status) {
+    case "starting":
+      return "Starting";
+    case "running":
+      return "Running";
+    case "completed":
+      return "Completed";
+    case "failed":
+      return "Failed";
+    case "interrupted":
+      return "Interrupted";
+    case "closed":
+      return "Closed";
+    default:
+      return "Idle";
+  }
+}
+
+function getSessionStatusAccentClassName(session: SessionSummary) {
+  switch (session.status) {
+    case "running":
+      return "bg-linear-to-r from-sky-500 via-cyan-400 to-emerald-400";
+    case "starting":
+      return "bg-linear-to-r from-indigo-500 via-sky-400 to-cyan-300";
+    case "completed":
+      return "bg-linear-to-r from-emerald-500 via-lime-400 to-emerald-300";
+    case "failed":
+      return "bg-linear-to-r from-rose-600 via-red-500 to-orange-400";
+    case "interrupted":
+      return "bg-linear-to-r from-amber-500 via-orange-400 to-yellow-300";
+    default:
+      return "bg-linear-to-r from-zinc-500/70 via-zinc-400/60 to-zinc-300/40";
+  }
+}
+
+function getSessionStatusDotClassName(session: SessionSummary) {
+  switch (session.status) {
+    case "running":
+      return "bg-cyan-400 shadow-[0_0_12px_rgba(34,211,238,0.75)]";
+    case "starting":
+      return "bg-sky-400 shadow-[0_0_12px_rgba(96,165,250,0.75)]";
+    case "completed":
+      return "bg-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.65)]";
+    case "failed":
+      return "bg-rose-400 shadow-[0_0_12px_rgba(251,113,133,0.7)]";
+    case "interrupted":
+      return "bg-amber-400 shadow-[0_0_12px_rgba(251,191,36,0.7)]";
+    default:
+      return "bg-zinc-400";
+  }
+}
+
+function getSessionListCardClassName(session: SessionSummary, active: boolean) {
+  const base =
+    session.status === "running"
+      ? "border-cyan-500/35 bg-cyan-500/8 hover:bg-cyan-500/12"
+      : session.status === "starting"
+        ? "border-sky-500/30 bg-sky-500/8 hover:bg-sky-500/12"
+        : session.status === "completed"
+          ? "border-emerald-500/25 bg-emerald-500/7 hover:bg-emerald-500/10"
+          : session.status === "failed"
+            ? "border-rose-500/28 bg-rose-500/8 hover:bg-rose-500/12"
+            : session.status === "interrupted"
+              ? "border-amber-500/28 bg-amber-500/8 hover:bg-amber-500/12"
+              : "border-border bg-card/60 hover:bg-accent/60";
+  return active ? `${base} ring-1 ring-primary/45` : base;
+}
+
+function getOverviewCardToneClassName(session: SessionSummary, active: boolean) {
+  const base =
+    session.status === "running"
+      ? "border-cyan-400/35 bg-[radial-gradient(circle_at_top_right,rgba(56,189,248,0.22),transparent_45%),linear-gradient(180deg,rgba(10,22,34,0.96),rgba(7,12,18,0.96))]"
+      : session.status === "starting"
+        ? "border-sky-400/30 bg-[radial-gradient(circle_at_top_right,rgba(96,165,250,0.2),transparent_45%),linear-gradient(180deg,rgba(13,19,36,0.96),rgba(8,12,20,0.96))]"
+        : session.status === "completed"
+          ? "border-emerald-400/28 bg-[radial-gradient(circle_at_top_right,rgba(16,185,129,0.16),transparent_45%),linear-gradient(180deg,rgba(12,26,22,0.96),rgba(8,14,12,0.96))]"
+          : session.status === "failed"
+            ? "border-rose-400/30 bg-[radial-gradient(circle_at_top_right,rgba(244,63,94,0.2),transparent_45%),linear-gradient(180deg,rgba(36,12,18,0.96),rgba(18,8,10,0.96))]"
+            : session.status === "interrupted"
+              ? "border-amber-400/30 bg-[radial-gradient(circle_at_top_right,rgba(245,158,11,0.18),transparent_45%),linear-gradient(180deg,rgba(34,22,12,0.96),rgba(18,11,8,0.96))]"
+              : "border-border bg-[linear-gradient(180deg,rgba(22,24,30,0.96),rgba(13,14,18,0.96))]";
+  return `${base} ${active ? "ring-1 ring-primary/40 shadow-[0_18px_44px_rgba(15,23,42,0.36)]" : "shadow-[0_12px_32px_rgba(2,6,23,0.22)]"}`;
+}
+
+function getOverviewCardAuraClassName(session: SessionSummary) {
+  switch (session.status) {
+    case "running":
+      return "bg-[radial-gradient(circle_at_85%_18%,rgba(34,211,238,0.24),transparent_34%),radial-gradient(circle_at_20%_0%,rgba(59,130,246,0.15),transparent_28%)]";
+    case "starting":
+      return "bg-[radial-gradient(circle_at_82%_16%,rgba(96,165,250,0.22),transparent_34%),radial-gradient(circle_at_12%_8%,rgba(129,140,248,0.16),transparent_26%)]";
+    case "completed":
+      return "bg-[radial-gradient(circle_at_84%_18%,rgba(52,211,153,0.18),transparent_32%),radial-gradient(circle_at_18%_10%,rgba(163,230,53,0.12),transparent_24%)]";
+    case "failed":
+      return "bg-[radial-gradient(circle_at_85%_18%,rgba(251,113,133,0.2),transparent_34%),radial-gradient(circle_at_12%_10%,rgba(248,113,113,0.14),transparent_24%)]";
+    case "interrupted":
+      return "bg-[radial-gradient(circle_at_85%_18%,rgba(251,191,36,0.2),transparent_34%),radial-gradient(circle_at_10%_10%,rgba(249,115,22,0.12),transparent_24%)]";
+    default:
+      return "bg-[radial-gradient(circle_at_85%_18%,rgba(255,255,255,0.06),transparent_34%)]";
+  }
+}
+
+function loadOverviewLayouts(): OverviewLayoutStore {
+  try {
+    const raw = localStorage.getItem(OVERVIEW_LAYOUT_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+    const parsed = JSON.parse(raw) as OverviewLayoutStore;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function ensureOverviewLayoutStore(
+  store: OverviewLayoutStore,
+  key: string,
+  sessionIds: string[],
+) {
+  const current = store[key] ?? {};
+  let changed = !store[key];
+  const next = { ...current };
+  sessionIds.forEach((sessionId, index) => {
+    if (!next[sessionId]) {
+      next[sessionId] = getDefaultOverviewCardLayout(index);
+      changed = true;
+    }
+  });
+  for (const sessionId of Object.keys(next)) {
+    if (!sessionIds.includes(sessionId)) {
+      delete next[sessionId];
+      changed = true;
+    }
+  }
+  if (!changed) {
+    return store;
+  }
+  return {
+    ...store,
+    [key]: next,
+  };
+}
+
+function getDefaultOverviewCardLayout(index: number): OverviewCardLayout {
+  const column = index % 4;
+  const row = Math.floor(index / 4);
+  return {
+    x: 20 + column * (OVERVIEW_CARD_WIDTH + OVERVIEW_CARD_GAP),
+    y: 20 + row * (OVERVIEW_CARD_HEIGHT + OVERVIEW_CARD_GAP),
+    width: OVERVIEW_CARD_WIDTH,
+    height: OVERVIEW_CARD_HEIGHT,
+  };
+}
+
+function updateOverviewLayoutPosition(
+  store: OverviewLayoutStore,
+  key: string,
+  sessionId: string,
+  x: number,
+  y: number,
+) {
+  const current = store[key] ?? {};
+  const layout = current[sessionId] ?? getDefaultOverviewCardLayout(0);
+  return {
+    ...store,
+    [key]: {
+      ...current,
+      [sessionId]: {
+        ...layout,
+        x,
+        y,
+      },
+    },
+  };
+}
+
+function getOverviewCanvasStyle(
+  layoutStore: Record<string, OverviewCardLayout>,
+  sessions: SessionSummary[],
+) {
+  const layouts = sessions.map((session, index) => layoutStore[session.id] ?? getDefaultOverviewCardLayout(index));
+  const width = Math.max(
+    960,
+    ...layouts.map((layout) => layout.x + layout.width + OVERVIEW_CARD_GAP),
+  );
+  const height = Math.max(
+    520,
+    ...layouts.map((layout) => layout.y + layout.height + OVERVIEW_CARD_GAP),
+  );
+  return {
+    width,
+    height,
+  };
 }
 
 function pathLikeExtension(filePath: string) {

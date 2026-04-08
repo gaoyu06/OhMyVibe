@@ -132,6 +132,49 @@ body {
   box-shadow: 0 8px 24px color-mix(in oklab, var(--foreground) 10%, transparent);
 }
 
+.ui-session-status-bar {
+  height: 3px;
+  margin: -0.5rem -0.625rem 0.1rem;
+  border-radius: 999px;
+  opacity: 0.92;
+}
+
+.overview-canvas {
+  min-height: 100%;
+  background-image:
+    linear-gradient(to right, color-mix(in oklab, var(--foreground) 6%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in oklab, var(--foreground) 6%, transparent) 1px, transparent 1px);
+  background-size: 32px 32px;
+  background-position: 0 0;
+}
+
+.ui-overview-progress {
+  position: relative;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--foreground) 10%, transparent);
+}
+
+.ui-overview-progress::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 38%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, rgba(96, 165, 250, 0.15), rgba(34, 211, 238, 0.95), rgba(52, 211, 153, 0.2));
+  box-shadow: 0 0 18px rgba(34, 211, 238, 0.4);
+  animation: ui-progress-slide 1.35s ease-in-out infinite;
+}
+
+.drag-handle {
+  cursor: grab;
+}
+
+.drag-handle:active {
+  cursor: grabbing;
+}
+
 .ui-entry-reveal {
   animation: ui-fade-up 220ms ease both;
 }
@@ -246,6 +289,15 @@ body {
   }
 }
 
+@keyframes ui-progress-slide {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+
 button,
 input,
 textarea {
@@ -268,32 +320,8 @@ textarea {
   }
 }
 
-.overview-columns {
-  column-count: 1;
-  column-gap: 12px;
-}
-
 .overview-card {
-  break-inside: avoid;
-  margin-bottom: 12px;
-}
-
-@media (min-width: 960px) {
-  .overview-columns {
-    column-count: 2;
-  }
-}
-
-@media (min-width: 1440px) {
-  .overview-columns {
-    column-count: 3;
-  }
-}
-
-@media (min-width: 1920px) {
-  .overview-columns {
-    column-count: 4;
-  }
+  user-select: none;
 }
 
 .markdown-body > :first-child {
@@ -316,6 +344,42 @@ textarea {
 .markdown-body ul,
 .markdown-body ol {
   padding-left: 1.2rem;
+}
+
+.project-code-editor {
+  height: 100%;
+  background: color-mix(in oklab, var(--background) 86%, var(--foreground) 2%);
+}
+
+.project-code-editor .cm-editor {
+  height: 100%;
+  font-family:
+    "JetBrains Mono",
+    "Fira Code",
+    "Cascadia Code",
+    "Consolas",
+    monospace;
+  font-size: 12px;
+}
+
+.project-code-editor .cm-scroller {
+  font-family: inherit;
+  line-height: 1.6;
+}
+
+.project-code-editor .cm-gutters {
+  border-right: 1px solid color-mix(in oklab, var(--border) 92%, transparent);
+  background: color-mix(in oklab, var(--background) 92%, var(--foreground) 1%);
+}
+
+.project-code-editor .cm-activeLineGutter,
+.project-code-editor .cm-activeLine {
+  background: color-mix(in oklab, var(--accent) 75%, transparent);
+}
+
+.project-code-editor .cm-selectionBackground,
+.project-code-editor .cm-content ::selection {
+  background: color-mix(in oklab, var(--primary) 28%, transparent);
 }
 
 .markdown-body li + li {
