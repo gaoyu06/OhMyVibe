@@ -536,8 +536,6 @@ function App() {
     sessionLoading,
     sendingMessage,
   });
-  const contextWindow = inferContextWindow(activeSession?.model || model);
-  const contextCompactionInfo = getContextCompactionInfo(activeSession);
   const activeDaemon = daemons.find((item) => item.id === activeDaemonId) ?? null;
   const activeWorkspace =
     workspaceState.workspaces.find((workspace) => workspace.id === workspaceState.activeWorkspaceId) ??
@@ -1072,10 +1070,6 @@ function App() {
       return;
     }
     await sendMessageText(composer);
-  }
-
-  async function handleCompactContext() {
-    await sendMessageText("/compact");
   }
 
   async function handleSessionConfigChange(next: {
@@ -1850,32 +1844,6 @@ function App() {
                   </div>
 
                   <div className="grid gap-2 border-t border-border p-3">
-                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border/80 bg-background/70 px-3 py-2 text-[11px] text-muted-foreground">
-                      <div className="flex min-w-0 flex-wrap items-center gap-2">
-                        <Badge variant="outline" className="rounded-full border-border/70 bg-muted/40 px-2 py-0.5 font-normal">
-                          Context {formatContextWindowLabel(contextWindow)}
-                        </Badge>
-                        <Badge variant="outline" className="rounded-full border-border/70 bg-muted/40 px-2 py-0.5 font-normal">
-                          Compactions {contextCompactionInfo.count}
-                        </Badge>
-                        <span className="truncate">
-                          {contextCompactionInfo.lastCompactedAt
-                            ? `Last compact ${formatTime(contextCompactionInfo.lastCompactedAt)}`
-                            : "No compaction yet"}
-                        </span>
-                        <span className="truncate text-foreground/55">Usage telemetry unavailable</span>
-                      </div>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        className="h-7 rounded-full px-3"
-                        disabled={!activeDaemonId || !activeSessionId || isTurnBusy(activeSession, sendingMessage)}
-                        onClick={() => void handleCompactContext()}
-                      >
-                        Compact
-                      </Button>
-                    </div>
                     <Textarea
                       value={composer}
                       onChange={(event) => setComposer(event.target.value)}
@@ -3142,49 +3110,6 @@ function formatEffortLabel(value: string) {
     default:
       return value;
   }
-}
-
-function inferContextWindow(model?: string): number | undefined {
-  const normalized = String(model || "").toLowerCase().trim();
-  if (!normalized) {
-    return undefined;
-  }
-  return 400_000;
-}
-
-function formatContextWindowLabel(value: number | undefined): string {
-  if (!value) {
-    return "unknown";
-  }
-  if (value >= 1_000_000) {
-    return `${Math.round(value / 1_000_000)}M`;
-  }
-  if (value >= 1000) {
-    return `${Math.round(value / 1000)}k`;
-  }
-  return String(value);
-}
-
-function getContextCompactionInfo(session: SessionDetails | null) {
-  if (!session?.transcript?.length) {
-    return { count: 0, lastCompactedAt: undefined as string | undefined };
-  }
-
-  const matches = session.transcript.filter((entry) => {
-    if (entry.kind !== "system") {
-      return false;
-    }
-    if (entry.meta?.eventType === "contextCompaction") {
-      return true;
-    }
-    const text = String(entry.text || "").toLowerCase();
-    return text.includes("context compacted") || text.includes("contextcompaction");
-  });
-
-  return {
-    count: matches.length,
-    lastCompactedAt: matches[matches.length - 1]?.createdAt,
-  };
 }
 
 function upsertSessionSummary(current: SessionSummary[], session: SessionSummary) {
