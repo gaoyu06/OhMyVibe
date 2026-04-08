@@ -128,6 +128,7 @@ export interface CodexHistoryEntry {
 export interface DaemonDescriptor {
   id: string;
   name: string;
+  version?: string;
   platform: string;
   cwd: string;
   connectedAt: string;

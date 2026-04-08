@@ -1451,8 +1451,15 @@ function App() {
                       {activeDaemon.online ? "online" : "offline"}
                     </Badge>
                   ) : null}
-                  <div className="truncate text-sm font-medium">
-                    {activeDaemon?.name || "No Daemon"}
+                  <div className="flex min-w-0 items-center gap-2">
+                    <div className="truncate text-sm font-medium">
+                      {activeDaemon?.name || "No Daemon"}
+                    </div>
+                    {activeDaemon?.version ? (
+                      <div className="shrink-0 text-[11px] text-muted-foreground">
+                        v{activeDaemon.version}
+                      </div>
+                    ) : null}
                   </div>
                 </div>
                 <div className="truncate text-xs text-muted-foreground">

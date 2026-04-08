@@ -8,6 +8,7 @@ import type { DaemonEvent } from "../src/shared/types.js";
 interface DaemonDescriptor {
   id: string;
   name: string;
+  version?: string;
   platform: string;
   cwd: string;
   connectedAt: string;

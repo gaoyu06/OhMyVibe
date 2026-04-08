@@ -1,6 +1,7 @@
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
+import packageJson from "../../package.json" with { type: "json" };
 import { SessionManager } from "./sessionManager.js";
 
 interface BridgeOptions {
@@ -103,6 +104,7 @@ export class ManagementBridge {
       daemon: {
         id: this.daemonId,
         name: this.daemonName,
+        version: packageJson.version,
         platform: process.platform,
         cwd: process.cwd(),
         connectedAt: new Date().toISOString(),
