@@ -27,6 +27,14 @@ export interface TranscriptEntry {
   meta?: Record<string, unknown>;
 }
 
+export interface SessionPreviewEntry {
+  id: string;
+  kind: TranscriptEntryKind;
+  previewText: string;
+  createdAt: string;
+  status?: string;
+}
+
 export type SessionOrigin = "created" | "restored";
 
 export interface ModelReasoningOption {
@@ -66,6 +74,7 @@ export interface SessionSummary {
   codexSource?: string;
   lastError?: string;
   transcriptCount: number;
+  previewEntries: SessionPreviewEntry[];
 }
 
 export interface SessionDetails extends SessionSummary {

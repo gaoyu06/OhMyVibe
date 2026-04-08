@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import fsPromises from "node:fs/promises";
 import path from "node:path";
 import { SessionDetails } from "../shared/types.js";
 
@@ -10,6 +11,7 @@ interface LegacySessionStoreShape {
 export class SessionStore {
   private readonly legacyFilePath: string;
   private readonly sessionsDirPath: string;
+  private initializationPromise?: Promise<void>;
 
   constructor(rootDir: string = process.cwd()) {
     this.legacyFilePath = path.join(rootDir, "data", "sessions.json");
@@ -25,36 +27,20 @@ export class SessionStore {
     return this.loadLegacy();
   }
 
-  save(sessions: SessionDetails[]): void {
-    fs.mkdirSync(this.sessionsDirPath, { recursive: true });
+  async saveSession(session: SessionDetails): Promise<void> {
+    await this.ensureInitialized();
+    await fsPromises.writeFile(
+      path.join(this.sessionsDirPath, this.sessionFileName(session.id)),
+      JSON.stringify(session, null, 2),
+      "utf8",
+    );
+  }
 
-    const expectedFileNames = new Set<string>();
-    for (const session of sessions) {
-      const fileName = this.sessionFileName(session.id);
-      expectedFileNames.add(fileName);
-      fs.writeFileSync(
-        path.join(this.sessionsDirPath, fileName),
-        JSON.stringify(session, null, 2),
-        "utf8",
-      );
-    }
-
-    try {
-      for (const entry of fs.readdirSync(this.sessionsDirPath, { withFileTypes: true })) {
-        if (!entry.isFile() || !entry.name.endsWith(".json")) {
-          continue;
-        }
-        if (!expectedFileNames.has(entry.name)) {
-          fs.rmSync(path.join(this.sessionsDirPath, entry.name), { force: true });
-        }
-      }
-    } catch {
-      // noop
-    }
-
-    if (fs.existsSync(this.legacyFilePath)) {
-      fs.rmSync(this.legacyFilePath, { force: true });
-    }
+  async deleteSession(sessionId: string): Promise<void> {
+    await this.ensureInitialized();
+    await fsPromises.rm(path.join(this.sessionsDirPath, this.sessionFileName(sessionId)), {
+      force: true,
+    });
   }
 
   private loadFromDirectory(): SessionDetails[] {
@@ -102,6 +88,21 @@ export class SessionStore {
 
   private sessionFileName(sessionId: string): string {
     return `${sessionId}.json`;
+  }
+
+  private ensureInitialized(): Promise<void> {
+    if (!this.initializationPromise) {
+      const initialization = (async () => {
+        await fsPromises.mkdir(this.sessionsDirPath, { recursive: true });
+        await fsPromises.rm(this.legacyFilePath, { force: true }).catch(() => undefined);
+      })();
+      this.initializationPromise = initialization.catch((error) => {
+        this.initializationPromise = undefined;
+        throw error;
+      });
+    }
+
+    return this.initializationPromise;
   }
 
   private isSessionDetails(value: unknown): value is SessionDetails {

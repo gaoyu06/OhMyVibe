@@ -60,6 +60,7 @@ import type {
   ProjectFileBrowseResult,
   ProjectFileReadResult,
   SessionDetails,
+  SessionPreviewEntry,
   SessionSummary,
   TranscriptEntry,
 } from "@/lib/types";
@@ -182,6 +183,11 @@ function App() {
   const prependPendingRef = useRef<{ previousHeight: number; previousTop: number } | null>(null);
   const stickToBottomRef = useRef(true);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const wsRef = useRef<WebSocket | null>(null);
+  const latestSubscriptionRef = useRef<{ daemonId: string | null; sessionId: string | null }>({
+    daemonId: null,
+    sessionId: null,
+  });
   const overviewDragRef = useRef<{
     sessionId: string;
     key: string;
@@ -192,6 +198,7 @@ function App() {
     scrollLeft: number;
     scrollTop: number;
   } | null>(null);
+  const subscribedSessionId = viewMode === "chat" ? activeSessionId : null;
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
@@ -209,11 +216,13 @@ function App() {
   useEffect(() => {
     let disposed = false;
     const ws = new WebSocket(toWsUrl(controlUrl));
+    wsRef.current = ws;
     setConnectionState("connecting");
 
     ws.onopen = () => {
       if (!disposed) {
         setConnectionState("open");
+        sendClientSubscription(ws, latestSubscriptionRef.current);
       }
     };
     ws.onerror = () => {
@@ -262,129 +271,146 @@ function App() {
       }
 
       const incomingEvents =
-        payload.type === "daemon-event" && payload.daemonId === activeDaemonId
+        payload.type === "daemon-event"
           ? [payload.event]
-          : payload.type === "daemon-events" && payload.daemonId === activeDaemonId
+          : payload.type === "daemon-events"
             ? payload.events
             : null;
 
       if (incomingEvents) {
         for (const event of incomingEvents) {
-        if (event.type === "session-created" || event.type === "session-updated") {
-          setSessions((current) => upsertSessionSummary(current, event.session));
-          setSessionDetailsById((current) => {
-            const existing = current[event.session.id];
-            if (!existing) {
-              return current;
-            }
-            return {
-              ...current,
-              [event.session.id]: { ...existing, ...event.session },
-            };
-          });
-          setActiveSession((current) =>
-            current && current.id === event.session.id ? { ...current, ...event.session } : current,
-          );
-          return;
-        }
-        if (event.type === "session-deleted") {
-          setSessions((current) => current.filter((session) => session.id !== event.sessionId));
-          setSessionDetailsById((current) => {
-            const next = { ...current };
-            delete next[event.sessionId];
-            return next;
-          });
-          setActiveSession((current) => (current?.id === event.sessionId ? null : current));
-          setActiveSessionId((current) => (current === event.sessionId ? null : current));
-          return;
-        }
-        if (event.type === "session-entry") {
-          setSessionDetailsById((current) => {
-            const existing = current[event.sessionId];
-            if (!existing) {
-              return current;
-            }
-            return {
-              ...current,
-              [event.sessionId]: appendTranscriptEntry(existing, event.entry),
-            };
-          });
-          setActiveSession((current) => {
-            if (!current || current.id !== event.sessionId) {
-              return current;
-            }
-            return appendTranscriptEntry(current, event.entry);
-          });
-          return;
-        }
-        if (event.type === "session-entry-updated") {
-          setSessionDetailsById((current) => {
-            const existing = current[event.sessionId];
-            if (!existing) {
-              return current;
-            }
-            return {
-              ...current,
-              [event.sessionId]: updateTranscriptEntry(existing, event.entry),
-            };
-          });
-          setActiveSession((current) => {
-            if (!current || current.id !== event.sessionId) {
-              return current;
-            }
-            return updateTranscriptEntry(current, event.entry);
-          });
-          return;
-        }
-        if (event.type === "session-entries-updated") {
-          setSessionDetailsById((current) => {
-            const existing = current[event.sessionId];
-            if (!existing) {
-              return current;
-            }
-            return {
-              ...current,
-              [event.sessionId]: updateTranscriptEntries(existing, event.entries, event.removedEntryIds),
-            };
-          });
-          setActiveSession((current) => {
-            if (!current || current.id !== event.sessionId) {
-              return current;
-            }
-            return updateTranscriptEntries(current, event.entries, event.removedEntryIds);
-          });
-          return;
-        }
-        if (event.type === "session-reset") {
-          setSessionDetailsById((current) => {
-            const existing = current[event.sessionId];
-            if (!existing) {
-              return current;
-            }
-            return {
-              ...current,
-              [event.sessionId]: {
-                ...existing,
-                transcript: event.transcript,
-                transcriptCount: event.transcript.length,
-              },
-            };
-          });
-          setActiveSession((current) =>
-            current && current.id === event.sessionId
-              ? { ...current, transcript: event.transcript, transcriptCount: event.transcript.length }
-              : current,
-          );
-        }
+          if (event.type === "session-created" || event.type === "session-updated") {
+            setSessions((current) => upsertSessionSummary(current, event.session));
+            setSessionDetailsById((current) => {
+              const existing = current[event.session.id];
+              if (!existing) {
+                return current;
+              }
+              return {
+                ...current,
+                [event.session.id]: { ...existing, ...event.session },
+              };
+            });
+            setActiveSession((current) =>
+              current && current.id === event.session.id ? { ...current, ...event.session } : current,
+            );
+            continue;
+          }
+
+          if (event.type === "session-deleted") {
+            setSessions((current) => current.filter((session) => session.id !== event.sessionId));
+            setSessionDetailsById((current) => {
+              const next = { ...current };
+              delete next[event.sessionId];
+              return next;
+            });
+            setActiveSession((current) => (current?.id === event.sessionId ? null : current));
+            setActiveSessionId((current) => (current === event.sessionId ? null : current));
+            continue;
+          }
+
+          if (event.type === "session-entry") {
+            setSessionDetailsById((current) => {
+              const existing = current[event.sessionId];
+              if (!existing) {
+                return current;
+              }
+              return {
+                ...current,
+                [event.sessionId]: appendTranscriptEntry(existing, event.entry),
+              };
+            });
+            setActiveSession((current) => {
+              if (!current || current.id !== event.sessionId) {
+                return current;
+              }
+              return appendTranscriptEntry(current, event.entry);
+            });
+            continue;
+          }
+
+          if (event.type === "session-entry-updated") {
+            setSessionDetailsById((current) => {
+              const existing = current[event.sessionId];
+              if (!existing) {
+                return current;
+              }
+              return {
+                ...current,
+                [event.sessionId]: updateTranscriptEntry(existing, event.entry),
+              };
+            });
+            setActiveSession((current) => {
+              if (!current || current.id !== event.sessionId) {
+                return current;
+              }
+              return updateTranscriptEntry(current, event.entry);
+            });
+            continue;
+          }
+
+          if (event.type === "session-entries-updated") {
+            setSessionDetailsById((current) => {
+              const existing = current[event.sessionId];
+              if (!existing) {
+                return current;
+              }
+              return {
+                ...current,
+                [event.sessionId]: updateTranscriptEntries(existing, event.entries, event.removedEntryIds),
+              };
+            });
+            setActiveSession((current) => {
+              if (!current || current.id !== event.sessionId) {
+                return current;
+              }
+              return updateTranscriptEntries(current, event.entries, event.removedEntryIds);
+            });
+            continue;
+          }
+
+          if (event.type === "session-reset") {
+            setSessionDetailsById((current) => {
+              const existing = current[event.sessionId];
+              if (!existing) {
+                return current;
+              }
+              return {
+                ...current,
+                [event.sessionId]: {
+                  ...existing,
+                  transcript: event.transcript,
+                  transcriptCount: event.transcript.length,
+                },
+              };
+            });
+            setActiveSession((current) =>
+              current && current.id === event.sessionId
+                ? { ...current, transcript: event.transcript, transcriptCount: event.transcript.length }
+                : current,
+            );
+          }
         }
       }
     };
 
     return () => {
       disposed = true;
+      if (wsRef.current === ws) {
+        wsRef.current = null;
+      }
       ws.close();
     };
-  }, [activeDaemonId, controlUrl]);
+  }, [controlUrl]);
+
+  useEffect(() => {
+    const nextSubscription = {
+      daemonId: activeDaemonId,
+      sessionId: subscribedSessionId,
+    };
+    latestSubscriptionRef.current = nextSubscription;
+    sendClientSubscription(wsRef.current, nextSubscription);
+  }, [activeDaemonId, subscribedSessionId]);
 
   useEffect(() => {
     if (!activeDaemonId) {
@@ -400,11 +426,11 @@ function App() {
   }, [activeDaemonId]);
 
   useEffect(() => {
-    if (!activeDaemonId || !activeSessionId) {
+    if (!activeDaemonId || !activeSessionId || viewMode !== "chat") {
       return;
     }
     void loadSession(activeDaemonId, activeSessionId);
-  }, [activeDaemonId, activeSessionId]);
+  }, [activeDaemonId, activeSessionId, viewMode]);
 
   useEffect(() => {
     setLoadedTranscriptCount(TRANSCRIPT_INITIAL_COUNT);
@@ -413,6 +439,16 @@ function App() {
     setSendingMessage(false);
     stickToBottomRef.current = true;
     setShowScrollToBottom(false);
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    setSessionDetailsById((current) => {
+      if (!activeSessionId) {
+        return {};
+      }
+      const activeDetails = current[activeSessionId];
+      return activeDetails ? { [activeSessionId]: activeDetails } : {};
+    });
   }, [activeSessionId]);
 
   useEffect(() => {
@@ -509,6 +545,8 @@ function App() {
     sessionLoading,
     sendingMessage,
   });
+  const contextWindow = inferContextWindow(activeSession?.model || model);
+  const contextCompactionInfo = getContextCompactionInfo(activeSession);
   const activeDaemon = daemons.find((item) => item.id === activeDaemonId) ?? null;
   const activeWorkspace =
     workspaceState.workspaces.find((workspace) => workspace.id === workspaceState.activeWorkspaceId) ??
@@ -552,16 +590,6 @@ function App() {
     const lastRow = chatTranscript[chatTranscript.length - 1];
     return `${lastEntry.id}:${lastEntry.text.length}:${lastEntry.status ?? ""}:${lastRow?.reasoning?.text.length ?? 0}`;
   }, [chatTranscript, displayTranscript]);
-
-  useEffect(() => {
-    if (!activeDaemonId || viewMode !== "overview" || !overviewSessions.length) {
-      return;
-    }
-    void loadOverviewSessions(
-      activeDaemonId,
-      overviewSessions.map((session) => session.id),
-    );
-  }, [activeDaemonId, overviewSessions, viewMode]);
 
   useEffect(() => {
     if (!overviewLayoutKey) {
@@ -733,25 +761,6 @@ function App() {
     } finally {
       setSessionLoading(false);
     }
-  }
-
-  async function loadOverviewSessions(daemonId: string, sessionIds: string[]) {
-    const missingIds = sessionIds.filter((sessionId) => !sessionDetailsById[sessionId]);
-    if (!missingIds.length) {
-      return;
-    }
-    const details = await Promise.all(
-      missingIds.map((sessionId) =>
-        api<SessionDetails>(`/api/daemons/${daemonId}/sessions/${sessionId}`),
-      ),
-    );
-    setSessionDetailsById((current) => {
-      const next = { ...current };
-      for (const detail of details) {
-        next[detail.id] = detail;
-      }
-      return next;
-    });
   }
 
   async function loadHistory(daemonId: string) {
@@ -957,45 +966,69 @@ function App() {
     setSessionPane("chat");
   }
 
-  async function handleSendMessage() {
-    if (!activeDaemonId || !activeSessionId || !composer.trim()) {
+  async function sendMessageText(text: string) {
+    if (!activeDaemonId || !activeSessionId || !text.trim()) {
       return;
     }
-    const text = composer.trim();
+    const trimmed = text.trim();
+    const optimisticAssistant = trimmed !== "/compact";
     const since = Date.now();
-    setSendingMessage(true);
-    setPendingAssistant({
-      sessionId: activeSessionId,
-      since,
-      baseTranscriptCount: transcript.length,
-      userEntry: {
-        id: `pending-user-${since}`,
-        kind: "user",
-        text,
-        createdAt: new Date(since).toISOString(),
-      },
-      entry: {
-        id: `pending-assistant-${since}`,
-        kind: "assistant",
-        text: "",
-        createdAt: new Date(since).toISOString(),
-        status: "streaming",
-      },
-    });
+    if (optimisticAssistant) {
+      setSendingMessage(true);
+      setPendingAssistant({
+        sessionId: activeSessionId,
+        since,
+        baseTranscriptCount: transcript.length,
+        userEntry: {
+          id: `pending-user-${since}`,
+          kind: "user",
+          text: trimmed,
+          createdAt: new Date(since).toISOString(),
+        },
+        entry: {
+          id: `pending-assistant-${since}`,
+          kind: "assistant",
+          text: "",
+          createdAt: new Date(since).toISOString(),
+          status: "streaming",
+        },
+      });
+    } else {
+      setSendingMessage(true);
+      setPendingAssistant(null);
+    }
     stickToBottomRef.current = true;
     setShowScrollToBottom(false);
-    setComposer("");
+    if (trimmed === composer.trim()) {
+      setComposer("");
+    }
     try {
       await api(`/api/daemons/${activeDaemonId}/sessions/${activeSessionId}/messages`, {
         method: "POST",
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text: trimmed }),
       });
+      if (!optimisticAssistant) {
+        setSendingMessage(false);
+      }
     } catch (error) {
-      setPendingAssistant(null);
+      if (optimisticAssistant) {
+        setPendingAssistant(null);
+      }
       setSendingMessage(false);
-      setComposer(text);
+      setComposer(trimmed);
       throw error;
     }
+  }
+
+  async function handleSendMessage() {
+    if (!composer.trim()) {
+      return;
+    }
+    await sendMessageText(composer);
+  }
+
+  async function handleCompactContext() {
+    await sendMessageText("/compact");
   }
 
   async function handleSessionConfigChange(next: {
@@ -1522,7 +1555,7 @@ function App() {
                         type="button"
                         onClick={() => handleSelectSession(session.id)}
                         className={[
-                          "ui-session-item grid w-full gap-1 overflow-hidden rounded-xl border px-2.5 py-2 text-left text-xs",
+                          "ui-session-item grid w-full gap-1 overflow-hidden rounded-xl border px-2.5 py-2 text-left text-xs backdrop-blur-sm",
                           getSessionListCardClassName(session, activeSessionId === session.id),
                         ].join(" ")}
                       >
@@ -1760,6 +1793,32 @@ function App() {
                   </div>
 
                   <div className="grid gap-2 border-t border-border p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border/80 bg-background/70 px-3 py-2 text-[11px] text-muted-foreground">
+                      <div className="flex min-w-0 flex-wrap items-center gap-2">
+                        <Badge variant="outline" className="rounded-full border-border/70 bg-muted/40 px-2 py-0.5 font-normal">
+                          Context {formatContextWindowLabel(contextWindow)}
+                        </Badge>
+                        <Badge variant="outline" className="rounded-full border-border/70 bg-muted/40 px-2 py-0.5 font-normal">
+                          Compactions {contextCompactionInfo.count}
+                        </Badge>
+                        <span className="truncate">
+                          {contextCompactionInfo.lastCompactedAt
+                            ? `Last compact ${formatTime(contextCompactionInfo.lastCompactedAt)}`
+                            : "No compaction yet"}
+                        </span>
+                        <span className="truncate text-foreground/55">Usage telemetry unavailable</span>
+                      </div>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="h-7 rounded-full px-3"
+                        disabled={!activeDaemonId || !activeSessionId || isTurnBusy(activeSession, sendingMessage)}
+                        onClick={() => void handleCompactContext()}
+                      >
+                        Compact
+                      </Button>
+                    </div>
                     <Textarea
                       value={composer}
                       onChange={(event) => setComposer(event.target.value)}
@@ -1769,7 +1828,7 @@ function App() {
                           void handleSendMessage();
                         }
                       }}
-                      placeholder="Enter send · Shift+Enter newline"
+                      placeholder="Message Codex or use /compact · Enter send · Shift+Enter newline"
                       className="min-h-[96px] max-h-[128px] md:max-h-[96px]"
                     />
                     <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -1940,8 +1999,9 @@ function OverviewSessionCard({
   onDragStart: (event: ReactPointerEvent<HTMLButtonElement>) => void;
 }) {
   const activity = getSessionOverviewActivity(session, details);
-  const previewEntries = getOverviewPreviewEntries(details);
+  const previewEntries = session.previewEntries.length ? session.previewEntries : getOverviewPreviewEntries(details);
   const live = session.status === "running" || session.status === "starting";
+  const liveBackgroundClassName = live ? getOverviewCardLiveClassName(session) : "";
 
   return (
     <div
@@ -1957,14 +2017,15 @@ function OverviewSessionCard({
       }}
     >
       <div className="pointer-events-none absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-white/55 to-transparent opacity-70" />
+      {live ? <div className={`pointer-events-none absolute inset-0 ui-overview-live-sheen ${liveBackgroundClassName}`} /> : null}
       <div className={`pointer-events-none absolute inset-0 opacity-80 ${getOverviewCardAuraClassName(session)}`} />
 
-      <div className="relative flex items-start justify-between gap-3">
-        <button type="button" className="min-w-0 text-left" onClick={onOpen}>
+      <div className="relative grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
+        <button type="button" className="min-w-0 pr-1 text-left" onClick={onOpen}>
           <div className="line-clamp-2 text-sm font-medium">{session.title}</div>
           <div className="mt-1 truncate text-[11px] text-muted-foreground">{session.cwd}</div>
         </button>
-        <div className="flex items-center gap-1.5">
+        <div className="flex shrink-0 items-center gap-1.5">
           {activity ? <Badge variant={activity.variant}>{activity.label}</Badge> : null}
           <button
             type="button"
@@ -2008,9 +2069,7 @@ function OverviewSessionCard({
         {previewEntries.length ? (
           previewEntries.map((entry) => <OverviewEntryPreview key={entry.id} entry={entry} />)
         ) : (
-          <div className="text-xs text-muted-foreground">
-            {details ? "No messages yet" : "Loading transcript"}
-          </div>
+          <div className="text-xs text-muted-foreground">No messages yet</div>
         )}
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-black/25 to-transparent" />
       </button>
@@ -2018,7 +2077,7 @@ function OverviewSessionCard({
   );
 }
 
-function OverviewEntryPreview({ entry }: { entry: TranscriptEntry }) {
+function OverviewEntryPreview({ entry }: { entry: TranscriptEntry | SessionPreviewEntry }) {
   const label = getOverviewEntryLabel(entry);
   const body = getOverviewEntryPreviewText(entry);
 
@@ -2616,7 +2675,7 @@ function getOverviewPreviewEntries(details?: SessionDetails) {
   return selected;
 }
 
-function getOverviewEntryLabel(entry: TranscriptEntry) {
+function getOverviewEntryLabel(entry: TranscriptEntry | SessionPreviewEntry) {
   switch (entry.kind) {
     case "user":
       return "User";
@@ -2637,7 +2696,10 @@ function getOverviewEntryLabel(entry: TranscriptEntry) {
   }
 }
 
-function getOverviewEntryPreviewText(entry: TranscriptEntry) {
+function getOverviewEntryPreviewText(entry: TranscriptEntry | SessionPreviewEntry) {
+  if ("previewText" in entry) {
+    return entry.previewText;
+  }
   if (entry.kind === "assistant" && entry.status === "streaming" && !entry.text.trim()) {
     return "Thinking…";
   }
@@ -2676,32 +2738,32 @@ function formatSessionStatusLabel(status: SessionSummary["status"]) {
 function getSessionStatusAccentClassName(session: SessionSummary) {
   switch (session.status) {
     case "running":
-      return "bg-linear-to-r from-sky-500 via-cyan-400 to-emerald-400";
+      return "bg-linear-to-r from-sky-500/70 via-cyan-400/65 to-emerald-400/60";
     case "starting":
-      return "bg-linear-to-r from-indigo-500 via-sky-400 to-cyan-300";
+      return "bg-linear-to-r from-indigo-500/68 via-sky-400/62 to-cyan-300/58";
     case "completed":
-      return "bg-linear-to-r from-emerald-500 via-lime-400 to-emerald-300";
+      return "bg-linear-to-r from-emerald-500/68 via-lime-400/56 to-emerald-300/54";
     case "failed":
-      return "bg-linear-to-r from-rose-600 via-red-500 to-orange-400";
+      return "bg-linear-to-r from-rose-600/68 via-red-500/62 to-orange-400/56";
     case "interrupted":
-      return "bg-linear-to-r from-amber-500 via-orange-400 to-yellow-300";
+      return "bg-linear-to-r from-amber-500/68 via-orange-400/58 to-yellow-300/50";
     default:
-      return "bg-linear-to-r from-zinc-500/70 via-zinc-400/60 to-zinc-300/40";
+      return "bg-linear-to-r from-zinc-500/44 via-zinc-400/34 to-zinc-300/18";
   }
 }
 
 function getSessionStatusDotClassName(session: SessionSummary) {
   switch (session.status) {
     case "running":
-      return "bg-cyan-400 shadow-[0_0_12px_rgba(34,211,238,0.75)]";
+      return "bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.38)]";
     case "starting":
-      return "bg-sky-400 shadow-[0_0_12px_rgba(96,165,250,0.75)]";
+      return "bg-sky-400 shadow-[0_0_8px_rgba(96,165,250,0.38)]";
     case "completed":
-      return "bg-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.65)]";
+      return "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.34)]";
     case "failed":
-      return "bg-rose-400 shadow-[0_0_12px_rgba(251,113,133,0.7)]";
+      return "bg-rose-400 shadow-[0_0_8px_rgba(251,113,133,0.34)]";
     case "interrupted":
-      return "bg-amber-400 shadow-[0_0_12px_rgba(251,191,36,0.7)]";
+      return "bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.34)]";
     default:
       return "bg-zinc-400";
   }
@@ -2710,50 +2772,56 @@ function getSessionStatusDotClassName(session: SessionSummary) {
 function getSessionListCardClassName(session: SessionSummary, active: boolean) {
   const base =
     session.status === "running"
-      ? "border-cyan-500/35 bg-cyan-500/8 hover:bg-cyan-500/12"
+      ? "border-cyan-500/18 bg-cyan-500/4 hover:bg-cyan-500/7"
       : session.status === "starting"
-        ? "border-sky-500/30 bg-sky-500/8 hover:bg-sky-500/12"
+        ? "border-sky-500/16 bg-sky-500/4 hover:bg-sky-500/7"
         : session.status === "completed"
-          ? "border-emerald-500/25 bg-emerald-500/7 hover:bg-emerald-500/10"
+          ? "border-emerald-500/16 bg-emerald-500/4 hover:bg-emerald-500/7"
           : session.status === "failed"
-            ? "border-rose-500/28 bg-rose-500/8 hover:bg-rose-500/12"
+            ? "border-rose-500/18 bg-rose-500/4 hover:bg-rose-500/7"
             : session.status === "interrupted"
-              ? "border-amber-500/28 bg-amber-500/8 hover:bg-amber-500/12"
-              : "border-border bg-card/60 hover:bg-accent/60";
-  return active ? `${base} ring-1 ring-primary/45` : base;
+              ? "border-amber-500/18 bg-amber-500/4 hover:bg-amber-500/7"
+              : "border-border/80 bg-card/42 hover:bg-accent/34";
+  return active ? `${base} ring-1 ring-foreground/12 shadow-[0_10px_24px_rgba(15,23,42,0.08)]` : base;
 }
 
 function getOverviewCardToneClassName(session: SessionSummary, active: boolean) {
   const base =
     session.status === "running"
-      ? "border-cyan-400/35 bg-[radial-gradient(circle_at_top_right,rgba(56,189,248,0.22),transparent_45%),linear-gradient(180deg,rgba(10,22,34,0.96),rgba(7,12,18,0.96))]"
+      ? "border-cyan-300/16 bg-[linear-gradient(180deg,rgba(18,25,32,0.95),rgba(12,16,22,0.96))]"
       : session.status === "starting"
-        ? "border-sky-400/30 bg-[radial-gradient(circle_at_top_right,rgba(96,165,250,0.2),transparent_45%),linear-gradient(180deg,rgba(13,19,36,0.96),rgba(8,12,20,0.96))]"
+        ? "border-sky-300/16 bg-[linear-gradient(180deg,rgba(20,24,34,0.95),rgba(13,16,24,0.96))]"
         : session.status === "completed"
-          ? "border-emerald-400/28 bg-[radial-gradient(circle_at_top_right,rgba(16,185,129,0.16),transparent_45%),linear-gradient(180deg,rgba(12,26,22,0.96),rgba(8,14,12,0.96))]"
+          ? "border-emerald-300/14 bg-[linear-gradient(180deg,rgba(20,26,24,0.95),rgba(13,17,16,0.96))]"
           : session.status === "failed"
-            ? "border-rose-400/30 bg-[radial-gradient(circle_at_top_right,rgba(244,63,94,0.2),transparent_45%),linear-gradient(180deg,rgba(36,12,18,0.96),rgba(18,8,10,0.96))]"
+            ? "border-rose-300/16 bg-[linear-gradient(180deg,rgba(33,21,24,0.95),rgba(19,13,15,0.96))]"
             : session.status === "interrupted"
-              ? "border-amber-400/30 bg-[radial-gradient(circle_at_top_right,rgba(245,158,11,0.18),transparent_45%),linear-gradient(180deg,rgba(34,22,12,0.96),rgba(18,11,8,0.96))]"
-              : "border-border bg-[linear-gradient(180deg,rgba(22,24,30,0.96),rgba(13,14,18,0.96))]";
-  return `${base} ${active ? "ring-1 ring-primary/40 shadow-[0_18px_44px_rgba(15,23,42,0.36)]" : "shadow-[0_12px_32px_rgba(2,6,23,0.22)]"}`;
+              ? "border-amber-300/16 bg-[linear-gradient(180deg,rgba(33,27,20,0.95),rgba(19,15,12,0.96))]"
+              : "border-border/80 bg-[linear-gradient(180deg,rgba(25,28,35,0.95),rgba(16,18,23,0.96))]";
+  return `${base} ${active ? "ring-1 ring-white/10 shadow-[0_18px_44px_rgba(15,23,42,0.28)]" : "shadow-[0_12px_32px_rgba(2,6,23,0.18)]"}`;
 }
 
 function getOverviewCardAuraClassName(session: SessionSummary) {
   switch (session.status) {
     case "running":
-      return "bg-[radial-gradient(circle_at_85%_18%,rgba(34,211,238,0.24),transparent_34%),radial-gradient(circle_at_20%_0%,rgba(59,130,246,0.15),transparent_28%)]";
+      return "bg-[radial-gradient(circle_at_85%_18%,rgba(34,211,238,0.14),transparent_34%),radial-gradient(circle_at_20%_0%,rgba(59,130,246,0.08),transparent_28%)]";
     case "starting":
-      return "bg-[radial-gradient(circle_at_82%_16%,rgba(96,165,250,0.22),transparent_34%),radial-gradient(circle_at_12%_8%,rgba(129,140,248,0.16),transparent_26%)]";
+      return "bg-[radial-gradient(circle_at_82%_16%,rgba(96,165,250,0.14),transparent_34%),radial-gradient(circle_at_12%_8%,rgba(129,140,248,0.09),transparent_26%)]";
     case "completed":
-      return "bg-[radial-gradient(circle_at_84%_18%,rgba(52,211,153,0.18),transparent_32%),radial-gradient(circle_at_18%_10%,rgba(163,230,53,0.12),transparent_24%)]";
+      return "bg-[radial-gradient(circle_at_84%_18%,rgba(52,211,153,0.1),transparent_32%),radial-gradient(circle_at_18%_10%,rgba(163,230,53,0.06),transparent_24%)]";
     case "failed":
-      return "bg-[radial-gradient(circle_at_85%_18%,rgba(251,113,133,0.2),transparent_34%),radial-gradient(circle_at_12%_10%,rgba(248,113,113,0.14),transparent_24%)]";
+      return "bg-[radial-gradient(circle_at_85%_18%,rgba(251,113,133,0.12),transparent_34%),radial-gradient(circle_at_12%_10%,rgba(248,113,113,0.08),transparent_24%)]";
     case "interrupted":
-      return "bg-[radial-gradient(circle_at_85%_18%,rgba(251,191,36,0.2),transparent_34%),radial-gradient(circle_at_10%_10%,rgba(249,115,22,0.12),transparent_24%)]";
+      return "bg-[radial-gradient(circle_at_85%_18%,rgba(251,191,36,0.12),transparent_34%),radial-gradient(circle_at_10%_10%,rgba(249,115,22,0.08),transparent_24%)]";
     default:
-      return "bg-[radial-gradient(circle_at_85%_18%,rgba(255,255,255,0.06),transparent_34%)]";
+      return "bg-[radial-gradient(circle_at_85%_18%,rgba(255,255,255,0.04),transparent_34%)]";
   }
+}
+
+function getOverviewCardLiveClassName(session: SessionSummary) {
+  return session.status === "starting"
+    ? "bg-[linear-gradient(120deg,rgba(99,102,241,0.08),rgba(56,189,248,0.14),rgba(148,163,184,0.05),rgba(99,102,241,0.08))]"
+    : "bg-[linear-gradient(120deg,rgba(34,197,94,0.05),rgba(34,211,238,0.16),rgba(59,130,246,0.08),rgba(34,197,94,0.05))]";
 }
 
 function loadOverviewLayouts(): OverviewLayoutStore {
@@ -2874,6 +2942,49 @@ function formatEffortLabel(value: string) {
     default:
       return value;
   }
+}
+
+function inferContextWindow(model?: string): number | undefined {
+  const normalized = String(model || "").toLowerCase().trim();
+  if (!normalized) {
+    return undefined;
+  }
+  return 400_000;
+}
+
+function formatContextWindowLabel(value: number | undefined): string {
+  if (!value) {
+    return "unknown";
+  }
+  if (value >= 1_000_000) {
+    return `${Math.round(value / 1_000_000)}M`;
+  }
+  if (value >= 1000) {
+    return `${Math.round(value / 1000)}k`;
+  }
+  return String(value);
+}
+
+function getContextCompactionInfo(session: SessionDetails | null) {
+  if (!session?.transcript?.length) {
+    return { count: 0, lastCompactedAt: undefined as string | undefined };
+  }
+
+  const matches = session.transcript.filter((entry) => {
+    if (entry.kind !== "system") {
+      return false;
+    }
+    if (entry.meta?.eventType === "contextCompaction") {
+      return true;
+    }
+    const text = String(entry.text || "").toLowerCase();
+    return text.includes("context compacted") || text.includes("contextcompaction");
+  });
+
+  return {
+    count: matches.length,
+    lastCompactedAt: matches[matches.length - 1]?.createdAt,
+  };
 }
 
 function upsertSessionSummary(current: SessionSummary[], session: SessionSummary) {
@@ -3206,6 +3317,23 @@ function toWsUrl(value: string) {
   url.pathname = "/ws";
   url.search = "";
   return url.toString();
+}
+
+function sendClientSubscription(
+  socket: WebSocket | null,
+  subscription: { daemonId: string | null; sessionId: string | null },
+) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  socket.send(
+    JSON.stringify({
+      type: "client-subscribe",
+      daemonId: subscription.daemonId,
+      sessionId: subscription.sessionId,
+    }),
+  );
 }
 
 function estimateEntryHeight(row: ChatTranscriptRow | undefined) {

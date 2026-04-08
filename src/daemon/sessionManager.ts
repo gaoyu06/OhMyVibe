@@ -15,6 +15,7 @@ import {
   RenameSessionInput,
   RestoreSessionInput,
   SessionDetails,
+  SessionPreviewEntry,
   SessionStatus,
   SessionSummary,
   TranscriptEntry,
@@ -30,7 +31,9 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
   private readonly store = new SessionStore();
   private configCache?: DaemonConfig;
   private persistTimer?: NodeJS.Timeout;
-  private persistQueued = false;
+  private persistInFlight = false;
+  private readonly dirtySessionIds = new Set<string>();
+  private readonly deletedSessionIds = new Set<string>();
   private sessionUpdateTimer?: NodeJS.Timeout;
   private readonly pendingSessionUpdates = new Map<string, SessionSummary>();
 
@@ -242,7 +245,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     };
 
     this.sessions.set(sessionId, session);
-    this.persist();
+    this.persist(session);
     this.emitChange({ type: "session-created", session: this.toSummary(session) });
     const runtime = this.createRuntime(session);
     session.startupPromise = this.trackSessionStartup(session, this.startSessionInBackground(session, runtime, input));
@@ -280,7 +283,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     };
 
     this.sessions.set(session.id, session);
-    this.persist();
+    this.persist(session);
     this.emitChange({ type: "session-created", session: this.toSummary(session) });
     const runtime = this.createRuntime(session);
     session.startupPromise = this.trackSessionStartup(session, this.restoreSessionInBackground(session, runtime, input));
@@ -303,7 +306,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     session.approvalPolicy = approvalPolicy;
     session.configDirty = session.configDirty || runtimeChanged;
     this.touch(session);
-    this.persist();
+    this.persist(session);
     this.emitChange({ type: "session-updated", session: this.toSummary(session) });
 
     if (session.status !== "running" && session.status !== "starting") {
@@ -322,7 +325,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
 
     session.title = nextTitle;
     this.touch(session);
-    this.persist();
+    this.persist(session);
     this.emitChange({ type: "session-updated", session: this.toSummary(session) });
     return this.getOrThrow(sessionId);
   }
@@ -352,7 +355,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     await this.runtimeFor(session).close();
     this.sessions.delete(sessionId);
     this.runtimes.delete(sessionId);
-    this.persist();
+    this.persistDeletion(sessionId);
     this.emitChange({ type: "session-deleted", sessionId });
   }
 
@@ -384,29 +387,86 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     }
   }
 
-  private persist(): void {
-    this.persistQueued = true;
+  private persist(target?: ManagedSession | string): void {
+    if (typeof target === "string" && target) {
+      this.deletedSessionIds.delete(target);
+      this.dirtySessionIds.add(target);
+    } else if (target) {
+      this.deletedSessionIds.delete(target.id);
+      this.dirtySessionIds.add(target.id);
+    } else {
+      for (const sessionId of this.sessions.keys()) {
+        this.deletedSessionIds.delete(sessionId);
+        this.dirtySessionIds.add(sessionId);
+      }
+    }
+
+    this.schedulePersistFlush();
+  }
+
+  private persistDeletion(sessionId: string): void {
+    this.dirtySessionIds.delete(sessionId);
+    this.deletedSessionIds.add(sessionId);
+    this.schedulePersistFlush();
+  }
+
+  private schedulePersistFlush(): void {
     if (this.persistTimer) {
       return;
     }
 
-    // Streaming turns can emit many small deltas; batch disk writes so read-only
-    // APIs and other sessions are not blocked by synchronous full-store saves.
     this.persistTimer = setTimeout(() => {
       this.persistTimer = undefined;
-      if (!this.persistQueued) {
-        return;
-      }
-      this.persistQueued = false;
-      this.store.save(
-        Array.from(this.sessions.values())
-          .map((session) => this.get(session.id))
-          .filter((session): session is SessionDetails => Boolean(session)),
-      );
-      if (this.persistQueued) {
-        this.persist();
-      }
+      void this.flushPersist();
     }, 120);
+  }
+
+  private async flushPersist(): Promise<void> {
+    if (this.persistInFlight) {
+      return;
+    }
+
+    if (!this.dirtySessionIds.size && !this.deletedSessionIds.size) {
+      return;
+    }
+
+    this.persistInFlight = true;
+    const deletedSessionIds = Array.from(this.deletedSessionIds);
+    const dirtySessionIds = Array.from(this.dirtySessionIds).filter(
+      (sessionId) => !this.deletedSessionIds.has(sessionId),
+    );
+
+    this.deletedSessionIds.clear();
+    this.dirtySessionIds.clear();
+
+    try {
+      for (const sessionId of dirtySessionIds) {
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+          continue;
+        }
+        await this.store.saveSession(this.serializeSessionForStore(session));
+      }
+
+      for (const sessionId of deletedSessionIds) {
+        await this.store.deleteSession(sessionId);
+      }
+    } catch {
+      for (const sessionId of dirtySessionIds) {
+        if (!this.deletedSessionIds.has(sessionId)) {
+          this.dirtySessionIds.add(sessionId);
+        }
+      }
+      for (const sessionId of deletedSessionIds) {
+        this.deletedSessionIds.add(sessionId);
+        this.dirtySessionIds.delete(sessionId);
+      }
+    } finally {
+      this.persistInFlight = false;
+      if (this.dirtySessionIds.size || this.deletedSessionIds.size) {
+        this.schedulePersistFlush();
+      }
+    }
   }
 
   private async startSessionInBackground(
@@ -425,7 +485,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
         text: `Session startup failed: ${session.lastError}`,
         status: "failed",
       });
-      this.persist();
+      this.persist(session);
       this.emitChange({ type: "session-updated", session: this.toSummary(session) });
     }
   }
@@ -446,7 +506,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
         text: `Session restore failed: ${session.lastError}`,
         status: "failed",
       });
-      this.persist();
+      this.persist(session);
       this.emitChange({ type: "session-updated", session: this.toSummary(session) });
     }
   }
@@ -462,7 +522,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     };
     session.transcript.push(entry);
     this.touch(session);
-    this.persist();
+    this.persist(session);
     this.emitChange({ type: "session-entry", sessionId: session.id, entry });
     this.emitChange({ type: "session-updated", session: this.toSummary(session) });
     return entry;
@@ -480,8 +540,18 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       };
     } else {
       const existing = session.transcript[existingIndex];
+      const keepExistingReadPreview =
+        existing.kind === "tool" &&
+        entry.kind === "tool" &&
+        this.isReadToolName(existing.meta?.name);
       const mergedText =
-        existing.kind === "tool" && entry.kind === "tool" && existing.text && entry.text && existing.text !== entry.text
+        keepExistingReadPreview
+          ? existing.text
+          : existing.kind === "tool" &&
+              entry.kind === "tool" &&
+              existing.text &&
+              entry.text &&
+              existing.text !== entry.text
           ? `${existing.text}\n\n${entry.text}`.trim()
           : entry.text || existing.text;
       session.transcript[existingIndex] = {
@@ -497,7 +567,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
     }
 
     this.touch(session);
-    this.persist();
+    this.persist(session);
     this.emitChange(event);
     this.emitChange({ type: "session-updated", session: this.toSummary(session) });
   }
@@ -541,7 +611,7 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
 
   private createRuntime(session: ManagedSession): SessionRuntime {
     const runtime = new SessionRuntime(session, {
-      persist: () => this.persist(),
+      persist: () => this.persist(session),
       emitChange: (event) => this.emitChange(event),
       touch: (target) => this.touch(target),
       toSummary: (target) => this.toSummary(target),
@@ -557,6 +627,29 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
 
   private runtimeFor(session: ManagedSession): SessionRuntime {
     return this.runtimes.get(session.id) ?? this.createRuntime(session);
+  }
+
+  private serializeSessionForStore(session: ManagedSession): SessionDetails {
+    return {
+      id: session.id,
+      title: session.title,
+      cwd: session.cwd,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      status: session.status,
+      origin: session.origin,
+      model: session.model,
+      reasoningEffort: session.reasoningEffort,
+      sandbox: session.sandbox,
+      approvalPolicy: session.approvalPolicy,
+      codexThreadId: session.codexThreadId,
+      codexPath: session.codexPath,
+      codexSource: session.codexSource,
+      lastError: session.lastError,
+      transcriptCount: session.transcript.length,
+      previewEntries: [],
+      transcript: [...session.transcript],
+    };
   }
 
   private toSummary(session: ManagedSession): SessionSummary {
@@ -577,7 +670,109 @@ export class SessionManager extends EventEmitter<{ event: [DaemonEvent] }> {
       codexSource: session.codexSource,
       lastError: session.lastError,
       transcriptCount: session.transcript.length,
+      previewEntries: this.toPreviewEntries(session.transcript),
     };
+  }
+
+  private toPreviewEntries(transcript: TranscriptEntry[]): SessionPreviewEntry[] {
+    if (!transcript.length) {
+      return [];
+    }
+
+    const selected: SessionPreviewEntry[] = [];
+    let textBudget = 520;
+
+    for (let index = transcript.length - 1; index >= 0; index -= 1) {
+      const entry = transcript[index];
+      if (!entry) {
+        continue;
+      }
+
+      const previewText = this.toPreviewText(entry);
+      if (!previewText) {
+        continue;
+      }
+
+      const cost = Math.max(40, previewText.length);
+      if (selected.length && textBudget - cost < 0) {
+        break;
+      }
+
+      selected.unshift({
+        id: entry.id,
+        kind: entry.kind,
+        previewText,
+        createdAt: entry.createdAt,
+        status: entry.status,
+      });
+      textBudget -= cost;
+
+      if (selected.length >= 6) {
+        break;
+      }
+    }
+
+    return selected;
+  }
+
+  private toPreviewText(entry: TranscriptEntry): string {
+    if (entry.kind === "assistant" && entry.status === "streaming" && !entry.text.trim()) {
+      return "Thinking...";
+    }
+
+    if (entry.kind === "approval") {
+      const approvalKind = typeof entry.meta?.approvalKind === "string" ? entry.meta.approvalKind : "";
+      if (approvalKind) {
+        return approvalKind;
+      }
+    }
+
+    if (entry.kind === "tool" || entry.kind === "command" || entry.kind === "file_change") {
+      return this.lastLines(entry.text, 6) || this.entryLabel(entry);
+    }
+
+    const collapsed = String(entry.text || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    return collapsed || this.entryLabel(entry);
+  }
+
+  private entryLabel(entry: TranscriptEntry): string {
+    switch (entry.kind) {
+      case "user":
+        return "User";
+      case "assistant":
+        return entry.status === "streaming" ? "Assistant" : "Reply";
+      case "reasoning":
+        return "Thinking";
+      case "tool":
+        return "Tool";
+      case "command":
+        return "Command";
+      case "file_change":
+        return "Diff";
+      case "approval":
+        return "Approval";
+      default:
+        return "System";
+    }
+  }
+
+  private lastLines(text: string, limit: number): string {
+    const lines = String(text || "")
+      .split(/\r?\n/)
+      .map((line) => line.trimEnd())
+      .filter((line) => line.trim().length > 0);
+    return lines.slice(-limit).join("\n").trim();
+  }
+
+  private isReadToolName(value: unknown): boolean {
+    if (typeof value !== "string") {
+      return false;
+    }
+
+    const normalized = value.replace(/[\s-]+/g, "_").trim().toLowerCase();
+    return normalized === "read" || normalized === "read_file" || normalized === "readfile";
   }
 
   private getSessionOrThrow(sessionId: string): ManagedSession {

@@ -112,11 +112,13 @@ body {
   transition:
     background-color 160ms ease,
     border-color 160ms ease,
+    box-shadow 160ms ease,
     transform 160ms ease;
 }
 
 .ui-session-item:hover {
   transform: translateY(-1px);
+  box-shadow: 0 8px 20px color-mix(in oklab, var(--foreground) 6%, transparent);
 }
 
 .ui-overview-card {
@@ -129,7 +131,14 @@ body {
 
 .ui-overview-card:hover {
   transform: translateY(-2px);
-  box-shadow: 0 8px 24px color-mix(in oklab, var(--foreground) 10%, transparent);
+  box-shadow: 0 10px 26px color-mix(in oklab, var(--foreground) 8%, transparent);
+}
+
+.ui-overview-live-sheen {
+  opacity: 0.9;
+  background-size: 220% 220%;
+  mix-blend-mode: screen;
+  animation: ui-live-gradient-drift 8.8s ease-in-out infinite;
 }
 
 .ui-session-status-bar {
@@ -298,6 +307,21 @@ body {
   }
 }
 
+@keyframes ui-live-gradient-drift {
+  0% {
+    background-position: 0% 50%;
+    transform: scale(1);
+  }
+  50% {
+    background-position: 100% 50%;
+    transform: scale(1.04);
+  }
+  100% {
+    background-position: 0% 50%;
+    transform: scale(1);
+  }
+}
+
 button,
 input,
 textarea {
@@ -312,6 +336,7 @@ textarea {
     transition: none;
   }
 
+  .ui-overview-live-sheen,
   .ui-entry-reveal,
   .ui-fab-reveal,
   .ui-dialog-overlay[data-state],

@@ -3,6 +3,7 @@ import express from "express";
 import http from "node:http";
 import path from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
+import type { DaemonEvent } from "../src/shared/types.js";
 
 interface DaemonDescriptor {
   id: string;
@@ -20,6 +21,11 @@ interface ConnectedDaemon {
   socket: WebSocket;
 }
 
+interface ClientSubscription {
+  daemonId: string | null;
+  sessionId: string | null;
+}
+
 const app = express();
 app.use(express.json());
 
@@ -30,6 +36,7 @@ const server = http.createServer(app);
 const daemonWss = new WebSocketServer({ noServer: true });
 const clientWss = new WebSocketServer({ noServer: true });
 const daemons = new Map<string, ConnectedDaemon>();
+const clientSubscriptions = new WeakMap<WebSocket, ClientSubscription>();
 const pending = new Map<
   string,
   {
@@ -310,11 +317,7 @@ daemonWss.on("connection", (socket) => {
       if (current) {
         current.descriptor.lastSeenAt = new Date().toISOString();
       }
-      broadcast({
-        type: "daemon-event",
-        daemonId,
-        event: payload.event,
-      });
+      dispatchDaemonEvent(daemonId, payload.event as DaemonEvent);
       return;
     }
 
@@ -323,11 +326,7 @@ daemonWss.on("connection", (socket) => {
       if (current) {
         current.descriptor.lastSeenAt = new Date().toISOString();
       }
-      broadcast({
-        type: "daemon-events",
-        daemonId,
-        events: payload.events,
-      });
+      dispatchDaemonEvents(daemonId, payload.events as DaemonEvent[]);
     }
   });
 
@@ -347,12 +346,30 @@ daemonWss.on("connection", (socket) => {
 });
 
 clientWss.on("connection", (socket) => {
+  clientSubscriptions.set(socket, { daemonId: null, sessionId: null });
+
   socket.send(
     JSON.stringify({
       type: "hello",
       daemons: Array.from(daemons.values()).map((item) => item.descriptor),
     }),
   );
+
+  socket.on("message", (raw) => {
+    const payload = JSON.parse(String(raw));
+    if (payload.type !== "client-subscribe") {
+      return;
+    }
+
+    const daemonId = typeof payload.daemonId === "string" && payload.daemonId.trim()
+      ? payload.daemonId.trim()
+      : null;
+    const sessionId = daemonId && typeof payload.sessionId === "string" && payload.sessionId.trim()
+      ? payload.sessionId.trim()
+      : null;
+
+    clientSubscriptions.set(socket, { daemonId, sessionId });
+  });
 });
 
 server.listen(port, () => {
@@ -391,4 +408,76 @@ function requestDaemon(daemonId: string, method: string, params: Record<string, 
     }, 30000);
     pending.set(requestId, { resolve, reject, timeout });
   });
+}
+
+function dispatchDaemonEvent(daemonId: string, event: DaemonEvent) {
+  for (const client of clientWss.clients) {
+    if (client.readyState !== WebSocket.OPEN) {
+      continue;
+    }
+    const subscription = clientSubscriptions.get(client);
+    if (!shouldSendDaemonEvent(subscription, daemonId, event)) {
+      continue;
+    }
+    client.send(
+      JSON.stringify({
+        type: "daemon-event",
+        daemonId,
+        event,
+      }),
+    );
+  }
+}
+
+function dispatchDaemonEvents(daemonId: string, events: DaemonEvent[]) {
+  if (!events.length) {
+    return;
+  }
+
+  for (const client of clientWss.clients) {
+    if (client.readyState !== WebSocket.OPEN) {
+      continue;
+    }
+    const subscription = clientSubscriptions.get(client);
+    if (!subscription || subscription.daemonId !== daemonId) {
+      continue;
+    }
+
+    const filteredEvents = events.filter((event) => shouldSendDaemonEvent(subscription, daemonId, event));
+    if (!filteredEvents.length) {
+      continue;
+    }
+
+    client.send(
+      JSON.stringify({
+        type: "daemon-events",
+        daemonId,
+        events: filteredEvents,
+      }),
+    );
+  }
+}
+
+function shouldSendDaemonEvent(
+  subscription: ClientSubscription | undefined,
+  daemonId: string,
+  event: DaemonEvent,
+) {
+  if (!subscription || subscription.daemonId !== daemonId) {
+    return false;
+  }
+
+  switch (event.type) {
+    case "session-created":
+    case "session-updated":
+    case "session-deleted":
+      return true;
+    case "session-entry":
+    case "session-entry-updated":
+    case "session-entries-updated":
+    case "session-reset":
+      return subscription.sessionId === event.sessionId;
+    default:
+      return false;
+  }
 }

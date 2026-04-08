@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import {
   CreateSessionInput,
   DaemonEvent,
@@ -640,7 +641,7 @@ export class SessionRuntime {
         return {
           id: item.id,
           kind: "tool",
-          text: JSON.stringify(item, null, 2),
+          text: this.formatStructuredToolCall(item),
           status: item.status ?? "completed",
           createdAt,
         };
@@ -674,8 +675,19 @@ export class SessionRuntime {
         return { id: item.id, kind: "system", text: item.text ?? "", createdAt, status: "completed" };
       case "enteredReviewMode":
       case "exitedReviewMode":
-      case "contextCompaction":
         return { id: item.id, kind: "system", text: JSON.stringify(item, null, 2), createdAt };
+      case "contextCompaction":
+        return {
+          id: item.id,
+          kind: "system",
+          text: "Context compacted",
+          createdAt,
+          status: "completed",
+          meta: {
+            eventType: "contextCompaction",
+            payload: item,
+          },
+        };
       default:
         return undefined;
     }
@@ -955,18 +967,117 @@ export class SessionRuntime {
 
   private formatFunctionCall(item: any): string {
     const name = item?.name || "tool";
+    if (this.isReadToolName(name)) {
+      const target = this.extractReadTarget(item?.arguments);
+      return target ? `read ${target}` : "read";
+    }
     const args = this.prettyJsonString(item?.arguments);
     return args ? `${name}\n\n${args}` : name;
   }
 
   private formatFunctionCallOutput(item: any): string {
+    if (this.isReadToolName(item?.name)) {
+      return "";
+    }
     return String(item?.output ?? "").trim();
   }
 
   private formatCustomToolCall(item: any): string {
     const name = item?.name || "custom_tool";
+    if (this.isReadToolName(name)) {
+      const target = this.extractReadTarget(item?.input);
+      return target ? `read ${target}` : "read";
+    }
     const input = typeof item?.input === "string" ? item.input : this.prettyJson(item?.input);
     return input ? `${name}\n\n${input}` : name;
+  }
+
+  private formatStructuredToolCall(item: any): string {
+    const name = item?.name || item?.toolName || item?.tool?.name || item?.type || "tool";
+    if (this.isReadToolName(name)) {
+      const target = this.extractReadTarget(item?.arguments ?? item?.input ?? item?.params ?? item);
+      return target ? `read ${target}` : "read";
+    }
+    return JSON.stringify(item, null, 2);
+  }
+
+  private isReadToolName(value: unknown): boolean {
+    if (typeof value !== "string") {
+      return false;
+    }
+
+    const normalized = value.replace(/[\s-]+/g, "_").trim().toLowerCase();
+    return normalized === "read" || normalized === "read_file" || normalized === "readfile";
+  }
+
+  private extractReadTarget(value: unknown): string {
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) {
+        return "";
+      }
+
+      const parsed = this.parseJsonLike(trimmed);
+      if (!parsed) {
+        const normalized = trimmed.replace(/^file:\/\//i, "").replace(/[\\/]+$/, "");
+        return path.basename(normalized) || normalized;
+      }
+
+      value = parsed;
+    }
+
+    const parsed = this.parseJsonLike(value);
+    if (!parsed || typeof parsed !== "object") {
+      return "";
+    }
+
+    const candidate = this.firstStringValue(parsed as Record<string, unknown>, [
+      "filePath",
+      "filepath",
+      "path",
+      "filename",
+      "file",
+      "target",
+      "uri",
+      "name",
+    ]);
+    if (!candidate) {
+      return "";
+    }
+
+    const normalized = candidate.replace(/^file:\/\//i, "").replace(/[\\/]+$/, "").trim();
+    if (!normalized) {
+      return "";
+    }
+
+    return path.basename(normalized) || normalized;
+  }
+
+  private parseJsonLike(value: unknown): unknown {
+    if (typeof value !== "string") {
+      return value;
+    }
+
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private firstStringValue(value: Record<string, unknown>, keys: string[]): string {
+    for (const key of keys) {
+      const candidate = value[key];
+      if (typeof candidate === "string" && candidate.trim()) {
+        return candidate.trim();
+      }
+    }
+    return "";
   }
 
   private prettyJsonString(value: unknown): string {
