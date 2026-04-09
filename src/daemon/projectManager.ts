@@ -49,6 +49,8 @@ const AGENT_PROMPT_TRANSCRIPT_PREVIEW_LIMIT = 6;
 const AGENT_PROMPT_LOG_PREVIEW_LIMIT = 6;
 const AGENT_PROMPT_TEXT_LIMIT = 600;
 const FOREMAN_WAKE_STATUSES = new Set(["completed", "failed", "interrupted", "idle"] as const);
+const STEWARD_HEARTBEAT_MS = 10 * 60 * 1000;
+const STEWARD_CONTINUE_DELAY_MS = 15_000;
 
 interface GitCacheEntry {
   summary?: SessionGitSummary;
@@ -72,6 +74,7 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
   private readonly agentRetryTimers = new Map<string, NodeJS.Timeout>();
   private readonly foremanWakeStatusBySession = new Map<string, string>();
   private readonly lastSessionStatusBySession = new Map<string, SessionSummary["status"]>();
+  private readonly stewardHeartbeatTimers = new Map<string, NodeJS.Timeout>();
 
   constructor(sessionManager: SessionManager) {
     super();
@@ -356,6 +359,7 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
         text: `Run project with policy ${project.runPolicy.mode}.`,
       });
       this.enqueueAgent(steward.id);
+      this.refreshStewardHeartbeat(project.id);
     }
 
     return this.getProject(projectId)!;
@@ -363,6 +367,7 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
 
   async pauseProject(projectId: string): Promise<ProjectDetails> {
     const project = this.getProjectSummaryOrThrow(projectId);
+    this.clearStewardHeartbeat(projectId);
     project.status = "paused";
     project.updatedAt = new Date().toISOString();
     this.schedulePersist();
@@ -632,6 +637,10 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
       this.emit("event", { type: "agent-updated", agent: this.toAgentSummary(agent) });
     } catch (error) {
       await this.handleAgentRunFailure(agent, project, error);
+    } finally {
+      if (agent.role === "steward") {
+        this.refreshStewardHeartbeat(project.id);
+      }
     }
   }
 
@@ -795,6 +804,16 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
             : `${project.name} update`;
         const body = typeof decision.actionInput?.body === "string" ? decision.actionInput.body.trim() : "";
 
+        if (this.shouldSuppressRoutineUserNotification(project, agent, severity)) {
+          this.appendAgentLog(agent, {
+            kind: "system",
+            direction: "internal",
+            text: "Routine user notification suppressed during autonomous run. Continue coordinating work without notifying the user.",
+          });
+          this.refreshStewardHeartbeat(project.id, STEWARD_CONTINUE_DELAY_MS);
+          return;
+        }
+
         await this.createNotification({
           projectId: project.id,
           severity,
@@ -808,6 +827,7 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
         return;
       }
       case "mark_project_complete": {
+        this.clearStewardHeartbeat(project.id);
         project.status = "completed";
         project.updatedAt = new Date().toISOString();
         this.schedulePersist();
@@ -817,6 +837,15 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
       case "noop":
       default:
         if (decision.userFacingText?.trim()) {
+          if (this.shouldSuppressRoutineUserNotification(project, agent, "info")) {
+            this.appendAgentLog(agent, {
+              kind: "system",
+              direction: "internal",
+              text: "Routine user update suppressed during autonomous run. Continue coordinating work without notifying the user.",
+            });
+            this.refreshStewardHeartbeat(project.id, STEWARD_CONTINUE_DELAY_MS);
+            return;
+          }
           await this.createNotification({
             id: randomUUID(),
             projectId: project.id,
@@ -963,7 +992,7 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
     this.appendAgentLog(foreman, {
       kind: "observation",
       direction: "internal",
-      text: `Bound session ${session.title} (${session.id}) is now ${currentStatus}. Review the outcome, decide the next step, and report status back to Steward.`,
+      text: `Bound session ${session.title} (${session.id}) is now ${currentStatus}. Review the outcome, decide the next step, and report status back to Steward before stopping.`,
       meta: {
         sessionId: session.id,
         sessionTitle: session.title,
@@ -976,6 +1005,7 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
   private buildAgentSystemPrompt(agent: AgentDetails, project: ProjectSummary): string {
     const commonLines = [
       `You are ${agent.role} for project "${project.name}".`,
+      `Project run policy: ${project.runPolicy.mode}${project.runPolicy.runUntil ? ` (${project.runPolicy.runUntil})` : ""}.`,
       "Follow ReAct using the provided native tools.",
       "Think briefly, then call exactly one tool for the next action.",
       "Never return plain JSON instead of a native tool call.",
@@ -992,7 +1022,10 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
         "When a new execution lane is needed, use create_session to create a new session plus its foreman.",
         "After that, communicate task intent to the relevant foreman, which is the only agent that should direct a session.",
         "If no session has inspected the repository or the existing evidence is stale, create a new execution lane or message an existing foreman to inspect the repository first.",
-        "Only after repository inspection should you break work down and assign or sequence tasks."
+        "Only after repository inspection should you break work down and assign or sequence tasks.",
+        "During autonomous run policies such as until_blocked or until_complete, do not notify the user about routine progress.",
+        "Only use notify_user when there is a real blocker, a real need for user input, a risk that needs attention, or the project is actually complete.",
+        "After each completed step, continue assigning the next useful work instead of stopping."
       );
     } else if (agent.role === "foreman") {
       commonLines.push(
@@ -1001,6 +1034,7 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
         "Before requesting implementation or planning, first make sure the bound session has inspected the repository and identified relevant files.",
         "Once the repository has been inspected, ask for a concrete plan, then drive execution step by step.",
         "When the bound session completes, fails, or is interrupted, review the outcome and report it to Steward before deciding the next step.",
+        "Do not ask the user for routine progress updates. Report status to Steward first.",
         "If blocked, message Steward or notify the user with the specific blocker."
       );
     } else {
@@ -1137,6 +1171,7 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
   }
 
   private blockProjectAfterAgentFailure(project: ProjectSummary, agent: AgentDetails, error: string): void {
+    this.clearStewardHeartbeat(project.id);
     if (project.status !== "blocked") {
       project.status = "blocked";
       project.updatedAt = new Date().toISOString();
@@ -1167,6 +1202,75 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
       status: "pending",
       createdAt: new Date().toISOString(),
     });
+  }
+
+  private shouldSuppressRoutineUserNotification(
+    project: ProjectSummary,
+    agent: AgentDetails,
+    severity: "info" | "warning" | "critical",
+  ): boolean {
+    return (
+      agent.role === "steward" &&
+      project.status === "running" &&
+      severity === "info" &&
+      (project.runPolicy.mode === "until_blocked" || project.runPolicy.mode === "until_complete")
+    );
+  }
+
+  private refreshStewardHeartbeat(projectId: string, delayMs: number = STEWARD_HEARTBEAT_MS): void {
+    const timer = this.stewardHeartbeatTimers.get(projectId);
+    if (timer) {
+      clearTimeout(timer);
+      this.stewardHeartbeatTimers.delete(projectId);
+    }
+
+    const project = this.state.projects.find((item) => item.id === projectId);
+    if (!project || project.status !== "running") {
+      return;
+    }
+
+    const steward = this.findProjectAgent(projectId, "steward");
+    if (!steward) {
+      return;
+    }
+
+    const nextTimer = setTimeout(() => {
+      this.stewardHeartbeatTimers.delete(projectId);
+      const nextProject = this.state.projects.find((item) => item.id === projectId);
+      if (!nextProject || nextProject.status !== "running") {
+        return;
+      }
+
+      const nextSteward = this.findProjectAgent(projectId, "steward");
+      if (!nextSteward) {
+        return;
+      }
+
+      if (this.runningAgents.has(nextSteward.id)) {
+        this.refreshStewardHeartbeat(projectId);
+        return;
+      }
+
+      this.appendAgentLog(nextSteward, {
+        kind: "observation",
+        direction: "internal",
+        text: "Heartbeat: review all sessions and agents, check whether any completed work unlocked the next task, and continue project orchestration until truly blocked.",
+        meta: {
+          heartbeat: true,
+        },
+      });
+      this.enqueueAgent(nextSteward.id);
+    }, delayMs);
+
+    this.stewardHeartbeatTimers.set(projectId, nextTimer);
+  }
+
+  private clearStewardHeartbeat(projectId: string): void {
+    const timer = this.stewardHeartbeatTimers.get(projectId);
+    if (timer) {
+      clearTimeout(timer);
+      this.stewardHeartbeatTimers.delete(projectId);
+    }
   }
 
   private enrichSessionSummary(session: SessionSummary): SessionSummary {
