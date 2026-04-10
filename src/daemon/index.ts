@@ -1,4 +1,5 @@
 import "dotenv/config";
+import packageJson from "../../package.json" with { type: "json" };
 import { ManagementBridge } from "./managementBridge.js";
 import { ProjectManager } from "./projectManager.js";
 import { SessionManager } from "./sessionManager.js";
@@ -19,3 +20,4 @@ const bridge = new ManagementBridge(projectManager, {
 bridge.start();
 
 console.log(`OhMyVibe daemon connecting to ${managementServerUrl}`);
+console.log(`OhMyVibe daemon version ${packageJson.version}`);

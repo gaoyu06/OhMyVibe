@@ -5,19 +5,17 @@
 - `daemon -> control server <- browser` 架构（daemon 主动连接管理端）
 - 每个会话独立启动一个 `codex app-server` 子进程
 - daemon 统一管理多会话、消息发送、中断、状态同步
-- 额外提供一个标准 `ACP` bridge 入口，方便后续给编辑器或其他 ACP client 接入
 - 应用侧 session 本地持久化到 `data/sessions.json`
 - 支持从 Codex 历史 `~/.codex/sessions` 恢复会话，并绑定到原始 Codex thread
 - Web 控制台为独立 React + shadcn 风格项目，浏览器只连接管理端
+- 浏览器端与管理端具备 websocket 心跳、自动重连与重同步
 
 ## 为什么这样做
 
-当前官方能力里，`Codex CLI` 暴露的是 `app-server` 自动化接口，而不是原生 `ACP agent`。因此这个 MVP 采用两层桥接：
+当前官方能力里，`Codex CLI` 暴露的是 `app-server` 自动化接口，因此当前实现直接围绕 `codex app-server` 做会话管理与编排：
 
-1. 南向：daemon 通过 `codex app-server --listen stdio://` 控制 Codex
-2. 北向：daemon 自己暴露 `ACP` 兼容 agent，供外部 ACP client 使用
-
-这能保证现在就能正确接入 Codex，同时不把上层协议绑死在 Codex 私有接口上。
+1. daemon 通过 `codex app-server --listen stdio://` 控制 Codex
+2. control server 负责聚合 daemon、推送事件，并为浏览器提供统一入口
 
 ## 运行
 
@@ -63,12 +61,6 @@ http://your-control-host:3310
 
 ```bash
 npm run web:dev
-```
-
-启动 ACP bridge：
-
-```bash
-npm run acp
 ```
 
 ## 使用示例
@@ -136,7 +128,7 @@ ohmyvibe daemon ^
 
 说明：
 
-- 当前 npm 包主要提供 `daemon` / `acp` CLI
+- 当前 npm 包主要提供 `daemon` CLI
 - Web 控制服务端目前仍建议直接从仓库部署
 
 ## 服务端部署示例
@@ -238,12 +230,9 @@ npm publish --access public
 ## 后续建议
 
 - 把 `turn/interrupt`、审批、文件 diff、命令执行输出做成更细粒度 UI
-- 将 ACP session 和 web session 统一到同一后端存储
 - 为 `codex app-server` 请求/通知补完整类型约束
 
 ## 参考文档
 
 - OpenAI Codex App Server: https://developers.openai.com/codex/app-server
 - OpenAI Codex CLI repo: https://github.com/openai/codex
-- ACP 协议主页: https://agentclientprotocol.com
-- ACP TypeScript SDK: https://www.npmjs.com/package/@agentclientprotocol/sdk

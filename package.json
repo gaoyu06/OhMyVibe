@@ -17,7 +17,6 @@
     "build:web": "npm --prefix web run build",
     "pack:dry-run": "npm pack --dry-run",
     "daemon": "tsx src/daemon/index.ts",
-    "acp": "tsx src/acp/index.ts",
     "dev": "tsx watch src/daemon/index.ts",
     "web:dev": "npm --prefix web run dev",
     "web:preview": "npm --prefix web run preview",
@@ -32,7 +31,6 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^0.18.0",
     "@types/nodemailer": "^8.0.0",
     "dotenv": "^17.4.1",
     "express": "^5.2.1",

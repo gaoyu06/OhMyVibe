@@ -155,7 +155,7 @@ export function AppHeader({
           <SelectContent>
             {daemons.map((item) => (
               <SelectItem key={item.id} value={item.id}>
-                {item.name}
+                {formatDaemonLabel(item)}
               </SelectItem>
             ))}
           </SelectContent>
@@ -389,4 +389,8 @@ export function AppHeader({
       </div>
     </header>
   );
+}
+
+function formatDaemonLabel(daemon: DaemonDescriptor) {
+  return daemon.version ? `${daemon.name} · v${daemon.version}` : daemon.name;
 }

@@ -27,10 +27,15 @@ interface ClientSubscription {
   sessionId: string | null;
 }
 
+interface SocketLiveness {
+  isAlive: boolean;
+}
+
 const app = express();
 app.use(express.json());
 
 const port = Number(process.env.PORT ?? "3310");
+const SOCKET_HEARTBEAT_MS = 15_000;
 const rootDir = path.resolve(process.cwd());
 const clientDistDir = path.join(rootDir, "dist");
 const server = http.createServer(app);
@@ -38,6 +43,8 @@ const daemonWss = new WebSocketServer({ noServer: true });
 const clientWss = new WebSocketServer({ noServer: true });
 const daemons = new Map<string, ConnectedDaemon>();
 const clientSubscriptions = new WeakMap<WebSocket, ClientSubscription>();
+const daemonSocketLiveness = new WeakMap<WebSocket, SocketLiveness>();
+const clientSocketLiveness = new WeakMap<WebSocket, SocketLiveness>();
 const pending = new Map<
   string,
   {
@@ -468,8 +475,19 @@ server.on("upgrade", (request, socket, head) => {
 
 daemonWss.on("connection", (socket) => {
   let daemonId: string | undefined;
+  daemonSocketLiveness.set(socket, { isAlive: true });
+  socket.on("pong", () => {
+    const liveness = daemonSocketLiveness.get(socket);
+    if (liveness) {
+      liveness.isAlive = true;
+    }
+  });
 
   socket.on("message", (raw) => {
+    const liveness = daemonSocketLiveness.get(socket);
+    if (liveness) {
+      liveness.isAlive = true;
+    }
     const payload = JSON.parse(String(raw));
 
     if (payload.type === "daemon-hello") {
@@ -546,6 +564,13 @@ daemonWss.on("connection", (socket) => {
 
 clientWss.on("connection", (socket) => {
   clientSubscriptions.set(socket, { daemonId: null, sessionId: null });
+  clientSocketLiveness.set(socket, { isAlive: true });
+  socket.on("pong", () => {
+    const liveness = clientSocketLiveness.get(socket);
+    if (liveness) {
+      liveness.isAlive = true;
+    }
+  });
 
   socket.send(
     JSON.stringify({
@@ -555,6 +580,10 @@ clientWss.on("connection", (socket) => {
   );
 
   socket.on("message", (raw) => {
+    const liveness = clientSocketLiveness.get(socket);
+    if (liveness) {
+      liveness.isAlive = true;
+    }
     const payload = JSON.parse(String(raw));
     if (payload.type !== "client-subscribe") {
       return;
@@ -569,6 +598,16 @@ clientWss.on("connection", (socket) => {
 
     clientSubscriptions.set(socket, { daemonId, sessionId });
   });
+});
+
+const heartbeatTimer = setInterval(() => {
+  heartbeatSockets(daemonWss.clients, daemonSocketLiveness);
+  heartbeatSockets(clientWss.clients, clientSocketLiveness);
+}, SOCKET_HEARTBEAT_MS);
+heartbeatTimer.unref();
+
+server.on("close", () => {
+  clearInterval(heartbeatTimer);
 });
 
 server.listen(port, () => {
@@ -763,5 +802,27 @@ function shouldSendDaemonEvent(
       return subscription.sessionId === event.sessionId;
     default:
       return false;
+  }
+}
+
+function heartbeatSockets(
+  sockets: Set<WebSocket>,
+  livenessMap: WeakMap<WebSocket, SocketLiveness>,
+) {
+  for (const socket of sockets) {
+    const liveness = livenessMap.get(socket);
+    if (!liveness) {
+      livenessMap.set(socket, { isAlive: true });
+      socket.ping();
+      continue;
+    }
+
+    if (!liveness.isAlive) {
+      socket.terminate();
+      continue;
+    }
+
+    liveness.isAlive = false;
+    socket.ping();
   }
 }

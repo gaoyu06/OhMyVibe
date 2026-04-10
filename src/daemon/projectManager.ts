@@ -45,12 +45,16 @@ const AGENT_CONTEXT_WINDOW_CHARS = AGENT_CONTEXT_WINDOW_TOKENS * 4;
 const AGENT_RECENT_LOG_LIMIT = 80;
 const AGENT_RETRY_LIMIT = 3;
 const AGENT_RETRY_BASE_DELAY_MS = 1_500;
+const AGENT_RUN_TIMEOUT_MS = 120_000;
+const MAX_PARALLEL_AGENTS = 4;
 const AGENT_PROMPT_TRANSCRIPT_PREVIEW_LIMIT = 6;
 const AGENT_PROMPT_LOG_PREVIEW_LIMIT = 6;
 const AGENT_PROMPT_TEXT_LIMIT = 600;
 const FOREMAN_WAKE_STATUSES = new Set(["completed", "failed", "interrupted", "idle"] as const);
 const STEWARD_HEARTBEAT_MS = 10 * 60 * 1000;
 const STEWARD_CONTINUE_DELAY_MS = 15_000;
+const SENTINEL_HEARTBEAT_MS = 60_000;
+const SESSION_STALL_THRESHOLD_MS = 5 * 60 * 1000;
 
 interface GitCacheEntry {
   summary?: SessionGitSummary;
@@ -75,6 +79,9 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
   private readonly foremanWakeStatusBySession = new Map<string, string>();
   private readonly lastSessionStatusBySession = new Map<string, SessionSummary["status"]>();
   private readonly stewardHeartbeatTimers = new Map<string, NodeJS.Timeout>();
+  private readonly sentinelHeartbeatTimers = new Map<string, NodeJS.Timeout>();
+  private readonly sessionStallAlertBySession = new Map<string, string>();
+  private drainAgentQueueScheduled = false;
 
   constructor(sessionManager: SessionManager) {
     super();
@@ -362,12 +369,20 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
       this.refreshStewardHeartbeat(project.id);
     }
 
+    const sentinel = this.findProjectAgent(projectId, "sentinel");
+    if (sentinel) {
+      this.enqueueAgent(sentinel.id);
+      this.refreshSentinelHeartbeat(project.id);
+    }
+
     return this.getProject(projectId)!;
   }
 
   async pauseProject(projectId: string): Promise<ProjectDetails> {
     const project = this.getProjectSummaryOrThrow(projectId);
     this.clearStewardHeartbeat(projectId);
+    this.clearSentinelHeartbeat(projectId);
+    this.clearQueuedAgentsForProject(projectId);
     project.status = "paused";
     project.updatedAt = new Date().toISOString();
     this.schedulePersist();
@@ -428,6 +443,9 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
       case "session-created":
       case "session-updated": {
         const enriched = this.enrichSessionSummary(event.session);
+        if (enriched.status !== "running" && enriched.status !== "starting") {
+          this.sessionStallAlertBySession.delete(enriched.id);
+        }
         this.emit("event", { ...event, session: enriched });
         void this.refreshGitForSession(enriched);
         if (event.type === "session-updated") {
@@ -439,6 +457,7 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
         const projectId = this.state.sessionProjectIds[event.sessionId];
         this.foremanWakeStatusBySession.delete(event.sessionId);
         this.lastSessionStatusBySession.delete(event.sessionId);
+        this.sessionStallAlertBySession.delete(event.sessionId);
         if (projectId) {
           delete this.state.sessionProjectIds[event.sessionId];
           const project = this.state.projects.find((item) => item.id === projectId);
@@ -571,24 +590,38 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
   }
 
   private enqueueAgent(agentId: string): void {
+    if (!agentId) {
+      this.scheduleDrainAgentQueue();
+      return;
+    }
     this.agentQueue.add(agentId);
+    this.scheduleDrainAgentQueue();
+  }
+
+  private scheduleDrainAgentQueue(): void {
+    if (this.drainAgentQueueScheduled) {
+      return;
+    }
+    this.drainAgentQueueScheduled = true;
     queueMicrotask(() => {
-      void this.drainAgentQueue();
+      this.drainAgentQueueScheduled = false;
+      this.drainAgentQueue();
     });
   }
 
-  private async drainAgentQueue(): Promise<void> {
-    for (const agentId of Array.from(this.agentQueue)) {
-      if (this.runningAgents.has(agentId)) {
-        continue;
+  private drainAgentQueue(): void {
+    while (this.runningAgents.size < MAX_PARALLEL_AGENTS) {
+      const nextAgentId = Array.from(this.agentQueue).find((agentId) => !this.runningAgents.has(agentId));
+      if (!nextAgentId) {
+        return;
       }
-      this.agentQueue.delete(agentId);
-      this.runningAgents.add(agentId);
-      try {
-        await this.runAgent(agentId);
-      } finally {
-        this.runningAgents.delete(agentId);
-      }
+
+      this.agentQueue.delete(nextAgentId);
+      this.runningAgents.add(nextAgentId);
+      void this.runAgent(nextAgentId).finally(() => {
+        this.runningAgents.delete(nextAgentId);
+        this.scheduleDrainAgentQueue();
+      });
     }
   }
 
@@ -603,7 +636,7 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
       return;
     }
 
-    if (!this.settings.provider.apiKey.trim()) {
+    if (agent.role !== "sentinel" && !this.settings.provider.apiKey.trim()) {
       agent.status = "blocked";
       agent.lastError = "Provider API key is not configured.";
       agent.updatedAt = new Date().toISOString();
@@ -621,17 +654,12 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
     this.emit("event", { type: "agent-updated", agent: this.toAgentSummary(agent) });
 
     try {
-      const client = new OpenAiAgentClient(this.settings.provider);
-      const decision = await client.decide(agent, this.buildAgentPrompt(agent, project));
+      await withTimeout(
+        agent.role === "sentinel" ? this.runSentinel(agent, project) : this.runDecisionAgent(agent, project),
+        AGENT_RUN_TIMEOUT_MS,
+        `Agent ${agent.name} timed out after ${AGENT_RUN_TIMEOUT_MS}ms`,
+      );
       this.clearAgentRetryState(agent.id);
-      if (decision.thought) {
-        this.appendAgentLog(agent, {
-          kind: "thought",
-          direction: "internal",
-          text: decision.thought,
-        });
-      }
-      await this.applyAgentDecision(agent, project, decision);
       agent.status = project.status === "running" ? "waiting" : "idle";
       agent.updatedAt = new Date().toISOString();
       this.emit("event", { type: "agent-updated", agent: this.toAgentSummary(agent) });
@@ -640,6 +668,90 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
     } finally {
       if (agent.role === "steward") {
         this.refreshStewardHeartbeat(project.id);
+      }
+      if (agent.role === "sentinel") {
+        this.refreshSentinelHeartbeat(project.id);
+      }
+      this.scheduleDrainAgentQueue();
+    }
+  }
+
+  private async runDecisionAgent(agent: AgentDetails, project: ProjectSummary): Promise<void> {
+    const client = new OpenAiAgentClient(this.settings.provider);
+    const decision = await client.decide(agent, this.buildAgentPrompt(agent, project));
+    if (decision.thought) {
+      this.appendAgentLog(agent, {
+        kind: "thought",
+        direction: "internal",
+        text: decision.thought,
+      });
+    }
+    await this.applyAgentDecision(agent, project, decision);
+  }
+
+  private async runSentinel(agent: AgentDetails, project: ProjectSummary): Promise<void> {
+    const sessions = this.listSessions().filter((session) => session.projectId === project.id);
+    const now = Date.now();
+    const stalledSessions = sessions.filter((session) => {
+      if (session.status !== "running" && session.status !== "starting") {
+        return false;
+      }
+
+      const updatedAt = Date.parse(session.updatedAt);
+      return Number.isFinite(updatedAt) && now - updatedAt >= SESSION_STALL_THRESHOLD_MS;
+    });
+
+    if (!stalledSessions.length) {
+      return;
+    }
+
+    for (const session of stalledSessions) {
+      const stallKey = `${session.status}:${session.updatedAt}:${session.transcriptCount}`;
+      if (this.sessionStallAlertBySession.get(session.id) === stallKey) {
+        continue;
+      }
+
+      this.sessionStallAlertBySession.set(session.id, stallKey);
+      const stalledForMs = Math.max(0, now - Date.parse(session.updatedAt));
+      this.appendAgentLog(agent, {
+        kind: "observation",
+        direction: "internal",
+        text: `Session ${session.title} (${session.id}) appears stalled in ${session.status} for ${formatDuration(stalledForMs)}.`,
+        meta: {
+          sessionId: session.id,
+          sessionStatus: session.status,
+          stalledForMs,
+        },
+      });
+
+      const foreman = this.findForemanForSession(session.id);
+      if (foreman) {
+        this.appendAgentLog(foreman, {
+          kind: "observation",
+          direction: "internal",
+          text: `Bound session ${session.title} (${session.id}) has shown no activity for ${formatDuration(stalledForMs)} while ${session.status}. Re-check the lane, decide whether it is actually blocked, and report back to Steward.`,
+          meta: {
+            sessionId: session.id,
+            stalledForMs,
+            detectedBy: agent.id,
+          },
+        });
+        this.enqueueAgent(foreman.id);
+      }
+
+      const steward = this.findProjectAgent(project.id, "steward");
+      if (steward) {
+        this.appendAgentLog(steward, {
+          kind: "observation",
+          direction: "internal",
+          text: `Sentinel detected a stalled execution lane: ${session.title} (${session.id}) has been ${session.status} for ${formatDuration(stalledForMs)} without new activity. Re-evaluate orchestration and unblock or replace the lane.`,
+          meta: {
+            sessionId: session.id,
+            stalledForMs,
+            detectedBy: agent.id,
+          },
+        });
+        this.enqueueAgent(steward.id);
       }
     }
   }
@@ -828,6 +940,8 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
       }
       case "mark_project_complete": {
         this.clearStewardHeartbeat(project.id);
+        this.clearSentinelHeartbeat(project.id);
+        this.clearQueuedAgentsForProject(project.id);
         project.status = "completed";
         project.updatedAt = new Date().toISOString();
         this.schedulePersist();
@@ -1172,6 +1286,8 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
 
   private blockProjectAfterAgentFailure(project: ProjectSummary, agent: AgentDetails, error: string): void {
     this.clearStewardHeartbeat(project.id);
+    this.clearSentinelHeartbeat(project.id);
+    this.clearQueuedAgentsForProject(project.id);
     if (project.status !== "blocked") {
       project.status = "blocked";
       project.updatedAt = new Date().toISOString();
@@ -1183,7 +1299,7 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
       if (sibling.projectId !== project.id || sibling.id === agent.id) {
         continue;
       }
-      if (sibling.status === "running" || sibling.status === "waiting") {
+      if (!this.runningAgents.has(sibling.id) && (sibling.status === "running" || sibling.status === "waiting")) {
         sibling.status = "idle";
         sibling.updatedAt = new Date().toISOString();
         sibling.lastError = undefined;
@@ -1270,6 +1386,62 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
     if (timer) {
       clearTimeout(timer);
       this.stewardHeartbeatTimers.delete(projectId);
+    }
+  }
+
+  private refreshSentinelHeartbeat(projectId: string, delayMs: number = SENTINEL_HEARTBEAT_MS): void {
+    const timer = this.sentinelHeartbeatTimers.get(projectId);
+    if (timer) {
+      clearTimeout(timer);
+      this.sentinelHeartbeatTimers.delete(projectId);
+    }
+
+    const project = this.state.projects.find((item) => item.id === projectId);
+    if (!project || project.status !== "running") {
+      return;
+    }
+
+    const sentinel = this.findProjectAgent(projectId, "sentinel");
+    if (!sentinel) {
+      return;
+    }
+
+    const nextTimer = setTimeout(() => {
+      this.sentinelHeartbeatTimers.delete(projectId);
+      const nextProject = this.state.projects.find((item) => item.id === projectId);
+      if (!nextProject || nextProject.status !== "running") {
+        return;
+      }
+
+      const nextSentinel = this.findProjectAgent(projectId, "sentinel");
+      if (!nextSentinel) {
+        return;
+      }
+
+      if (this.runningAgents.has(nextSentinel.id)) {
+        this.refreshSentinelHeartbeat(projectId);
+        return;
+      }
+
+      this.enqueueAgent(nextSentinel.id);
+    }, delayMs);
+
+    this.sentinelHeartbeatTimers.set(projectId, nextTimer);
+  }
+
+  private clearSentinelHeartbeat(projectId: string): void {
+    const timer = this.sentinelHeartbeatTimers.get(projectId);
+    if (timer) {
+      clearTimeout(timer);
+      this.sentinelHeartbeatTimers.delete(projectId);
+    }
+  }
+
+  private clearQueuedAgentsForProject(projectId: string): void {
+    for (const agent of this.state.agents) {
+      if (agent.projectId === projectId) {
+        this.agentQueue.delete(agent.id);
+      }
     }
   }
 
@@ -1448,4 +1620,28 @@ export class ProjectManager extends EventEmitter<{ event: [DaemonEvent] }> {
       }
     }
   }
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+    timeout.unref?.();
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }) as Promise<T>;
+}
+
+function formatDuration(durationMs: number): string {
+  if (durationMs < 1_000) {
+    return `${durationMs}ms`;
+  }
+  if (durationMs < 60_000) {
+    return `${Math.round(durationMs / 1_000)}s`;
+  }
+  return `${Math.round(durationMs / 60_000)}m`;
 }

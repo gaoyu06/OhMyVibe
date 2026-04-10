@@ -4,6 +4,10 @@ import type { DaemonDescriptor, DaemonEvent } from "@/lib/types";
 
 export type ConnectionState = "connecting" | "open" | "closed" | "error";
 
+const SOCKET_OPEN_TIMEOUT_MS = 10_000;
+const RECONNECT_BASE_DELAY_MS = 1_000;
+const RECONNECT_MAX_DELAY_MS = 10_000;
+
 type DaemonSocketPayload =
   | { type: "hello"; daemons?: DaemonDescriptor[] }
   | { type: "daemon-connected"; daemon: DaemonDescriptor }
@@ -46,6 +50,9 @@ export function useDaemonConnection({
   const onDaemonDisconnectedRef = useRef(onDaemonDisconnected);
   const onDaemonEventRef = useRef(onDaemonEvent);
   const onFlushActiveSessionEventsRef = useRef(onFlushActiveSessionEvents);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const connectTimeoutRef = useRef<number | null>(null);
+  const reconnectAttemptRef = useRef(0);
 
   const flushQueuedActiveSessionEvents = () => {
     const queuedEvents = queuedActiveSessionEventsRef.current;
@@ -98,65 +105,138 @@ export function useDaemonConnection({
       if (queuedActiveSessionFlushRef.current !== null) {
         window.clearTimeout(queuedActiveSessionFlushRef.current);
       }
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+      }
+      if (connectTimeoutRef.current !== null) {
+        window.clearTimeout(connectTimeoutRef.current);
+      }
     };
   }, []);
 
   useEffect(() => {
     let disposed = false;
-    const ws = new WebSocket(toControlWsUrl(controlUrl));
-    wsRef.current = ws;
-    setConnectionState("connecting");
+    const clearReconnectTimer = () => {
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+    };
 
-    ws.onopen = () => {
-      if (!disposed) {
+    const clearConnectTimeout = () => {
+      if (connectTimeoutRef.current !== null) {
+        window.clearTimeout(connectTimeoutRef.current);
+        connectTimeoutRef.current = null;
+      }
+    };
+
+    const scheduleReconnect = () => {
+      if (disposed || reconnectTimerRef.current !== null) {
+        return;
+      }
+
+      const delay = Math.min(
+        RECONNECT_BASE_DELAY_MS * Math.max(1, 2 ** reconnectAttemptRef.current),
+        RECONNECT_MAX_DELAY_MS,
+      );
+      reconnectAttemptRef.current += 1;
+      setConnectionState("connecting");
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        connect();
+      }, delay);
+    };
+
+    const bindSocket = (ws: WebSocket) => {
+      ws.onopen = () => {
+        if (disposed || wsRef.current !== ws) {
+          ws.close();
+          return;
+        }
+
+        clearConnectTimeout();
+        clearReconnectTimer();
+        reconnectAttemptRef.current = 0;
         setConnectionState("open");
         sendControlSubscription(ws, latestSubscriptionRef.current);
-      }
-    };
-    ws.onerror = () => {
-      if (!disposed) {
-        setConnectionState("error");
-      }
-    };
-    ws.onclose = () => {
-      if (!disposed) {
-        setConnectionState("closed");
-      }
-    };
-    ws.onmessage = (event) => {
-      const payload = JSON.parse(event.data) as DaemonSocketPayload;
+      };
 
-      if (payload.type === "hello") {
-        onHelloDaemonsRef.current(Array.isArray(payload.daemons) ? payload.daemons : []);
-        return;
-      }
-
-      if (payload.type === "daemon-connected") {
-        onDaemonConnectedRef.current(payload.daemon);
-        return;
-      }
-
-      if (payload.type === "daemon-disconnected") {
-        onDaemonDisconnectedRef.current(payload.daemonId);
-        return;
-      }
-
-      const incomingEvents = payload.type === "daemon-event" ? [payload.event] : payload.events;
-      for (const daemonEvent of incomingEvents) {
-        if (isBufferedActiveSessionEvent(daemonEvent)) {
-          queueActiveSessionEvent(daemonEvent);
-          continue;
+      ws.onerror = () => {
+        if (!disposed && wsRef.current === ws) {
+          setConnectionState("error");
         }
-        onDaemonEventRef.current(daemonEvent);
-      }
+      };
+
+      ws.onclose = () => {
+        clearConnectTimeout();
+        if (wsRef.current === ws) {
+          wsRef.current = null;
+        }
+        if (disposed) {
+          setConnectionState("closed");
+          return;
+        }
+        scheduleReconnect();
+      };
+
+      ws.onmessage = (event) => {
+        const payload = JSON.parse(event.data) as DaemonSocketPayload;
+
+        if (payload.type === "hello") {
+          onHelloDaemonsRef.current(Array.isArray(payload.daemons) ? payload.daemons : []);
+          return;
+        }
+
+        if (payload.type === "daemon-connected") {
+          onDaemonConnectedRef.current(payload.daemon);
+          return;
+        }
+
+        if (payload.type === "daemon-disconnected") {
+          onDaemonDisconnectedRef.current(payload.daemonId);
+          return;
+        }
+
+        const incomingEvents = payload.type === "daemon-event" ? [payload.event] : payload.events;
+        for (const daemonEvent of incomingEvents) {
+          if (isBufferedActiveSessionEvent(daemonEvent)) {
+            queueActiveSessionEvent(daemonEvent);
+            continue;
+          }
+          onDaemonEventRef.current(daemonEvent);
+        }
+      };
     };
+
+    const connect = () => {
+      if (disposed) {
+        return;
+      }
+
+      clearConnectTimeout();
+      const ws = new WebSocket(toControlWsUrl(controlUrl));
+      wsRef.current = ws;
+      setConnectionState("connecting");
+      connectTimeoutRef.current = window.setTimeout(() => {
+        if (wsRef.current === ws && ws.readyState === WebSocket.CONNECTING) {
+          ws.close();
+        }
+      }, SOCKET_OPEN_TIMEOUT_MS);
+      bindSocket(ws);
+    };
+
+    connect();
 
     return () => {
       disposed = true;
-      if (wsRef.current === ws) {
+      clearReconnectTimer();
+      clearConnectTimeout();
+      const ws = wsRef.current;
+      if (ws) {
         wsRef.current = null;
+        ws.close();
       }
-      ws.close();
+      setConnectionState("closed");
     };
   }, [controlUrl]);
 

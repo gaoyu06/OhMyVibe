@@ -106,6 +106,8 @@ function App() {
   >("never");
   const activeDaemonIdRef = useRef<string | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
+  const activeProjectIdRef = useRef<string | null>(null);
+  const activeAgentIdRef = useRef<string | null>(null);
   const loadSessionRequestIdRef = useRef(0);
   const loadOlderTranscriptRequestIdRef = useRef(0);
   const subscribedSessionId = viewMode === "chat" ? activeSessionId : null;
@@ -122,11 +124,25 @@ function App() {
     subscribedSessionId,
     onHelloDaemons: (nextDaemons) => {
       setDaemons(nextDaemons);
-      setActiveDaemonId((current) => current ?? nextDaemons[0]?.id ?? null);
+      const currentDaemonId = activeDaemonIdRef.current;
+      const nextDaemonId =
+        currentDaemonId && nextDaemons.some((daemon) => daemon.id === currentDaemonId)
+          ? currentDaemonId
+          : nextDaemons[0]?.id ?? null;
+      setActiveDaemonId(nextDaemonId);
+      if (nextDaemonId) {
+        void refreshDaemonState(nextDaemonId);
+      }
     },
     onDaemonConnected: (daemon) => {
       setDaemons((current) => upsertDaemon(current, daemon));
-      setActiveDaemonId((current) => current ?? daemon.id);
+      const shouldActivate = !activeDaemonIdRef.current;
+      if (shouldActivate) {
+        setActiveDaemonId(daemon.id);
+      }
+      if (shouldActivate || activeDaemonIdRef.current === daemon.id) {
+        void refreshDaemonState(daemon.id);
+      }
     },
     onDaemonDisconnected: (daemonId) => {
       setDaemons((current) =>
@@ -150,6 +166,14 @@ function App() {
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
+
+  useEffect(() => {
+    activeProjectIdRef.current = activeProjectId;
+  }, [activeProjectId]);
+
+  useEffect(() => {
+    activeAgentIdRef.current = activeAgentId;
+  }, [activeAgentId]);
 
   useEffect(() => {
     if (!activeDaemonId) {
@@ -546,6 +570,30 @@ function App() {
   async function loadSettings(daemonId: string) {
     const nextSettings = await getDaemonSettings(controlUrl, daemonId);
     setSettings(nextSettings);
+  }
+
+  async function refreshDaemonState(daemonId: string) {
+    await Promise.allSettled([
+      loadConfig(daemonId),
+      loadSessions(daemonId),
+      loadProjects(daemonId),
+      loadSettings(daemonId),
+    ]);
+
+    const projectId = activeProjectIdRef.current;
+    if (projectId) {
+      await Promise.allSettled([loadAgents(daemonId, projectId), loadNotifications(daemonId, projectId)]);
+
+      const agentId = activeAgentIdRef.current;
+      if (agentId) {
+        await Promise.allSettled([loadAgent(daemonId, projectId, agentId)]);
+      }
+    }
+
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId && viewMode === "chat") {
+      await Promise.allSettled([loadSession(daemonId, sessionId)]);
+    }
   }
 
   async function loadSession(daemonId: string, sessionId: string) {

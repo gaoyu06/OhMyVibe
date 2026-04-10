@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import "dotenv/config";
+import packageJson from "../package.json" with { type: "json" };
 
-type CommandName = "daemon" | "acp";
+type CommandName = "daemon";
 
 interface CliOptions {
   command: CommandName;
@@ -20,7 +21,6 @@ Usage:
 
 Commands:
   daemon        Start the managed daemon (default)
-  acp           Start the ACP bridge
 
 Options:
   -u, --management-server-url <url>  Control server URL
@@ -32,12 +32,11 @@ Options:
 Examples:
   ohmyvibe --management-server-url http://localhost:3310
   ohmyvibe daemon -u http://localhost:3310 -n my-daemon
-  ohmyvibe acp
 `);
 }
 
 function printVersion(): void {
-  console.log("0.1.1");
+  console.log(packageJson.version);
 }
 
 function readOptionValue(args: string[], index: number, flag: string): string {
@@ -53,7 +52,7 @@ function parseCliArgs(argv: string[]): CliOptions {
   let startIndex = 0;
 
   const first = argv[0];
-  if (first === "daemon" || first === "acp") {
+  if (first === "daemon") {
     command = first;
     startIndex = 1;
   }
@@ -119,11 +118,6 @@ async function run(): Promise<void> {
   }
 
   applyEnvOverrides(options);
-
-  if (options.command === "acp") {
-    await import("./acp/index.js");
-    return;
-  }
 
   await import("./daemon/index.js");
 }
